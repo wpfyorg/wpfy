@@ -1,0 +1,34 @@
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class WpfyPaths:
+    install_root: str = os.environ.get("WPFY_INSTALL_ROOT", "/opt/wpfy")
+    config_dir: str = os.environ.get("WPFY_CONFIG_DIR", "/etc/wpfy")
+    state_dir: str = os.environ.get("WPFY_STATE_DIR", "/var/lib/wpfy")
+    log_dir: str = os.environ.get("WPFY_LOG_DIR", "/var/log/wpfy")
+
+    @property
+    def app_dir(self) -> str:
+        return os.path.join(self.install_root, "app")
+
+    @property
+    def sites_dir(self) -> str:
+        return os.path.join(self.install_root, "sites")
+
+    @property
+    def tmp_dir(self) -> str:
+        return os.path.join(self.state_dir, "tmp")
+
+    @property
+    def traefik_dir(self) -> str:
+        return os.environ.get("WPFY_TRAEFIK_DIR", os.path.join(self.install_root, "traefik"))
+
+    def site_dir(self, domain: str) -> str:
+        return os.path.join(self.sites_dir, domain)
+
+
+PATHS = WpfyPaths()

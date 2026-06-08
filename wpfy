@@ -1,0 +1,813 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+APP_NAME="wpfy"
+INSTALL_ROOT="/opt/wpfy"
+APP_DIR="$INSTALL_ROOT/app"
+STAGED_APP_DIR="$INSTALL_ROOT/app.next"
+PREVIOUS_APP_DIR="$INSTALL_ROOT/app.previous"
+VENV_DIR="$INSTALL_ROOT/venv"
+CONFIG_DIR="/etc/wpfy"
+STATE_DIR="/var/lib/wpfy"
+LOG_DIR="/var/log/wpfy"
+LOG_FILE="${WPFY_INSTALL_LOG:-$LOG_DIR/install.log}"
+SITES_DIR="$INSTALL_ROOT/sites"
+TMP_DIR="/var/lib/wpfy/tmp"
+BIN_PATH="/usr/local/bin/wpfy"
+DRY_RUN="${WPFY_DRY_RUN:-0}"
+VERBOSE="${WPFY_VERBOSE:-0}"
+NO_COLOR_REQUESTED="${WPFY_NO_COLOR:-0}"
+SOURCE_URL="${WPFY_SOURCE_URL:-}"
+SWAP_ENABLED="${WPFY_SWAP:-1}"
+SWAP_FILE="${WPFY_SWAP_FILE:-/swapfile}"
+SWAP_SIZE_MB="${WPFY_SWAP_SIZE_MB:-}"
+SKIP_WPFY_INSTALL=0
+PROGRESS_OFFSET="${WPFY_PROGRESS_OFFSET:-4}"
+PROGRESS_TOTAL="${WPFY_PROGRESS_TOTAL:-16}"
+INSTALL_STARTED_AT="${WPFY_INSTALL_STARTED_AT:-$(date +%s)}"
+CURRENT_STEP=0
+CURRENT_STEP_LABEL=""
+CURRENT_STEP_COMMAND=""
+CURRENT_STEP_LOG=""
+STEP_STATUS="OK"
+INSTALL_SESSION_DIR=""
+USE_TTY=0
+
+COLOR_RESET=""
+COLOR_CYAN=""
+COLOR_GREEN=""
+COLOR_YELLOW=""
+COLOR_RED=""
+
+log() {
+    printf '%s\n' "$*"
+}
+
+warn() {
+    printf 'wpfy: %s\n' "$*" >&2
+}
+
+setup_ui() {
+    if [[ "$VERBOSE" != "1" && "$NO_COLOR_REQUESTED" != "1" && -z "${NO_COLOR+x}" ]] \
+        && [[ "${WPFY_TEST_TTY:-0}" == "1" || ( -t 1 && -z "${CI:-}" ) ]]; then
+        USE_TTY=1
+        COLOR_RESET=$'\033[0m'
+        COLOR_CYAN=$'\033[36m'
+        COLOR_GREEN=$'\033[32m'
+        COLOR_YELLOW=$'\033[33m'
+        COLOR_RED=$'\033[31m'
+    fi
+}
+
+progress_bar() {
+    local completed="$1"
+    local width=16
+    local filled=$(( completed * width / PROGRESS_TOTAL ))
+    local empty=$(( width - filled ))
+    printf '%*s' "$filled" '' | tr ' ' '#'
+    printf '%*s' "$empty" '' | tr ' ' '-'
+}
+
+progress_line() {
+    local completed="$1"
+    local label="$2"
+    local status="${3:-ACTIVE}"
+    local percent=$(( completed * 100 / PROGRESS_TOTAL ))
+    local color="$COLOR_CYAN"
+    case "$status" in
+        OK) color="$COLOR_GREEN" ;;
+        SKIP|WARN) color="$COLOR_YELLOW" ;;
+        FAIL) color="$COLOR_RED" ;;
+    esac
+    printf '%s[%s] %3d%%  %2d/%d  %-42.42s%s' \
+        "$color" "$(progress_bar "$completed")" "$percent" "$completed" "$PROGRESS_TOTAL" "$label" "$COLOR_RESET"
+}
+
+render_active_step() {
+    [[ "$DRY_RUN" == "1" ]] && return 0
+    if [[ "$USE_TTY" == "1" ]]; then
+        printf '\r\033[2K'
+        progress_line "$(( CURRENT_STEP - 1 ))" "$CURRENT_STEP_LABEL"
+    fi
+}
+
+render_completed_step() {
+    local status="$1"
+    if [[ "$DRY_RUN" == "1" ]]; then
+        return 0
+    fi
+    if [[ "$USE_TTY" == "1" ]]; then
+        printf '\r\033[2K'
+        progress_line "$CURRENT_STEP" "$CURRENT_STEP_LABEL" "$status"
+    else
+        printf '[%s] [%d/%d] %s\n' "$status" "$CURRENT_STEP" "$PROGRESS_TOTAL" "$CURRENT_STEP_LABEL"
+    fi
+}
+
+restore_terminal() {
+    if [[ "$USE_TTY" == "1" ]]; then
+        printf '\033[?25h'
+    fi
+    return 0
+}
+
+format_duration() {
+    local seconds="$1"
+    if (( seconds >= 60 )); then
+        printf '%dm %02ds' "$(( seconds / 60 ))" "$(( seconds % 60 ))"
+    else
+        printf '%ds' "$seconds"
+    fi
+}
+
+mark_step_skipped() {
+    printf 'SKIP\n%s\n' "$1" >"$INSTALL_SESSION_DIR/step-status"
+}
+
+mark_step_warning() {
+    printf 'WARN\n%s\n' "$1" >"$INSTALL_SESSION_DIR/step-status"
+}
+
+host_value() {
+    local override_name="$1"
+    shift
+    local override_value="${!override_name:-}"
+    if [[ -n "$override_value" ]]; then
+        printf '%s\n' "$override_value"
+        return 0
+    fi
+    "$@"
+}
+
+host_os() {
+    if [[ -r /etc/os-release ]]; then
+        (
+            . /etc/os-release
+            printf '%s\n' "${PRETTY_NAME:-${NAME:-Linux}}"
+        )
+        return
+    fi
+    uname -srm
+}
+
+host_hostname() {
+    local value
+    value="$(hostname -f 2>/dev/null || hostname 2>/dev/null || true)"
+    printf '%s\n' "${value:-unknown}"
+}
+
+host_virtualization() {
+    local value="unknown"
+    if command -v systemd-detect-virt >/dev/null 2>&1; then
+        value="$(systemd-detect-virt 2>/dev/null || true)"
+        [[ "$value" == "none" ]] && value="physical"
+    fi
+    printf '%s\n' "$value"
+}
+
+host_disk() {
+    local value
+    value="$(df -hP / 2>/dev/null | awk 'NR == 2 { printf "%s free of %s total (%s used)", $4, $2, $5 }' || true)"
+    printf '%s\n' "${value:-unknown}"
+}
+
+host_ram() {
+    if command -v free >/dev/null 2>&1; then
+        free -h | awk '/^Mem:/ { print $2 }'
+        return
+    fi
+    printf 'unknown\n'
+}
+
+host_swap() {
+    if command -v free >/dev/null 2>&1; then
+        free -h | awk '/^Swap:/ { print $2 }'
+        return
+    fi
+    printf 'unknown\n'
+}
+
+host_cpu_count() {
+    if command -v nproc >/dev/null 2>&1; then
+        nproc
+        return
+    fi
+    getconf _NPROCESSORS_ONLN 2>/dev/null || printf 'unknown\n'
+}
+
+host_ipv4() {
+    local address=""
+    if command -v ip >/dev/null 2>&1; then
+        address="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{ for (i=1; i<=NF; i++) if ($i == "src") { print $(i+1); exit } }' || true)"
+    fi
+    printf '%s\n' "${address:-N/A}"
+}
+
+host_ipv6() {
+    if command -v ip >/dev/null 2>&1; then
+        local address
+        address="$(ip -6 route get 2606:4700:4700::1111 2>/dev/null | awk '{ for (i=1; i<=NF; i++) if ($i == "src") { print $(i+1); exit } }' || true)"
+        printf '%s\n' "${address:-N/A}"
+        return
+    fi
+    printf 'N/A\n'
+}
+
+banner_row() {
+    printf '# %-20s %-55.55s #\n' "$1:" "$2"
+}
+
+show_welcome() {
+    local build os hostname virtualization disk ram swap cpu ipv4 ipv6
+    build="${WPFY_BUILD:-$(date -u +%b%Y | tr '[:lower:]' '[:upper:]')}"
+    os="$(host_value WPFY_TEST_HOST_OS host_os)"
+    hostname="$(host_value WPFY_TEST_HOSTNAME host_hostname)"
+    virtualization="$(host_value WPFY_TEST_VIRTUALIZATION host_virtualization)"
+    disk="$(host_value WPFY_TEST_DISK host_disk)"
+    ram="$(host_value WPFY_TEST_RAM host_ram)"
+    swap="$(host_value WPFY_TEST_SWAP host_swap)"
+    cpu="$(host_value WPFY_TEST_CPU host_cpu_count)"
+    ipv4="$(host_value WPFY_TEST_IPV4 host_ipv4)"
+    ipv6="$(host_value WPFY_TEST_IPV6 host_ipv6)"
+
+    cat <<'EOF'
+ __        ______  ______ __   __
+ \ \      / /  _ \|  ____|\ \ / /
+  \ \ /\ / /| |_) | |__    \ V /
+   \ V  V / |  __/|  __|    | |
+    \_/\_/  |_|   |_|       |_|
+EOF
+    printf '%80s\n' '' | tr ' ' '#'
+    banner_row "Build" "$build"
+    banner_row "Operating System" "$os"
+    banner_row "Hostname" "$hostname"
+    banner_row "Virtualization" "$virtualization"
+    banner_row "Disk Space" "$disk"
+    banner_row "RAM Memory" "$ram total"
+    banner_row "Swap" "$swap total"
+    banner_row "vCPU Cores" "$cpu"
+    banner_row "IPv4 Address" "${ipv4:-N/A}"
+    banner_row "IPv6 Address" "${ipv6:-N/A}"
+    printf '%80s\n' '' | tr ' ' '#'
+}
+
+die() {
+    warn "$*"
+    exit 1
+}
+
+show_failure() {
+    local status="$1"
+    local command="${2:-$CURRENT_STEP_COMMAND}"
+    restore_terminal
+    if [[ "$USE_TTY" == "1" ]]; then
+        printf '\r\033[2K'
+        progress_line "$(( CURRENT_STEP > 0 ? CURRENT_STEP - 1 : 0 ))" "${CURRENT_STEP_LABEL:-Installation}" "FAIL"
+        printf '\n'
+    fi
+    printf '%sInstallation failed%s\n' "$COLOR_RED" "$COLOR_RESET" >&2
+    printf 'Step: %s (%d/%d)\n' "${CURRENT_STEP_LABEL:-bootstrap}" "$CURRENT_STEP" "$PROGRESS_TOTAL" >&2
+    printf 'Exit status: %s\n' "$status" >&2
+    [[ -n "$command" ]] && printf 'Command: %s\n' "$command" >&2
+    printf 'Log: %s\n' "$LOG_FILE" >&2
+    if [[ -n "$CURRENT_STEP_LOG" && -s "$CURRENT_STEP_LOG" ]]; then
+        printf '\nLast 15 log lines:\n' >&2
+        tail -n 15 "$CURRENT_STEP_LOG" >&2
+    fi
+    printf '\nFix the reported issue, then run the installer again.\n' >&2
+}
+
+install_failed() {
+    local status="$1"
+    local command="${2:-$CURRENT_STEP_COMMAND}"
+    restore_previous_source
+    show_failure "$status" "$command"
+    exit "$status"
+}
+
+setup_logging() {
+    INSTALL_SESSION_DIR="$(mktemp -d)"
+    if [[ "$DRY_RUN" == "1" ]]; then
+        return 0
+    fi
+    mkdir -p "$(dirname "$LOG_FILE")"
+    touch "$LOG_FILE"
+    chmod 640 "$LOG_FILE"
+    if [[ -n "${WPFY_BOOTSTRAP_LOG:-}" && -s "$WPFY_BOOTSTRAP_LOG" && "$WPFY_BOOTSTRAP_LOG" != "$LOG_FILE" ]]; then
+        cat "$WPFY_BOOTSTRAP_LOG" >>"$LOG_FILE"
+    fi
+}
+
+run() {
+    if [[ "$DRY_RUN" == "1" ]]; then
+        log "[dry-run] $*"
+        return 0
+    fi
+    "$@"
+}
+
+append_step_log() {
+    local label="$1"
+    local status="$2"
+    local duration="$3"
+    {
+        printf '\n[%s] STEP %d/%d START %s\n' "$(date -u +%FT%TZ)" "$CURRENT_STEP" "$PROGRESS_TOTAL" "$label"
+        [[ -s "$CURRENT_STEP_LOG" ]] && cat "$CURRENT_STEP_LOG"
+        printf '[%s] STEP %d/%d %s duration=%ss\n' \
+            "$(date -u +%FT%TZ)" "$CURRENT_STEP" "$PROGRESS_TOTAL" "$status" "$duration"
+    } >>"$LOG_FILE"
+}
+
+run_step() {
+    local local_step="$1"
+    local label="$2"
+    shift 2
+    local started status duration
+
+    CURRENT_STEP=$(( PROGRESS_OFFSET + local_step ))
+    CURRENT_STEP_LABEL="$label"
+    CURRENT_STEP_COMMAND="$1"
+    STEP_STATUS="OK"
+
+    if [[ "$DRY_RUN" == "1" ]]; then
+        printf '\n[DRY-RUN] [%d/%d] %s\n' "$CURRENT_STEP" "$PROGRESS_TOTAL" "$label"
+        "$@"
+        return
+    fi
+
+    CURRENT_STEP_LOG="$INSTALL_SESSION_DIR/step-${CURRENT_STEP}.log"
+    : >"$CURRENT_STEP_LOG"
+    rm -f "$INSTALL_SESSION_DIR/step-status"
+    started="$(date +%s)"
+    render_active_step
+
+    set +e
+    if [[ "$VERBOSE" == "1" ]]; then
+        ( set -e; "$@" ) > >(tee "$CURRENT_STEP_LOG") 2>&1
+        status=$?
+    else
+        ( set -e; "$@" ) >"$CURRENT_STEP_LOG" 2>&1
+        status=$?
+    fi
+    set -e
+
+    duration=$(( $(date +%s) - started ))
+    if [[ -f "$INSTALL_SESSION_DIR/step-status" ]]; then
+        STEP_STATUS="$(sed -n '1p' "$INSTALL_SESSION_DIR/step-status")"
+    fi
+
+    if [[ "$status" -ne 0 ]]; then
+        append_step_log "$label" "FAIL" "$duration"
+        install_failed "$status" "$CURRENT_STEP_COMMAND"
+    fi
+
+    append_step_log "$label" "$STEP_STATUS" "$duration"
+    render_completed_step "$STEP_STATUS"
+}
+
+on_interrupt() {
+    restore_terminal
+    printf '\n%sInstallation interrupted%s\n' "$COLOR_RED" "$COLOR_RESET" >&2
+    printf 'Log: %s\n' "$LOG_FILE" >&2
+    restore_previous_source
+    exit 130
+}
+
+cleanup_session() {
+    restore_terminal
+    [[ -n "$INSTALL_SESSION_DIR" ]] && rm -rf "$INSTALL_SESSION_DIR"
+}
+
+ensure_root() {
+    if [[ "$DRY_RUN" == "1" ]]; then
+        return 0
+    fi
+    if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+        die "root required; run with sudo"
+    fi
+}
+
+ensure_ubuntu() {
+    local os_id
+    local os_version_id
+    if [[ -f /etc/os-release ]]; then
+        os_id="$(grep -oP '(?<=^ID=).*' /etc/os-release | tr -d '"')"
+        os_version_id="$(grep -oP '(?<=^VERSION_ID=).*' /etc/os-release | tr -d '"')"
+    else
+        os_id="$(lsb_release -is 2>/dev/null | tr '[:upper:]' '[:lower:]')"
+        os_version_id="$(lsb_release -rs 2>/dev/null)"
+    fi
+
+    if [[ "$os_id" != "ubuntu" ]]; then
+        die "Ubuntu is required for v1; detected ${os_id:-unknown}"
+    fi
+
+    if [[ -z "$os_version_id" ]]; then
+        die "unable to detect Ubuntu version"
+    fi
+
+    case "$os_version_id" in
+        22.04) log "Ubuntu 22.04 detected — supported" ;;
+        24.04) log "Ubuntu 24.04 detected — supported" ;;
+        20.04) die "Ubuntu 20.04 is not supported — wpfy requires Ubuntu 22.04 or 24.04 (Docker Engine 24+)" ;;
+        *)     die "Unsupported Ubuntu version: $os_version_id — wpfy requires Ubuntu 22.04 or 24.04" ;;
+    esac
+}
+
+ensure_dirs() {
+    run mkdir -p "$INSTALL_ROOT" "$APP_DIR" "$VENV_DIR" "$CONFIG_DIR" "$STATE_DIR" "$LOG_DIR" "$SITES_DIR" "$TMP_DIR"
+    if [[ "$DRY_RUN" != "1" ]]; then
+        chmod 750 "$INSTALL_ROOT" "$APP_DIR" "$VENV_DIR" "$CONFIG_DIR" "$STATE_DIR" "$LOG_DIR" "$SITES_DIR" "$TMP_DIR"
+    fi
+}
+
+active_swap_present() {
+    if [[ -n "${WPFY_TEST_ACTIVE_SWAP:-}" ]]; then
+        [[ "$WPFY_TEST_ACTIVE_SWAP" == "1" ]]
+        return
+    fi
+    [[ -f /proc/swaps ]] && awk 'NR > 1 { found=1 } END { exit found ? 0 : 1 }' /proc/swaps
+}
+
+root_free_gb() {
+    if [[ -n "${WPFY_TEST_ROOT_FREE_GB:-}" ]]; then
+        printf '%s\n' "$WPFY_TEST_ROOT_FREE_GB"
+        return 0
+    fi
+    df -BG / | awk 'NR == 2 { gsub(/G/, "", $4); print $4 }'
+}
+
+swap_size_mb_for_disk() {
+    local free_gb="$1"
+    if [[ -n "$SWAP_SIZE_MB" ]]; then
+        printf '%s\n' "$SWAP_SIZE_MB"
+        return 0
+    fi
+    if (( free_gb < 8 )); then
+        printf '0\n'
+    elif (( free_gb < 30 )); then
+        printf '2048\n'
+    else
+        printf '4096\n'
+    fi
+}
+
+validate_swap_size() {
+    local size_mb="$1"
+    [[ "$size_mb" =~ ^[0-9]+$ ]] || die "WPFY_SWAP_SIZE_MB must be a positive integer"
+    (( size_mb > 0 )) || die "WPFY_SWAP_SIZE_MB must be greater than 0"
+}
+
+create_swap_file() {
+    local size_mb="$1"
+    if fallocate -l "${size_mb}M" "$SWAP_FILE"; then
+        return 0
+    fi
+    warn "fallocate failed for $SWAP_FILE; falling back to dd"
+    dd if=/dev/zero of="$SWAP_FILE" bs=1M count="$size_mb" status=progress
+}
+
+ensure_swap() {
+    if [[ "$SWAP_ENABLED" == "0" ]]; then
+        log "Swap setup skipped (WPFY_SWAP=0)"
+        [[ "$DRY_RUN" == "1" ]] || mark_step_skipped "disabled by WPFY_SWAP=0"
+        return 0
+    fi
+
+    if active_swap_present; then
+        log "Swap setup skipped (active swap already present)"
+        [[ "$DRY_RUN" == "1" ]] || mark_step_skipped "active swap already present"
+        return 0
+    fi
+
+    local free_gb size_mb
+    free_gb="$(root_free_gb)"
+    [[ "$free_gb" =~ ^[0-9]+$ ]] || die "unable to determine free disk space on /"
+    size_mb="$(swap_size_mb_for_disk "$free_gb")"
+    if [[ -n "$SWAP_SIZE_MB" ]]; then
+        validate_swap_size "$size_mb"
+    fi
+
+    if (( size_mb == 0 )); then
+        log "Swap setup skipped (free disk on / is ${free_gb}GB; need at least 8GB)"
+        [[ "$DRY_RUN" == "1" ]] || mark_step_skipped "insufficient free disk for swap"
+        return 0
+    fi
+
+    if [[ "$DRY_RUN" == "1" ]]; then
+        log "[dry-run] create ${size_mb}MB swap at $SWAP_FILE (free disk on /: ${free_gb}GB)"
+        log "[dry-run] chmod 600 $SWAP_FILE; mkswap $SWAP_FILE; swapon $SWAP_FILE; add /etc/fstab entry if absent"
+        return 0
+    fi
+
+    if [[ -e "$SWAP_FILE" ]]; then
+        warn "Swap file $SWAP_FILE already exists but no active swap was detected; leaving it unchanged"
+        return 0
+    fi
+
+    log "Creating ${size_mb}MB swap at $SWAP_FILE (free disk on /: ${free_gb}GB)"
+    create_swap_file "$size_mb"
+    chmod 600 "$SWAP_FILE"
+    mkswap "$SWAP_FILE"
+    swapon "$SWAP_FILE"
+    if ! awk -v file="$SWAP_FILE" '$1 == file && $2 == "none" && $3 == "swap" { found=1 } END { exit found ? 0 : 1 }' /etc/fstab; then
+        printf '%s none swap sw 0 0\n' "$SWAP_FILE" >>/etc/fstab
+    fi
+    log "Swap enabled at $SWAP_FILE"
+}
+
+install_base_packages() {
+    export DEBIAN_FRONTEND=noninteractive
+    run apt-get update -qq
+    run apt-get install -y -qq \
+        ca-certificates \
+        curl \
+        gpg \
+        git \
+        lsb-release \
+        python3 \
+        python3-pip \
+        python3-setuptools \
+        python3-venv \
+        python3-wheel \
+        rsync
+}
+
+docker_installed() {
+    command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1
+}
+
+install_docker() {
+    if docker_installed; then
+        log "Docker and Compose plugin already available"
+        [[ "$DRY_RUN" == "1" ]] || mark_step_skipped "Docker already installed"
+        return 0
+    fi
+
+    run mkdir -p /etc/apt/keyrings
+    if [[ "$DRY_RUN" == "1" ]]; then
+        log "[dry-run] install Docker repo and packages"
+        return 0
+    fi
+
+    curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+    chmod a+r /etc/apt/keyrings/docker.gpg
+    local codename
+    codename="$(lsb_release -cs)"
+    cat >/etc/apt/sources.list.d/docker.list <<EOF
+deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu ${codename} stable
+EOF
+    apt-get update -qq
+    apt-get install -y -qq docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+    systemctl enable --now docker
+}
+
+check_docker_version() {
+    if [[ "$DRY_RUN" == "1" ]]; then
+        log "[dry-run] docker version --format '{{.Server.Version}}'"
+        return 0
+    fi
+    local docker_ver
+    docker_ver="$(docker version --format '{{.Server.Version}}' 2>/dev/null || true)"
+    if [[ -z "$docker_ver" ]]; then
+        warn "cannot determine Docker Engine version (is the daemon running?)"
+        [[ "$DRY_RUN" == "1" ]] || mark_step_warning "Docker version unavailable"
+        return 0
+    fi
+    local major
+    major="${docker_ver%%.*}"
+    if [[ "$major" -lt 24 ]]; then
+        die "Docker Engine $docker_ver is too old — wpfy requires Docker Engine 24+"
+    fi
+    log "Docker Engine $docker_ver — supported"
+}
+
+locate_source_tree() {
+    local script_dir
+    script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    if [[ -f "$script_dir/pyproject.toml" && -d "$script_dir/src/wpfy" ]]; then
+        printf '%s\n' "$script_dir" >"$INSTALL_SESSION_DIR/source-dir"
+        return 0
+    fi
+
+    if [[ -z "$SOURCE_URL" ]]; then
+        die "source tree not found; run from a checkout or set WPFY_SOURCE_URL to a source tarball"
+    fi
+
+    if [[ "$DRY_RUN" == "1" ]]; then
+        log "[dry-run] would download source from $SOURCE_URL"
+        printf '%s\n' "$INSTALL_ROOT/app" >"$INSTALL_SESSION_DIR/source-dir"
+        return 0
+    fi
+
+    local tmp_root="$INSTALL_SESSION_DIR/source-download"
+    mkdir -p "$tmp_root"
+    curl -fsSL "$SOURCE_URL" -o "$tmp_root/source.tar.gz"
+    tar -xzf "$tmp_root/source.tar.gz" -C "$tmp_root"
+    local extracted
+    extracted="$(find "$tmp_root" -mindepth 1 -maxdepth 1 -type d | head -n 1)"
+    if [[ -z "$extracted" ]]; then
+        die "downloaded source archive did not contain a directory"
+    fi
+    printf '%s\n' "$extracted" >"$INSTALL_SESSION_DIR/source-dir"
+}
+
+sync_source() {
+    local src_dir
+    src_dir="$(cat "$INSTALL_SESSION_DIR/source-dir")"
+    if [[ "$DRY_RUN" == "1" ]]; then
+        log "[dry-run] sync $src_dir to $STAGED_APP_DIR"
+        log "[dry-run] activate staged source at $APP_DIR"
+        return 0
+    fi
+
+    rm -rf "$STAGED_APP_DIR"
+    mkdir -p "$STAGED_APP_DIR"
+    rsync -a --delete --exclude '.git' --exclude '__pycache__' "$src_dir"/ "$STAGED_APP_DIR"/
+
+    rm -rf "$PREVIOUS_APP_DIR"
+    if [[ -d "$APP_DIR" ]]; then
+        mv "$APP_DIR" "$PREVIOUS_APP_DIR"
+    fi
+    mv "$STAGED_APP_DIR" "$APP_DIR"
+    chmod 750 "$APP_DIR"
+}
+
+restore_previous_source() {
+    if [[ "$DRY_RUN" == "1" || ! -d "$PREVIOUS_APP_DIR" ]]; then
+        return 0
+    fi
+    warn "restoring previous app source at $APP_DIR"
+    rm -rf "$APP_DIR"
+    mv "$PREVIOUS_APP_DIR" "$APP_DIR"
+}
+
+finalize_source_activation() {
+    if [[ "$DRY_RUN" == "1" ]]; then
+        return 0
+    fi
+    rm -rf "$STAGED_APP_DIR" "$PREVIOUS_APP_DIR"
+}
+
+install_python_package() {
+    if [[ "$DRY_RUN" == "1" ]]; then
+        log "[dry-run] python3 -m venv $VENV_DIR"
+        log "[dry-run] $VENV_DIR/bin/python -m pip install --upgrade pip setuptools wheel"
+        log "[dry-run] $VENV_DIR/bin/python -m pip install -e $APP_DIR"
+        log "[dry-run] write $BIN_PATH wrapper"
+        return 0
+    fi
+
+    python3 -m venv "$VENV_DIR"
+    "$VENV_DIR/bin/python" -m pip install --upgrade pip setuptools wheel
+    "$VENV_DIR/bin/python" -m pip install -e "$APP_DIR"
+    cat >"$BIN_PATH" <<EOF
+#!/usr/bin/env bash
+# wpfy manages root-owned paths and the system Docker daemon, so it must run as
+# root. To keep the UX as plain "wpfy ..." (no typed sudo) for non-root operators,
+# self-elevate via sudo, forwarding WPFY_*/ACME_* env across sudo's env reset.
+VENV_BIN="$VENV_DIR/bin/wpfy"
+if [ "\$(id -u)" -eq 0 ] || [ -n "\${WPFY_NO_SELF_ELEVATE:-}" ]; then
+    exec "\$VENV_BIN" "\$@"
+fi
+if ! command -v sudo >/dev/null 2>&1; then
+    echo "wpfy: root privileges required and sudo is not available" >&2
+    exit 1
+fi
+fwd=()
+while IFS='=' read -r name _; do
+    case "\$name" in
+        WPFY_*|ACME_*) fwd+=("\$name=\${!name}") ;;
+    esac
+done < <(env)
+exec sudo -- env "\${fwd[@]}" "\$VENV_BIN" "\$@"
+EOF
+    chmod 755 "$BIN_PATH"
+}
+
+install_wpfy_pip() {
+    if [[ "$SKIP_WPFY_INSTALL" == "1" ]]; then
+        log "wpfy pip install skipped (--skip-wpfy-install)"
+        [[ "$DRY_RUN" == "1" ]] || mark_step_skipped "bundled source install"
+        return 0
+    fi
+    if [[ "$DRY_RUN" == "1" ]]; then
+        log "[dry-run] $VENV_DIR/bin/python -m pip install wpfy"
+        return 0
+    fi
+    "$VENV_DIR/bin/python" -m pip install wpfy
+}
+
+write_config() {
+    if [[ "$DRY_RUN" == "1" ]]; then
+        log "[dry-run] write $CONFIG_DIR/wpfy.conf"
+        return 0
+    fi
+
+    cat >"$CONFIG_DIR/wpfy.conf" <<EOF
+install_root=$INSTALL_ROOT
+app_dir=$APP_DIR
+config_dir=$CONFIG_DIR
+state_dir=$STATE_DIR
+log_dir=$LOG_DIR
+sites_dir=$SITES_DIR
+EOF
+    chmod 640 "$CONFIG_DIR/wpfy.conf"
+}
+
+smoke_checks() {
+    if [[ "$DRY_RUN" == "1" ]]; then
+        log "[dry-run] smoke checks: wpfy --version, wpfy stack status, docker --version, docker compose version"
+        return 0
+    fi
+
+    command -v wpfy >/dev/null 2>&1 || die "wpfy not found on PATH after install"
+    wpfy --version >/dev/null
+    wpfy stack status >/dev/null 2>&1 || warn "wpfy stack status reported an issue (non-fatal during install)"
+    docker --version >/dev/null
+    docker compose version >/dev/null
+}
+
+show_success() {
+    local elapsed version docker_version
+    elapsed=$(( $(date +%s) - INSTALL_STARTED_AT ))
+    version="$(wpfy --version 2>/dev/null || printf 'wpfy installed')"
+    docker_version="$(docker version --format '{{.Server.Version}}' 2>/dev/null || printf 'unavailable')"
+
+    restore_terminal
+    if [[ "$USE_TTY" == "1" ]]; then
+        printf '\r\033[2K'
+        progress_line "$PROGRESS_TOTAL" "Installation complete" "OK"
+        printf '\n'
+    fi
+    printf '\n%sInstallation complete%s\n' "$COLOR_GREEN" "$COLOR_RESET"
+    printf 'Version: %s\n' "$version"
+    printf 'Docker: %s\n' "$docker_version"
+    printf 'Elapsed: %s\n' "$(format_duration "$elapsed")"
+    printf 'Log: %s\n' "$LOG_FILE"
+    printf "Next: wpfy stack install --nginx\n"
+}
+
+finish_install() {
+    smoke_checks
+    finalize_source_activation
+}
+
+main() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --dry-run) DRY_RUN="1" ;;
+            --verbose) VERBOSE="1" ;;
+            --no-color) NO_COLOR_REQUESTED="1" ;;
+            --skip-wpfy-install) SKIP_WPFY_INSTALL=1 ;;
+            --help)
+                log "Usage: bash wpfy [--dry-run] [--verbose] [--no-color] [--skip-wpfy-install]"
+                log "  --dry-run            Show steps without executing"
+                log "  --verbose            Show command output while retaining the install log"
+                log "  --no-color           Disable ANSI colors and cursor updates"
+                log "  --skip-wpfy-install  Skip 'pip install wpfy' (source install from checkout only)"
+                exit 0
+                ;;
+            *) die "unknown argument: $1" ;;
+        esac
+        shift
+    done
+
+    ensure_root
+    setup_ui
+    setup_logging
+    trap on_interrupt INT TERM
+    trap cleanup_session EXIT
+
+    if [[ "${WPFY_SKIP_WELCOME:-0}" != "1" ]]; then
+        if [[ "$DRY_RUN" == "1" ]]; then
+            show_welcome
+        else
+            show_welcome | tee -a "$LOG_FILE"
+        fi
+    fi
+    [[ "$USE_TTY" == "1" && "$DRY_RUN" != "1" ]] && printf '\033[?25l'
+
+    run_step 1 "Checking Ubuntu support" ensure_ubuntu
+    run_step 2 "Preparing swap" ensure_swap
+    run_step 3 "Installing base packages" install_base_packages
+    run_step 4 "Installing Docker and Compose" install_docker
+    run_step 5 "Checking Docker version" check_docker_version
+    run_step 6 "Creating installation directories" ensure_dirs
+    run_step 7 "Locating source tree" locate_source_tree
+    run_step 8 "Syncing source tree" sync_source
+    run_step 9 "Creating Python environment" install_python_package
+    run_step 10 "Installing wpfy package" install_wpfy_pip
+    run_step 11 "Writing configuration" write_config
+    run_step 12 "Running smoke checks" finish_install
+
+    if [[ "$DRY_RUN" == "1" ]]; then
+        log "${APP_NAME} dry-run complete"
+    else
+        show_success
+    fi
+}
+
+if [[ "${WPFY_INSTALLER_SOURCE_ONLY:-0}" != "1" ]]; then
+    main "$@"
+fi
