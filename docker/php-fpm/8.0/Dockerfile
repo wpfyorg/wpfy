@@ -40,7 +40,15 @@ RUN set -eux; \
         exif \
     ; \
     pecl channel-update pecl.php.net; \
-    pecl install redis imagick; \
+    for ext in redis imagick; do \
+        for attempt in 1 2 3 4 5; do \
+            pecl install "$ext" && break; \
+            [ "$attempt" = 5 ] && { echo "pecl install $ext failed after 5 attempts" >&2; exit 1; }; \
+            echo "pecl install $ext failed (attempt $attempt/5); clearing cache, retrying in 10s..." >&2; \
+            rm -rf /tmp/pear; \
+            sleep 10; \
+        done; \
+    done; \
     docker-php-ext-enable redis imagick opcache; \
     apk del .build-deps; \
     rm -rf /tmp/* /var/cache/apk/*
