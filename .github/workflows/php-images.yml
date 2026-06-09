@@ -45,14 +45,15 @@ jobs:
       # Images are published only from the public mirror (wpfyorg/wpfy) so the
       # package is owned by a public repo and image.source points at public
       # source. In the private wpfy-pvt mirror this workflow builds only, as a
-      # validation gate. See docs/adr/0011-publish-php-images-from-public-mirror.md
+      # validation gate. The public repo secret must be a PAT with write:packages.
+      # See docs/adr/0011-publish-php-images-from-public-mirror.md
       - name: Log in to GHCR
         if: github.repository == 'wpfyorg/wpfy' && github.event_name != 'pull_request'
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          username: wpfyorg
+          password: ${{ secrets.PUBLICPUSH }}
 
       - name: Build and publish
         uses: docker/build-push-action@v6
