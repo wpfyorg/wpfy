@@ -136,7 +136,7 @@ Run `wpfy <command> --help` for full flags on any command.
 
 ## Architecture overview
 
-```
+```text
                     Internet
                        │
               ┌────────▼────────┐
@@ -162,7 +162,7 @@ Run `wpfy <command> --help` for full flags on any command.
 
 Each site lives at `/opt/wpfy/sites/<domain>/`:
 
-```
+```text
 /opt/wpfy/sites/example.com/
 ├── compose.yaml      # the site's Docker Compose definition
 ├── .env              # site configuration and credentials (root-only)
