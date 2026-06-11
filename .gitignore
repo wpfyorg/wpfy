@@ -6,3 +6,8 @@ __pycache__/
 .context/
 conductor.json
 
+# Never commit environment files or local secrets (defensive; none exist in-repo)
+.env
+.env.*
+*.local
+
