@@ -159,3 +159,63 @@ def test_traefik_status_before_scaffold_does_not_raise(tmp_wpfy_home, monkeypatc
 
     assert result.exit_code == 0
     assert "not installed" in result.message
+
+
+def test_acme_email_problem_flags_unconfigured_default(monkeypatch, tmp_path):
+    import wpfy.traefik as traefik
+
+    monkeypatch.setattr(traefik, "traefik_config_path", lambda: tmp_path / "traefik.yml")
+    monkeypatch.delenv("WPFY_ACME_EMAIL", raising=False)
+
+    problem = traefik.acme_email_problem()
+
+    assert problem is not None
+    assert "WPFY_ACME_EMAIL" in problem
+
+
+def test_acme_email_problem_accepts_valid_env_email(monkeypatch, tmp_path):
+    import wpfy.traefik as traefik
+
+    monkeypatch.setattr(traefik, "traefik_config_path", lambda: tmp_path / "traefik.yml")
+    monkeypatch.setenv("WPFY_ACME_EMAIL", "ops@example.com")
+
+    assert traefik.acme_email_problem() is None
+
+
+def test_acme_email_problem_rejects_malformed_env_email(monkeypatch, tmp_path):
+    import wpfy.traefik as traefik
+
+    monkeypatch.setattr(traefik, "traefik_config_path", lambda: tmp_path / "traefik.yml")
+    monkeypatch.setenv("WPFY_ACME_EMAIL", "not-an-email")
+
+    assert traefik.acme_email_problem() is not None
+
+
+def test_acme_email_problem_reads_scaffolded_config_over_env(monkeypatch, tmp_path):
+    import wpfy.traefik as traefik
+
+    config = tmp_path / "traefik.yml"
+    config.write_text(
+        "certificatesResolvers:\n  le:\n    acme:\n      email: admin@localhost\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(traefik, "traefik_config_path", lambda: config)
+    # The already-written proxy config is what Traefik actually uses, so a
+    # valid env var alone is not enough until the scaffold is regenerated.
+    monkeypatch.setenv("WPFY_ACME_EMAIL", "ops@example.com")
+
+    assert traefik.acme_email_problem() is not None
+
+
+def test_acme_email_problem_accepts_valid_scaffolded_config(monkeypatch, tmp_path):
+    import wpfy.traefik as traefik
+
+    config = tmp_path / "traefik.yml"
+    config.write_text(
+        "certificatesResolvers:\n  le:\n    acme:\n      email: ops@example.com\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(traefik, "traefik_config_path", lambda: config)
+    monkeypatch.delenv("WPFY_ACME_EMAIL", raising=False)
+
+    assert traefik.acme_email_problem() is None

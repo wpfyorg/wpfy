@@ -359,3 +359,94 @@ def test_remove_sftp_regenerates_all_persisted_state(tmp_wpfy_home, monkeypatch)
     assert "SFTP_PASSWORD" not in env
     assert "SFTP_PORT" not in env
     assert "sftp_enabled" not in metadata
+
+
+def test_ensure_sftp_container_explicit_password_rotates_existing(tmp_wpfy_home, monkeypatch):
+    import wpfy.sftp
+    import wpfy.site_layout
+
+    importlib.reload(wpfy.site_layout)
+    importlib.reload(wpfy.sftp)
+    monkeypatch.setenv("WPFY_SKIP_RUNTIME", "1")
+    monkeypatch.setattr(wpfy.sftp, "_wait_for_sftp_port", lambda host_port="2222": True)
+
+    class Proc:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    monkeypatch.setattr(wpfy.sftp, "compose_command", lambda *args: Proc())
+
+    domain = "sftp-rotate.example.com"
+    spec = SiteSpec(domain=domain, flavor="html", use_mysql=False, use_redis=False)
+    wpfy.site_layout.ensure_site_scaffold(spec)
+    env_file = wpfy.site_layout.env_path(domain)
+    existing = env_file.read_text(encoding="utf-8")
+    env_file.write_text(existing + "SFTP_PASSWORD=old-secret\nSFTP_PORT=2222\n", encoding="utf-8")
+
+    result = wpfy.sftp.ensure_sftp_container(domain, password="new-secret")
+
+    env_text = env_file.read_text(encoding="utf-8")
+    assert result.exit_code == 0
+    assert "SFTP_PASSWORD=new-secret" in env_text
+    assert "old-secret" not in env_text
+    # An explicitly chosen password is never echoed back.
+    assert "new-secret" not in result.message
+
+
+def test_ensure_sftp_container_shows_generated_password_once(tmp_wpfy_home, monkeypatch):
+    import wpfy.sftp
+    import wpfy.site_layout
+
+    importlib.reload(wpfy.site_layout)
+    importlib.reload(wpfy.sftp)
+    monkeypatch.setenv("WPFY_SKIP_RUNTIME", "1")
+    monkeypatch.setattr(wpfy.sftp, "_wait_for_sftp_port", lambda host_port="2222": True)
+
+    class Proc:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    monkeypatch.setattr(wpfy.sftp, "compose_command", lambda *args: Proc())
+
+    domain = "sftp-generated.example.com"
+    spec = SiteSpec(domain=domain, flavor="html", use_mysql=False, use_redis=False)
+    wpfy.site_layout.ensure_site_scaffold(spec)
+
+    result = wpfy.sftp.ensure_sftp_container(domain)
+
+    env = wpfy.site_layout.read_env(wpfy.site_layout.env_path(domain))
+    assert result.exit_code == 0
+    assert env["SFTP_PASSWORD"]
+    assert f"password (shown once): {env['SFTP_PASSWORD']}" in result.message
+
+
+def test_ensure_sftp_container_does_not_reveal_existing_password(tmp_wpfy_home, monkeypatch):
+    import wpfy.sftp
+    import wpfy.site_layout
+
+    importlib.reload(wpfy.site_layout)
+    importlib.reload(wpfy.sftp)
+    monkeypatch.setenv("WPFY_SKIP_RUNTIME", "1")
+    monkeypatch.setattr(wpfy.sftp, "_wait_for_sftp_port", lambda host_port="2222": True)
+
+    class Proc:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    monkeypatch.setattr(wpfy.sftp, "compose_command", lambda *args: Proc())
+
+    domain = "sftp-existing.example.com"
+    spec = SiteSpec(domain=domain, flavor="html", use_mysql=False, use_redis=False)
+    wpfy.site_layout.ensure_site_scaffold(spec)
+    env_file = wpfy.site_layout.env_path(domain)
+    existing = env_file.read_text(encoding="utf-8")
+    env_file.write_text(existing + "SFTP_PASSWORD=existing-secret\nSFTP_PORT=2222\n", encoding="utf-8")
+
+    result = wpfy.sftp.ensure_sftp_container(domain)
+
+    assert result.exit_code == 0
+    assert "existing-secret" not in result.message
+    assert "shown once" not in result.message

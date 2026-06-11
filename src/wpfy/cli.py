@@ -23,6 +23,8 @@ from . import operational_inspection
 from .php_runtime import DEFAULT_PHP_VERSION, PHP_IMAGE_REPOSITORY, SUPPORTED_PHP_VERSIONS, php_image
 from .certificate_lifecycle import cert_expiry_days, force_renew_cert, get_cert_info, preflight_ssl
 from .site_layout import (
+    MARIADB_IMAGE,
+    REDIS_IMAGE,
     WORDPRESS_FLAVORS,
     backup_site,
     compose_command,
@@ -1158,7 +1160,7 @@ def make_site_handler(name: str):
                     return CommandResult(f"delete aborted")
             try:
                 backup_result = backup_site(domain)
-                stop_result = stop_site_runtime(domain)
+                stop_result = stop_site_runtime(domain, remove_volumes=True)
                 removed = remove_site_scaffold(domain)
             except (FileNotFoundError, ValueError) as exc:
                 return CommandResult(str(exc), exit_code=2)
@@ -1215,8 +1217,8 @@ def handle_stack_install(args: argparse.Namespace) -> CommandResult:
             pulled_php_versions.add(php_ver)
 
     if install_all or getattr(args, "mysql", False) or getattr(args, "mariadb", False):
-        image = "mariadb:11.4"
-        _progress("Pulling MariaDB 11.4 image...")
+        image = MARIADB_IMAGE
+        _progress(f"Pulling {image} image...")
         proc = subprocess.run(["docker", "pull", image], check=False, capture_output=True, text=True)
         if proc.returncode == 0:
             results.append(f"MariaDB: OK pulled {image}")
@@ -1226,8 +1228,8 @@ def handle_stack_install(args: argparse.Namespace) -> CommandResult:
             exit_code = proc.returncode or 1
 
     if install_all or getattr(args, "redis", False):
-        image = "redis:7-alpine"
-        _progress("Pulling Redis 7 image...")
+        image = REDIS_IMAGE
+        _progress(f"Pulling {image} image...")
         proc = subprocess.run(["docker", "pull", image], check=False, capture_output=True, text=True)
         if proc.returncode == 0:
             results.append(f"Redis: OK pulled {image}")
@@ -1346,7 +1348,7 @@ def handle_stack_purge(args: argparse.Namespace) -> CommandResult:
 
     purge_msgs.append(
         f"pulled images: docker rmi {php_image(DEFAULT_PHP_VERSION)} "
-        f"mariadb:11.4 redis:7-alpine {traefik.TRAEFIK_IMAGE}"
+        f"{MARIADB_IMAGE} {REDIS_IMAGE} {traefik.TRAEFIK_IMAGE}"
     )
     return CommandResult("\n".join(purge_msgs))
 

@@ -776,3 +776,194 @@ def test_restore_valid_archive_preserves_private_env(tmp_wpfy_home, monkeypatch)
     assert result.exit_code == 0
     mode = stat.S_IMODE(wpfy.site_layout.env_path("valid.example.com").stat().st_mode)
     assert mode == 0o600
+
+
+def test_nginx_conf_allows_large_uploads_and_long_requests(tmp_wpfy_home, monkeypatch):
+    import wpfy.site_layout
+
+    importlib.reload(wpfy.site_layout)
+    spec = wpfy.site_layout.SiteSpec(domain="uploads.example.com", flavor="wp", use_mysql=True, use_redis=False)
+
+    wpfy.site_layout.ensure_site_scaffold(spec)
+
+    content = wpfy.site_layout.nginx_conf_path("uploads.example.com").read_text(encoding="utf-8")
+    # Matches the bundled PHP images (upload_max_filesize 64M, max_execution_time 300).
+    assert "client_max_body_size 64m;" in content
+    assert "fastcgi_read_timeout 300s;" in content
+
+
+def test_nginx_conf_php_handler_is_case_insensitive_with_missing_file_guard(tmp_wpfy_home, monkeypatch):
+    import wpfy.site_layout
+
+    importlib.reload(wpfy.site_layout)
+    spec = wpfy.site_layout.SiteSpec(domain="phpcase.example.com", flavor="wp", use_mysql=True, use_redis=False)
+
+    wpfy.site_layout.ensure_site_scaffold(spec)
+
+    content = wpfy.site_layout.nginx_conf_path("phpcase.example.com").read_text(encoding="utf-8")
+    assert "location ~* \\.php$ {" in content
+    assert "try_files $uri =404;" in content
+
+
+def test_nginx_conf_hsts_only_when_ssl_enabled(tmp_wpfy_home, monkeypatch):
+    import wpfy.site_layout
+
+    importlib.reload(wpfy.site_layout)
+    hsts = "Strict-Transport-Security"
+
+    plain = wpfy.site_layout.SiteSpec(domain="plain.example.com", flavor="wp", use_mysql=True, use_redis=False)
+    wpfy.site_layout.ensure_site_scaffold(plain)
+    assert hsts not in wpfy.site_layout.nginx_conf_path("plain.example.com").read_text(encoding="utf-8")
+
+    ssl = wpfy.site_layout.SiteSpec(
+        domain="tls.example.com", flavor="wp", use_mysql=True, use_redis=False,
+        letsencrypt="default", ssl_enabled=True,
+    )
+    wpfy.site_layout.ensure_site_scaffold(ssl)
+    assert hsts in wpfy.site_layout.nginx_conf_path("tls.example.com").read_text(encoding="utf-8")
+
+
+def test_env_content_preserves_operator_added_keys():
+    spec = _spec(domain="example.com", flavor="wp", use_mysql=True, use_redis=False)
+    existing = {
+        "DB_PASSWORD": "keep-db",
+        "WP_DEBUG": "1",
+        "MY_API_KEY": "operator-added",
+    }
+
+    content = env_content(spec, existing)
+
+    assert "WP_DEBUG=1" in content
+    assert "MY_API_KEY=operator-added" in content
+    assert "DB_PASSWORD=keep-db" in content
+
+
+def test_env_content_still_drops_managed_keys_owned_by_spec():
+    # SFTP disabled in the spec: SFTP_* must not be resurrected from the old .env.
+    spec = _spec(domain="example.com", flavor="wp", use_mysql=True, use_redis=False)
+    existing = {"SFTP_PASSWORD": "old-secret", "SFTP_PORT": "2222", "CUSTOM": "kept"}
+
+    content = env_content(spec, existing)
+
+    assert "SFTP_PASSWORD" not in content
+    assert "SFTP_PORT" not in content
+    assert "CUSTOM=kept" in content
+
+
+def test_ensure_site_scaffold_rejects_compose_project_collision(tmp_wpfy_home, monkeypatch):
+    import wpfy.site_layout
+
+    importlib.reload(wpfy.site_layout)
+    first = wpfy.site_layout.SiteSpec(domain="a-b.example.com", flavor="html", use_mysql=False, use_redis=False)
+    wpfy.site_layout.ensure_site_scaffold(first)
+
+    second = wpfy.site_layout.SiteSpec(domain="a.b.example.com", flavor="html", use_mysql=False, use_redis=False)
+    with pytest.raises(ValueError, match="compose project"):
+        wpfy.site_layout.ensure_site_scaffold(second)
+
+    # Re-running the original domain stays idempotent.
+    wpfy.site_layout.ensure_site_scaffold(first)
+
+
+def test_site_exists_rejects_traversal_input(tmp_wpfy_home, monkeypatch):
+    import wpfy.site_layout
+
+    importlib.reload(wpfy.site_layout)
+    assert wpfy.site_layout.site_exists("../../etc") is False
+    assert wpfy.site_layout.site_exists("/etc") is False
+    assert wpfy.site_layout.site_exists("not a domain") is False
+
+
+def test_stop_site_runtime_omits_volume_removal_by_default(tmp_wpfy_home, monkeypatch):
+    import wpfy.site_layout
+
+    importlib.reload(wpfy.site_layout)
+    monkeypatch.delenv("WPFY_SKIP_RUNTIME", raising=False)
+    monkeypatch.setattr(wpfy.site_layout, "docker_available", lambda: True)
+    calls = []
+
+    class Proc:
+        returncode = 0
+        stdout = "stopped"
+        stderr = ""
+
+    monkeypatch.setattr(wpfy.site_layout, "compose_command", lambda domain, *args: calls.append(args) or Proc())
+
+    wpfy.site_layout.stop_site_runtime("stop.example.com")
+    wpfy.site_layout.stop_site_runtime("stop.example.com", remove_volumes=True)
+
+    assert calls == [("down",), ("down", "-v")]
+
+
+def test_extract_tar_safely_rejects_traversal_member(tmp_path):
+    import wpfy.site_layout
+
+    archive_path = tmp_path / "evil.tar.gz"
+    _write_tar_with_text(archive_path, {"wordpress/index.php": "<?php\n", "../escape.txt": "bad"})
+    destination = tmp_path / "dest"
+    destination.mkdir()
+
+    with tarfile.open(archive_path, "r:gz") as archive:
+        with pytest.raises(Exception):
+            wpfy.site_layout._extract_tar_safely(archive, str(destination))
+
+    assert not (tmp_path / "escape.txt").exists()
+
+
+def test_restore_preserves_live_db_credentials_when_db_initialized(tmp_wpfy_home, monkeypatch):
+    import wpfy.site_layout
+
+    importlib.reload(wpfy.site_layout)
+    monkeypatch.setenv("WPFY_SKIP_RUNTIME", "1")
+    domain = "restore-live.example.com"
+    spec = wpfy.site_layout.SiteSpec(domain=domain, flavor="wp", use_mysql=True, use_redis=False)
+    wpfy.site_layout.ensure_site_scaffold(spec)
+
+    backup = wpfy.site_layout.backup_site(domain)
+    assert backup.exit_code == 0
+    archive_path = backup.message.removeprefix("backup created: ")
+
+    # Rotate credentials after the backup and mark the DB volume as initialized:
+    # the archive now carries stale credentials the volume no longer accepts.
+    env_file = wpfy.site_layout.env_path(domain)
+    rotated = wpfy.site_layout.read_env(env_file)
+    old_password = rotated["DB_PASSWORD"]
+    rotated["DB_PASSWORD"] = "rotated-live-password"
+    rotated["DB_ROOT_PASSWORD"] = "rotated-root-password"
+    env_file.write_text("\n".join(f"{k}={v}" for k, v in rotated.items()) + "\n", encoding="utf-8")
+    (wpfy.site_layout.db_data_dir(domain) / "ibdata1").write_text("initialized", encoding="utf-8")
+
+    result = wpfy.site_layout.restore_site(domain, archive_path)
+
+    restored = wpfy.site_layout.read_env(env_file)
+    assert result.exit_code == 0
+    assert restored["DB_PASSWORD"] == "rotated-live-password"
+    assert restored["DB_ROOT_PASSWORD"] == "rotated-root-password"
+    assert restored["DB_PASSWORD"] != old_password
+
+
+def test_restore_keeps_archive_credentials_for_uninitialized_db(tmp_wpfy_home, monkeypatch):
+    import wpfy.site_layout
+
+    importlib.reload(wpfy.site_layout)
+    monkeypatch.setenv("WPFY_SKIP_RUNTIME", "1")
+    domain = "restore-fresh.example.com"
+    spec = wpfy.site_layout.SiteSpec(domain=domain, flavor="wp", use_mysql=True, use_redis=False)
+    wpfy.site_layout.ensure_site_scaffold(spec)
+
+    backup = wpfy.site_layout.backup_site(domain)
+    assert backup.exit_code == 0
+    archive_path = backup.message.removeprefix("backup created: ")
+
+    env_file = wpfy.site_layout.env_path(domain)
+    archived = wpfy.site_layout.read_env(env_file)
+    rotated = dict(archived)
+    rotated["DB_PASSWORD"] = "rotated-live-password"
+    env_file.write_text("\n".join(f"{k}={v}" for k, v in rotated.items()) + "\n", encoding="utf-8")
+    # db-data stays empty: MariaDB will initialize from the restored .env.
+
+    result = wpfy.site_layout.restore_site(domain, archive_path)
+
+    restored = wpfy.site_layout.read_env(env_file)
+    assert result.exit_code == 0
+    assert restored["DB_PASSWORD"] == archived["DB_PASSWORD"]

@@ -290,8 +290,8 @@ def test_stack_install_shows_tty_progress(monkeypatch, capsys):
     assert result == 0
     assert "Starting shared Traefik edge proxy..." in progress
     assert "Pulling PHP 8.4 runtime image..." in progress
-    assert "Pulling MariaDB 11.4 image..." in progress
-    assert "Pulling Redis 7 image..." in progress
+    assert "Pulling mariadb:11.4 image..." in progress
+    assert "Pulling redis:7.2-alpine image..." in progress
 
 
 def test_stack_install_php_pull_failure_exits_nonzero(monkeypatch, capsys):

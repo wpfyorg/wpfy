@@ -18,8 +18,10 @@ from .site_layout import (
     site_info,
     start_site_runtime,
     wordpress_install_state,
+    wp_cli_command,
 )
 from .certificate_lifecycle import preflight_ssl
+from .traefik import acme_email_problem
 
 
 MYSQL_FLAVORS = {
@@ -111,6 +113,22 @@ class SiteLifecycleError(Exception):
         self.preflight = preflight
 
 
+def _require_acme_email() -> None:
+    problem = acme_email_problem()
+    if problem:
+        raise SiteLifecycleError(problem, preflight=True)
+
+
+def _resolve_admin_user(domain: str) -> str:
+    proc = wp_cli_command(domain, "user", "list", "--role=administrator", "--field=user_login", "--allow-root")
+    if proc.returncode == 0:
+        for line in proc.stdout.splitlines():
+            candidate = line.strip()
+            if candidate:
+                return candidate
+    return "admin"
+
+
 def _resolve_proxied(override: bool | None, detected_mode: str | None) -> bool:
     if override is not None:
         return override
@@ -155,6 +173,7 @@ def create_site(
 
     if request.letsencrypt:
         report("preflight")
+        _require_acme_email()
         preflight = preflight_ssl(request.domain)
         if not preflight.passed:
             raise SiteLifecycleError(preflight.message, preflight=True)
@@ -266,6 +285,7 @@ def update_site(request: UpdateSiteRequest) -> UpdateSiteResult:
     preflight_message: str | None = None
     detected_mode: str | None = None
     if new_letsencrypt and not current_letsencrypt:
+        _require_acme_email()
         preflight = preflight_ssl(domain)
         if not preflight.passed:
             raise SiteLifecycleError(preflight.message, preflight=True)
@@ -297,23 +317,24 @@ def update_site(request: UpdateSiteRequest) -> UpdateSiteResult:
 
     password_summary: str | None = None
     if request.password:
-        proc = compose_command(
+        admin_user = _resolve_admin_user(domain)
+        # The password travels over stdin (--prompt) so it never appears in
+        # process argv on the host or inside the container.
+        proc = wp_cli_command(
             domain,
-            "--profile",
-            "cli",
-            "run",
-            "--rm",
-            "wpcli",
             "user",
             "update",
-            "admin",
-            f"--user_pass={request.password}",
+            admin_user,
+            "--skip-email",
+            "--prompt=user_pass",
             "--allow-root",
+            input_text=request.password + "\n",
         )
         if proc.returncode != 0:
-            password_summary = f"FAIL {proc.stderr.strip() or proc.stdout.strip()}"
+            message = proc.stderr.strip() or proc.stdout.strip() or "wp user update failed"
+            password_summary = f"FAIL {message.replace(request.password, '***REDACTED***')}"
         else:
-            password_summary = "OK admin password updated"
+            password_summary = f"OK password updated for {admin_user}"
 
     exit_code = runtime.exit_code if runtime.exit_code and not runtime.skipped else 0
     return UpdateSiteResult(
@@ -334,6 +355,7 @@ def enable_ssl(
     dns_provider: str | None = None,
     proxied_override: bool | None = None,
 ) -> EnableSSLResult:
+    _require_acme_email()
     preflight = preflight_ssl(domain)
     if not preflight.passed:
         raise SiteLifecycleError(preflight.message, preflight=True)

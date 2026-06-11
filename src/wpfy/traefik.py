@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -10,6 +11,8 @@ from .site_layout import RuntimeResult, runtime_skip_requested, docker_available
 
 
 TRAEFIK_IMAGE = "traefik:v3.6.17"
+_DEFAULT_ACME_EMAIL = "admin@localhost"
+_ACME_EMAIL_RE = re.compile(r"[^@\s]+@[^@\s.]+(?:\.[^@\s.]+)+")
 TRAEFIK_NETWORK = "wpfy"
 TRAEFIK_CONTAINER = "wpfy-traefik"
 TRAEFIK_PROJECT = "wpfy-traefik"
@@ -64,8 +67,35 @@ def ensure_traefik_network() -> RuntimeResult:
     return RuntimeResult(0, f"traefik network '{TRAEFIK_NETWORK}' created", ran=True)
 
 
+def effective_acme_email() -> str:
+    """The ACME contact email Traefik will actually use: the one already
+    written to traefik.yml if the proxy is scaffolded, else the env value
+    a future scaffold would render."""
+    config_file = traefik_config_path()
+    if config_file.exists():
+        for line in config_file.read_text(encoding="utf-8").splitlines():
+            stripped = line.strip()
+            if stripped.startswith("email:"):
+                return stripped.split(":", 1)[1].strip()
+    return os.environ.get("WPFY_ACME_EMAIL", _DEFAULT_ACME_EMAIL)
+
+
+def acme_email_problem() -> str | None:
+    """Return an actionable message if certificate issuance would fail at ACME
+    registration because no real contact email is configured, else None."""
+    email = effective_acme_email()
+    if email and email != _DEFAULT_ACME_EMAIL and _ACME_EMAIL_RE.fullmatch(email):
+        return None
+    return (
+        f"ACME contact email is not configured (current: {email or 'unset'}); "
+        "Let's Encrypt rejects invalid contact addresses. "
+        "Set WPFY_ACME_EMAIL=you@example.com and re-run 'wpfy stack install --nginx', "
+        "then retry enabling SSL"
+    )
+
+
 def traefik_static_config() -> str:
-    acme_email = os.environ.get("WPFY_ACME_EMAIL", "admin@localhost")
+    acme_email = os.environ.get("WPFY_ACME_EMAIL", _DEFAULT_ACME_EMAIL)
     lines = [
         "api:",
         "  dashboard: false",

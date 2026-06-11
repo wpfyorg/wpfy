@@ -9,6 +9,7 @@ def test_create_site_runs_lifecycle_in_order(monkeypatch):
 
     calls: list[str] = []
     captured = {}
+    monkeypatch.setattr(lifecycle, "acme_email_problem", lambda: None)
     monkeypatch.setattr(
         lifecycle,
         "preflight_ssl",
@@ -61,6 +62,7 @@ def test_create_site_stops_before_mutation_when_preflight_fails(monkeypatch):
     import pytest
     import wpfy.site_lifecycle as lifecycle
 
+    monkeypatch.setattr(lifecycle, "acme_email_problem", lambda: None)
     monkeypatch.setattr(
         lifecycle,
         "preflight_ssl",
@@ -110,6 +112,7 @@ def test_enable_ssl_preserves_existing_site_definition(monkeypatch):
     import wpfy.site_lifecycle as lifecycle
 
     captured = {}
+    monkeypatch.setattr(lifecycle, "acme_email_problem", lambda: None)
     monkeypatch.setattr(
         lifecycle,
         "preflight_ssl",
@@ -150,6 +153,7 @@ def test_enable_ssl_preserves_existing_site_definition(monkeypatch):
 def test_enable_ssl_returns_failure_when_wordpress_url_update_fails(monkeypatch):
     import wpfy.site_lifecycle as lifecycle
 
+    monkeypatch.setattr(lifecycle, "acme_email_problem", lambda: None)
     monkeypatch.setattr(
         lifecycle,
         "preflight_ssl",
@@ -171,3 +175,133 @@ def test_enable_ssl_returns_failure_when_wordpress_url_update_fails(monkeypatch)
 
     assert result.exit_code == 1
     assert result.wordpress_message == "FAIL database unavailable"
+
+
+def test_update_site_password_travels_via_stdin(monkeypatch):
+    import wpfy.site_lifecycle as lifecycle
+
+    calls = []
+    monkeypatch.setattr(lifecycle, "site_info", lambda domain: {"domain": domain, "flavor": "wp"})
+    monkeypatch.setattr(lifecycle, "read_env", lambda path: {"SITE_FLAVOR": "wp", "PHP_VERSION": "8.4"})
+    monkeypatch.setattr(lifecycle, "ensure_site_scaffold", lambda spec: [])
+    monkeypatch.setattr(lifecycle, "start_site_runtime", lambda domain: RuntimeResult(0, "started", ran=True))
+
+    class Proc:
+        returncode = 0
+        stdout = "site-admin\n"
+        stderr = ""
+
+    def fake_wp_cli(domain, *args, input_text=None):
+        calls.append((args, input_text))
+        return Proc()
+
+    monkeypatch.setattr(lifecycle, "wp_cli_command", fake_wp_cli)
+
+    result = lifecycle.update_site(lifecycle.UpdateSiteRequest("example.com", password="s3cret-pass"))
+
+    update_args, update_stdin = calls[-1]
+    assert "--prompt=user_pass" in update_args
+    assert update_stdin == "s3cret-pass\n"
+    # The password must never appear in process argv.
+    assert all("s3cret-pass" not in arg for arg in update_args)
+    # The actual administrator login resolved from wp-cli is targeted, not a literal "admin".
+    assert "site-admin" in update_args
+    assert result.password_summary == "OK password updated for site-admin"
+
+
+def test_update_site_password_falls_back_to_admin_when_lookup_fails(monkeypatch):
+    import wpfy.site_lifecycle as lifecycle
+
+    calls = []
+    monkeypatch.setattr(lifecycle, "site_info", lambda domain: {"domain": domain, "flavor": "wp"})
+    monkeypatch.setattr(lifecycle, "read_env", lambda path: {"SITE_FLAVOR": "wp", "PHP_VERSION": "8.4"})
+    monkeypatch.setattr(lifecycle, "ensure_site_scaffold", lambda spec: [])
+    monkeypatch.setattr(lifecycle, "start_site_runtime", lambda domain: RuntimeResult(0, "started", ran=True))
+
+    class Proc:
+        def __init__(self, returncode, stdout=""):
+            self.returncode = returncode
+            self.stdout = stdout
+            self.stderr = ""
+
+    def fake_wp_cli(domain, *args, input_text=None):
+        calls.append(args)
+        if args[:2] == ("user", "list"):
+            return Proc(1)
+        return Proc(0)
+
+    monkeypatch.setattr(lifecycle, "wp_cli_command", fake_wp_cli)
+
+    result = lifecycle.update_site(lifecycle.UpdateSiteRequest("example.com", password="s3cret-pass"))
+
+    assert "admin" in calls[-1]
+    assert result.password_summary == "OK password updated for admin"
+
+
+def test_update_site_password_failure_is_redacted(monkeypatch):
+    import wpfy.site_lifecycle as lifecycle
+
+    monkeypatch.setattr(lifecycle, "site_info", lambda domain: {"domain": domain, "flavor": "wp"})
+    monkeypatch.setattr(lifecycle, "read_env", lambda path: {"SITE_FLAVOR": "wp", "PHP_VERSION": "8.4"})
+    monkeypatch.setattr(lifecycle, "ensure_site_scaffold", lambda spec: [])
+    monkeypatch.setattr(lifecycle, "start_site_runtime", lambda domain: RuntimeResult(0, "started", ran=True))
+
+    class Proc:
+        def __init__(self, returncode, stdout="", stderr=""):
+            self.returncode = returncode
+            self.stdout = stdout
+            self.stderr = stderr
+
+    def fake_wp_cli(domain, *args, input_text=None):
+        if args[:2] == ("user", "list"):
+            return Proc(0, stdout="admin\n")
+        return Proc(1, stderr="error processing s3cret-pass input")
+
+    monkeypatch.setattr(lifecycle, "wp_cli_command", fake_wp_cli)
+
+    result = lifecycle.update_site(lifecycle.UpdateSiteRequest("example.com", password="s3cret-pass"))
+
+    assert result.password_summary.startswith("FAIL")
+    assert "s3cret-pass" not in result.password_summary
+
+
+def test_create_site_requires_acme_email_before_preflight(monkeypatch):
+    import pytest
+    import wpfy.site_lifecycle as lifecycle
+
+    monkeypatch.setattr(lifecycle, "acme_email_problem", lambda: "ACME contact email is not configured")
+    monkeypatch.setattr(
+        lifecycle,
+        "preflight_ssl",
+        lambda domain: pytest.fail("preflight must not run without an ACME email"),
+    )
+    monkeypatch.setattr(
+        lifecycle,
+        "ensure_site_scaffold",
+        lambda spec: pytest.fail("scaffold must not run without an ACME email"),
+    )
+
+    with pytest.raises(lifecycle.SiteLifecycleError, match="ACME contact email") as exc:
+        lifecycle.create_site(
+            lifecycle.CreateSiteRequest("example.com", "wp", letsencrypt="certbot"),
+            credentials=lambda: pytest.fail("credentials must not be requested"),
+        )
+
+    assert exc.value.preflight is True
+
+
+def test_enable_ssl_requires_acme_email(monkeypatch):
+    import pytest
+    import wpfy.site_lifecycle as lifecycle
+
+    monkeypatch.setattr(lifecycle, "acme_email_problem", lambda: "ACME contact email is not configured")
+    monkeypatch.setattr(
+        lifecycle,
+        "preflight_ssl",
+        lambda domain: pytest.fail("preflight must not run without an ACME email"),
+    )
+
+    with pytest.raises(lifecycle.SiteLifecycleError, match="ACME contact email") as exc:
+        lifecycle.enable_ssl("example.com", letsencrypt="certbot")
+
+    assert exc.value.preflight is True

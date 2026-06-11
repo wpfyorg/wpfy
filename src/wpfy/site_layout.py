@@ -22,6 +22,12 @@ from .site_definition import SiteDefinition, sftp_service_lines
 PHP_IMAGE_REPOSITORY = _PHP_IMAGE_REPOSITORY
 WORDPRESS_FLAVORS = {"wp", "wpfc", "wpredis", "wpsc", "wprocket", "wpce", "wpsubdir", "wpsubdomain"}
 
+# Single source of truth for non-PHP service images: compose_content renders
+# these and `wpfy stack install` pre-pulls the same tags.
+WEB_IMAGE = "nginxinc/nginx-unprivileged:1.27-alpine"
+MARIADB_IMAGE = "mariadb:11.4"
+REDIS_IMAGE = "redis:7.2-alpine"
+
 # Base for per-site UID/GID allocation. Each site gets a unique uid (== gid) used
 # by every one of its containers and to own its host files, so a compromised (or
 # escaped) container from one site has no uid-level path to another site's files,
@@ -113,8 +119,8 @@ def compose_content(spec: SiteSpec) -> str:
     if spec.site_uid is None:
         raise ValueError("compose_content requires spec.site_uid; allocate it via ensure_site_scaffold")
     user = f"{spec.site_uid}:{spec.site_uid}"
-    web_image = "nginxinc/nginx-unprivileged:1.27-alpine"
-    db_image = "mariadb:11.4"
+    web_image = WEB_IMAGE
+    db_image = MARIADB_IMAGE
     lines = [
         f"name: {project}",
         "services:",
@@ -244,7 +250,7 @@ def compose_content(spec: SiteSpec) -> str:
         lines.extend([
             "",
             "  redis:",
-            "    image: redis:7.2-alpine",
+            f"    image: {REDIS_IMAGE}",
             f"    container_name: {project}-redis",
             "    command: [\"redis-server\", \"--appendonly\", \"yes\"]",
             "    restart: unless-stopped",
@@ -329,9 +335,24 @@ def generated_secret() -> str:
     return secrets.token_urlsafe(32)
 
 
+# Keys fully owned by SiteDefinition.env_values: regeneration adds or drops them
+# from .env as the spec dictates (e.g. disabling SFTP removes SFTP_PASSWORD).
+# Any other key found in an existing .env was added by the operator and must
+# survive regeneration untouched.
+MANAGED_ENV_KEYS = {
+    "DOMAIN", "COMPOSE_PROJECT_NAME", "SITE_FLAVOR", "APP_ROOT", "PHP_VERSION",
+    "SITE_UID", "DB_NAME", "DB_USER", "DB_PASSWORD", "DB_ROOT_PASSWORD",
+    "LETSENCRYPT_MODE", "DNS_PROVIDER", "PROXIED", "REDIS_ENABLED",
+    "SFTP_PASSWORD", "SFTP_PORT",
+}
+
+
 def env_content(spec: SiteSpec, existing: dict[str, str] | None = None) -> str:
     existing = existing or {}
-    return "\n".join(f"{key}={value}" for key, value in spec.env_values(existing, generated_secret)) + "\n"
+    values = list(spec.env_values(existing, generated_secret))
+    managed = {key for key, _ in values} | MANAGED_ENV_KEYS
+    values.extend((key, value) for key, value in existing.items() if key not in managed)
+    return "\n".join(f"{key}={value}" for key, value in values) + "\n"
 
 
 def read_text(path: Path) -> str | None:
@@ -401,10 +422,11 @@ def start_site_runtime(domain: str) -> RuntimeResult:
     return RuntimeResult(0, message, ran=True)
 
 
-def stop_site_runtime(domain: str) -> RuntimeResult:
+def stop_site_runtime(domain: str, *, remove_volumes: bool = False) -> RuntimeResult:
     if runtime_skip_requested() or not docker_available():
         return RuntimeResult(0, "runtime stop skipped", skipped=True)
-    proc = compose_command(domain, "down", "-v")
+    args = ("down", "-v") if remove_volumes else ("down",)
+    proc = compose_command(domain, *args)
     if proc.returncode != 0:
         message = proc.stderr.strip() or proc.stdout.strip() or "docker compose down failed"
         return RuntimeResult(proc.returncode, message)
@@ -603,7 +625,7 @@ def bootstrap_site_files(domain: str) -> RuntimeResult:
             with urlopen("https://wordpress.org/latest.tar.gz", timeout=15) as response:
                 archive_path.write_bytes(response.read())
             with tarfile.open(archive_path, "r:gz") as archive:
-                archive.extractall(temp_dir)
+                _extract_tar_safely(archive, temp_dir)
 
             wordpress_root = Path(temp_dir) / "wordpress"
             if wordpress_root.exists():
@@ -815,6 +837,20 @@ def provision_wordpress_site(
     return RuntimeResult(0, f"wordpress installed for {domain} (admin user: {admin_user})", ran=True)
 
 
+def _unsafe_member_reason(member: tarfile.TarInfo) -> str | None:
+    name = member.name
+    path = Path(name)
+    if path.is_absolute():
+        return f"absolute path: {name}"
+    if any(part == ".." for part in path.parts):
+        return f"unsafe path: {name}"
+    if member.issym() or member.islnk():
+        return f"unsupported link: {name}"
+    if member.isdev():
+        return f"unsupported device file: {name}"
+    return None
+
+
 def _validate_restore_member(member: tarfile.TarInfo, domain: str) -> str | None:
     name = member.name
     path = Path(name)
@@ -831,6 +867,20 @@ def _validate_restore_member(member: tarfile.TarInfo, domain: str) -> str | None
     return None
 
 
+def _extract_tar_safely(archive: tarfile.TarFile, destination: str) -> None:
+    """Extract with the stdlib data filter; on Pythons without the filter
+    kwarg, reject traversal/link/device members ourselves before extracting."""
+    try:
+        archive.extractall(destination, filter="data")
+    except TypeError:
+        members = archive.getmembers()
+        for member in members:
+            reason = _unsafe_member_reason(member)
+            if reason:
+                raise RuntimeError(f"refusing to extract archive member with {reason}")
+        archive.extractall(destination, members=members)
+
+
 def _restore_archive_to_temp(source: Path, domain: str, temp_dir: str) -> RuntimeResult | None:
     with tarfile.open(source, "r:gz") as archive:
         members = archive.getmembers()
@@ -840,6 +890,29 @@ def _restore_archive_to_temp(source: Path, domain: str, temp_dir: str) -> Runtim
                 return RuntimeResult(2, error)
         archive.extractall(temp_dir, members=members)
     return None
+
+
+def _preserve_live_db_credentials(domain: str, live_env: dict[str, str]) -> None:
+    """Backups carry the SQL dump but not db-data/, so an initialized MariaDB
+    volume keeps its pre-restore users. Restoring the archive's old DB
+    credentials into .env would break authentication; keep the live ones."""
+    keys = ("DB_NAME", "DB_USER", "DB_PASSWORD", "DB_ROOT_PASSWORD")
+    preserved = {key: live_env[key] for key in keys if live_env.get(key)}
+    if not preserved:
+        return
+    data_dir = db_data_dir(domain)
+    if not data_dir.exists() or not any(data_dir.iterdir()):
+        return
+    ep = env_path(domain)
+    restored = read_env(ep)
+    if not restored:
+        return
+    merged = dict(restored)
+    merged.update(preserved)
+    if merged == restored:
+        return
+    ep.write_text("\n".join(f"{key}={value}" for key, value in merged.items()) + "\n", encoding="utf-8")
+    ep.chmod(0o600)
 
 
 def _harden_restored_permissions(domain: str) -> None:
@@ -886,6 +959,7 @@ def restore_site(domain: str, archive_path: str) -> RuntimeResult:
                 message = stop_proc.stderr.strip() or stop_proc.stdout.strip() or "docker compose down failed"
                 return RuntimeResult(stop_proc.returncode, f"failed to stop runtime before restore: {message}")
 
+        live_env = read_env(target / ".env")
         for entry in extracted_root.iterdir():
             destination = target / entry.name
             if destination.exists():
@@ -898,6 +972,7 @@ def restore_site(domain: str, archive_path: str) -> RuntimeResult:
             else:
                 shutil.copy2(entry, destination)
 
+        _preserve_live_db_credentials(domain, live_env)
         _harden_restored_permissions(domain)
         sql_files = sorted((target / "backups").glob("*.sql")) if (target / "backups").exists() else []
         if docker_available() and not runtime_skip_requested():
@@ -926,6 +1001,13 @@ def restore_site(domain: str, archive_path: str) -> RuntimeResult:
 
 
 def site_exists(domain: str) -> bool:
+    # Validate before touching the filesystem so traversal-shaped input
+    # (e.g. "../../etc") can never resolve to a path outside the sites dir,
+    # even from callers that gate only on existence.
+    try:
+        validate_domain(domain)
+    except ValueError:
+        return False
     return compose_path(domain).exists() and env_path(domain).exists()
 
 
@@ -1009,6 +1091,27 @@ def write_if_changed(path: Path, content: str) -> bool:
     return True
 
 
+def _project_collision(domain: str) -> str | None:
+    """Return the existing domain whose compose project name collides with this
+    one, if any. domain_to_project folds '.' and '_' to '-', so distinct domains
+    like a-b.com and a.b.com would otherwise share containers, networks, and
+    Traefik routers."""
+    project = domain_to_project(domain)
+    known: set[str] = set()
+    try:
+        known.update(site["domain"] for site in registry.list_sites() if site.get("domain"))
+    except Exception:
+        pass
+    sites_root = Path(PATHS.sites_dir)
+    if sites_root.exists():
+        for env_file in sites_root.glob("*/.env"):
+            known.add(read_env(env_file).get("DOMAIN") or env_file.parent.name)
+    for other in sorted(known):
+        if other != domain and domain_to_project(other) == project:
+            return other
+    return None
+
+
 def _used_site_uids(current_domain: str) -> set[int]:
     used: set[int] = set()
     current_env = env_path(current_domain)
@@ -1077,6 +1180,12 @@ def apply_site_ownership(domain: str) -> RuntimeResult:
 
 def ensure_site_scaffold(spec: SiteSpec) -> list[str]:
     validate_domain(spec.domain)
+    conflict = _project_collision(spec.domain)
+    if conflict is not None:
+        raise ValueError(
+            f"domain {spec.domain} conflicts with existing site {conflict}: "
+            f"both map to compose project {domain_to_project(spec.domain)}"
+        )
     # Allocate (or reuse) this site's unique uid before rendering the templates,
     # so .env and compose.yaml both carry it.
     env_file = env_path(spec.domain)
@@ -1101,7 +1210,7 @@ def ensure_site_scaffold(spec: SiteSpec) -> list[str]:
         touched.append(str(env_file))
     env_file.chmod(0o600)
     nginx_file = nginx_conf_path(spec.domain)
-    nginx_content = "\n".join([
+    nginx_lines = [
         "server {",
         "    listen 8080;",
         f"    server_name {spec.domain};",
@@ -1109,10 +1218,17 @@ def ensure_site_scaffold(spec: SiteSpec) -> list[str]:
         "    root /var/www/html;",
         "    index index.php index.html;",
         "    autoindex off;",
+        # Match the bundled PHP images: upload_max_filesize/post_max_size 64M,
+        # max_execution_time 300 (nginx defaults of 1m/60s would 413/504 first).
+        "    client_max_body_size 64m;",
         "    add_header X-Content-Type-Options nosniff always;",
         "    add_header X-Frame-Options SAMEORIGIN always;",
         "    add_header Referrer-Policy strict-origin-when-cross-origin always;",
         "    add_header Permissions-Policy \"geolocation=(), microphone=(), camera=()\" always;",
+    ]
+    if spec.ssl_enabled:
+        nginx_lines.append("    add_header Strict-Transport-Security \"max-age=31536000\" always;")
+    nginx_lines.extend([
         "    location = /healthz.html {",
         "        access_log off;",
         "        add_header Content-Type text/plain;",
@@ -1132,14 +1248,17 @@ def ensure_site_scaffold(spec: SiteSpec) -> list[str]:
         "    location / {",
         "        try_files $uri $uri/ /index.php?$args;",
         "    }",
-        "    location ~ \\.php$ {",
+        "    location ~* \\.php$ {",
+        "        try_files $uri =404;",
         "        include fastcgi_params;",
         "        fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;",
+        "        fastcgi_read_timeout 300s;",
         "        fastcgi_pass app:9000;",
         "    }",
         "}",
         "",
     ])
+    nginx_content = "\n".join(nginx_lines)
     if write_if_changed(nginx_file, nginx_content):
         touched.append(str(nginx_file))
     health_file = healthcheck_path(spec.domain)

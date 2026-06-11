@@ -113,13 +113,19 @@ def ensure_sftp_container(domain: str, password: str | None = None) -> RuntimeRe
     compose_has_sftp = _compose_has_sftp(domain)
     host_port = _allocate_sftp_port(domain, env)
 
+    # Precedence: an explicit --password always wins (rotation), then the
+    # already-configured value, then a fresh generated one shown exactly once.
+    generated = False
     if password is None:
-        password = env.get("SFTP_PASSWORD", generated_secret()[:16])
+        password = env.get("SFTP_PASSWORD")
+        if not password:
+            password = generated_secret()[:16]
+            generated = True
 
     _backup_compose(domain)
     definition = replace(
         _current_definition(domain),
-        sftp_password=env.get("SFTP_PASSWORD", password),
+        sftp_password=password,
         sftp_port=host_port,
     )
     ensure_site_scaffold(definition)
@@ -132,7 +138,10 @@ def ensure_sftp_container(domain: str, password: str | None = None) -> RuntimeRe
         return RuntimeResult(1, f"sftp configured but port {host_port} is not ready")
 
     state = "already enabled" if env_has_sftp and compose_has_sftp else "enabled"
-    return RuntimeResult(0, f"sftp {state} for {domain} on port {host_port}; username: sftpuser", ran=True)
+    message = f"sftp {state} for {domain} on port {host_port}; username: sftpuser"
+    if generated:
+        message += f"\npassword (shown once): {password}"
+    return RuntimeResult(0, message, ran=True)
 
 
 def remove_sftp_container(domain: str) -> RuntimeResult:

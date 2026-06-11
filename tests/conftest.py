@@ -17,6 +17,8 @@ def tmp_wpfy_home(tmp_path, monkeypatch):
     monkeypatch.setenv("WPFY_CONFIG_DIR", config_dir)
     monkeypatch.setenv("WPFY_STATE_DIR", state_dir)
     monkeypatch.setenv("WPFY_LOG_DIR", log_dir)
+    # SSL flows now require a valid ACME contact email before preflight.
+    monkeypatch.setenv("WPFY_ACME_EMAIL", "test@example.com")
 
     # Reimport settings module to pick up patched env vars
     import wpfy.settings
