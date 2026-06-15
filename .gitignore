@@ -11,3 +11,6 @@ conductor.json
 .env.*
 *.local
 
+# Agent tooling
+.omc/
+

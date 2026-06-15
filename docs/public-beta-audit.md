@@ -7,7 +7,7 @@
 | | |
 |---|---|
 | **Audit date** | 2026-06-11 |
-| **Branch** | `claude/wpfy-beta-launch-readiness-rbeepm` |
+| **Branch** | `beta-launch-readiness` |
 | **Base commit inspected** | `2fcf811` ("Security & correctness remediation pass: 12 fixes from fresh-eyes review") |
 | **Audit type** | Public exposure + documentation readiness |
 | **Test suite at time of audit** | 201 tests, all passing (`pytest`, 1.9s, offline) |
