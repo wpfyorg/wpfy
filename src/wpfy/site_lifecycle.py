@@ -7,7 +7,6 @@ from .php_runtime import DEFAULT_PHP_VERSION
 from .site_layout import (
     RuntimeResult,
     SiteSpec,
-    WORDPRESS_FLAVORS,
     apply_site_ownership,
     bootstrap_site_files,
     compose_command,
@@ -21,20 +20,8 @@ from .site_layout import (
     wp_cli_command,
 )
 from .certificate_lifecycle import preflight_ssl
+from .site_definition import MYSQL_FLAVORS, WORDPRESS_FLAVORS
 from .traefik import acme_email_problem
-
-
-MYSQL_FLAVORS = {
-    "mysql",
-    "wp",
-    "wpfc",
-    "wpredis",
-    "wpsc",
-    "wprocket",
-    "wpce",
-    "wpsubdir",
-    "wpsubdomain",
-}
 
 
 @dataclass(frozen=True)

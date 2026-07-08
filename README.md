@@ -19,6 +19,7 @@ wpfy turns a fresh Ubuntu VPS into a managed WordPress host. Every site runs in 
 - Runs a shared **Traefik edge proxy** that routes traffic per domain and obtains Let's Encrypt certificates automatically.
 - Performs **DNS/IP preflight checks** before requesting certificates, with automatic Cloudflare detection.
 - Provides **backups, restore, diagnostics, log access, security auditing, and per-site SFTP** from a single CLI.
+- Provides WordPress cron interval runners, optional systemd timers, and SMTP config/test helpers without automatic backup or update side effects.
 
 ### Why Docker-first?
 
@@ -39,6 +40,8 @@ Traditional WordPress stack managers install Nginx, PHP, and MySQL directly on t
 | SSL DNS/IP preflight + Cloudflare detection | ✅ Implemented |
 | WordPress provisioning via wp-cli | ✅ Implemented |
 | Backups and restore (files + database) | ✅ Implemented |
+| WordPress cron runners and systemd timers | ✅ Implemented |
+| SMTP config and explicit test sends | ✅ Implemented |
 | Diagnostics (`wpfy debug`) | ✅ Implemented |
 | Per-site SFTP lifecycle | ✅ Implemented |
 | Security audit (`wpfy secure`) | ✅ Implemented |
@@ -75,6 +78,12 @@ cd wpfy
 PYTHONPATH=src python3 -m wpfy --help
 ```
 
+## Repository split
+
+This repository is the application and installer repository. The marketing
+website and documentation are maintained separately from this public runtime
+surface.
+
 ## Prerequisites
 
 - **Ubuntu VPS** (Ubuntu-first for v1; other Linux distributions are untested).
@@ -109,9 +118,12 @@ wpfy site create example.com --wp -le
 
 ## Common commands
 
+Flat commands are the canonical VM/operator target surface. During migration, grouped `wpfy site ...` and `wpfy stack ...` commands remain temporary compatibility surfaces; the current flat commands reuse the proven grouped implementations until the cleanup page removes grouped parsers.
+
 | Command | Description |
 |---|---|
 | `wpfy site create <domain> --wp` | Create a WordPress site (add `-le` for SSL, `--php 8.3` to pick a PHP version) |
+| `wpfy run <domain> --wp` | Create a WordPress site through the flat CLI (currently delegates to `wpfy site create`) |
 | `wpfy site create <domain> --html` | Create a static HTML site |
 | `wpfy site list` | List managed sites |
 | `wpfy site info <domain>` | Show site metadata and file paths |
@@ -121,9 +133,31 @@ wpfy site create example.com --wp -le
 | `wpfy site ssl <domain> --renew` | Force certificate renewal |
 | `wpfy site wp <domain> <wp-cli args>` | Run wp-cli inside the site's container (e.g. `wpfy site wp example.com plugin list`) |
 | `wpfy site update <domain> --php 8.4` | Change a site's PHP version |
+| `wpfy config <domain>` | Show sanitized config status without printing raw `.env` contents |
+| `wpfy config <domain> --php 8.4` | Apply controlled config mutations through the site lifecycle path |
+| `wpfy edit <domain> [--print-path]` | Print or safely open the authoritative `.env` path with a backup |
+| `wpfy refresh <domain\|all> [--restart]` | Regenerate scaffold files from authoritative state; restart only when requested |
+| `wpfy up <domain>` | Start a site's Compose runtime |
+| `wpfy down <domain> [--volumes]` | Stop a site's Compose runtime without removing volumes unless requested |
+| `wpfy compose <domain> -- <args>` | Run Docker Compose for one managed site |
+| `wpfy exec <domain> [service] -- <command>` | Run a command in a site service (`app`, `web`, `db`, `redis`, `wpcli`, or `sftp`) |
+| `wpfy cp <domain> <source> <destination>` | Copy one file into or out of a site service |
+| `wpfy pull <domain> [--all\|--service <service>]` | Pull images for one managed site |
+| `wpfy healthcheck [all\|system\|disk\|load\|app]` | Run script-safe operator health checks |
+| `wpfy motd [--compact]` | Print a safe login-style operator summary |
+| `wpfy utility password\|username\|uid\|token\|htpasswd` | Generate offline utility values without Docker |
+| `wpfy cron minute\|five-minute\|hourly\|six-hour\|daily\|weekly` | Run due WordPress cron events and small safe interval tasks |
+| `wpfy cron install\|status\|disable` | Manage systemd timers for the cron intervals |
+| `wpfy smtp set\|status\|test\|clear` | Store redacted SMTP settings and run explicit dry-run/test sends |
 | `wpfy site backup <domain>` | Create a backup archive (files + database) |
+| `wpfy backup <domain>` | Create a backup through the flat CLI (currently delegates to `wpfy site backup`) |
+| `wpfy backup storage set\|status\|test\|clear` | Manage one S3-compatible upload target |
+| `wpfy backup schedule daily\|weekly\|status\|disable` | Manage one recurring all-site backup timer |
 | `wpfy site restore <domain> <backup>` | Restore a site from a backup archive |
+| `wpfy restore <domain> <backup>` | Restore through the flat CLI (currently delegates to `wpfy site restore`) |
 | `wpfy site delete <domain>` | Remove a site and its resources (asks for confirmation) |
+| `wpfy rm <domain>` | Delete through the flat CLI with the same confirmation rules as `wpfy site delete` |
+| `wpfy wp <domain> <wp-cli args>` | Run wp-cli through the flat CLI (currently delegates to `wpfy site wp`) |
 | `wpfy sftp <domain> --enable` | Enable SFTP access for a site |
 | `wpfy stack status` | Show shared stack component status |
 | `wpfy log show <domain> --nginx -f` | Follow a site's Nginx logs |
@@ -131,8 +165,24 @@ wpfy site create example.com --wp -le
 | `wpfy secure <domain>` | Audit site/container hardening |
 | `wpfy debug [domain]` | Run diagnostics across Docker, Traefik, and sites |
 | `wpfy update --check` | Check for new wpfy releases |
+| `wpfy version` | Print the installed wpfy version |
 
 Run `wpfy <command> --help` for full flags on any command.
+
+## Release validation
+
+Page 8 validation now treats the flat CLI as the VM/operator surface under test. The disposable-VPS runner exercises flat site creation, runtime commands, config/refresh, backup/restore/listing, cron, SMTP dry-run/status, operator utilities, log cron, and flat deletion. Grouped `wpfy stack install|status` remains in validation because there is no flat stack replacement yet, and grouped site status/SSL probes remain where the flat CLI has no exact replacement.
+
+Local release checks:
+
+```bash
+PYTHONPATH=src pytest -q
+python3 -m py_compile src/wpfy/*.py
+bash -n wpfy install.sh scripts/vps-release-validation.sh scripts/vps-release-validation-remote.sh
+graphify update .
+```
+
+VM evidence is required before this release is considered VM-ready; parser tests alone are not enough. Evidence review must confirm `validation-failures.txt` is absent or empty and must also scan must-pass outputs for unexpected `[exit N]`, `result: FAIL`, and command-specific failure lines. If the disposable VPS cannot be reached, record the SSH/DNS blocker and keep grouped-parser cleanup blocked.
 
 ## Architecture overview
 
@@ -203,16 +253,29 @@ Certificates are obtained and renewed by **Traefik's ACME resolver**. For Cloudf
 ## Backups and restore
 
 ```bash
+wpfy backup example.com --list
+wpfy backup example.com --path /root/wpfy-backups
+wpfy backup example.com --s3
+wpfy backup all --path /root/wpfy-backups
+wpfy backup storage set --endpoint https://s3.example.com --bucket site-backups --region auto --access-key ... --secret-key-stdin
+wpfy backup schedule daily --time 02:30 --s3
+wpfy restore example.com --list
 wpfy site backup example.com
 wpfy site restore example.com /var/lib/wpfy/backups/example.com/example.com-20260611120000.tar.gz
 ```
 
 - Backups are written to `/var/lib/wpfy/backups/<domain>/<domain>-<timestamp>.tar.gz` with `0600` permissions.
+- `wpfy backup <domain> --list` and `wpfy restore <domain> --list` print local archive candidates without reading archive contents.
+- `wpfy backup <domain> --path <directory>` keeps the canonical local archive and copies the verified archive to the destination directory with `0600` permissions.
+- `wpfy backup all [--path <directory>] [--s3]` processes every managed site in sorted order and reports per-site failures without stopping the whole run.
+- `wpfy backup <domain> --s3` uploads the verified local archive to S3-compatible storage using `WPFY_BACKUP_S3_ENDPOINT`, `WPFY_BACKUP_S3_BUCKET`, `WPFY_BACKUP_S3_REGION`, `WPFY_BACKUP_S3_ACCESS_KEY`, `WPFY_BACKUP_S3_SECRET_KEY`, and optional `WPFY_BACKUP_S3_PREFIX`.
+- `wpfy backup storage set/status/test/clear` stores one default S3-compatible target in `/etc/wpfy/backup-storage.env` with `0600` permissions. Environment variables still override the stored config.
+- `wpfy backup schedule daily|weekly` installs one `systemd` timer that runs `wpfy backup all`; `status` shows whether it is configured, and `disable` stops the timer without deleting backup storage config.
 - An archive contains the site's `compose.yaml`, `.env`, `app/` (WordPress files), `nginx/`, `php/`, and a SQL dump taken with `mariadb-dump --single-transaction` when the database is running.
 - Every archive is verified after creation.
 - Restore validates the archive and checks free disk space **before** touching the live site, stops the runtime, restores files and ownership, preserves the live database credentials, restarts the stack, and imports the SQL dump. An invalid archive aborts the restore with no changes made.
 
-**There is no automatic retention or rotation yet** — old backups stay until you delete them, so monitor disk usage. Backups live on the same server; copy important archives off-host.
+**There is no automatic retention or rotation yet** — old backups stay until you delete them, so monitor disk usage. S3 support is upload-only; remote restore/list/delete, lifecycle policies, restore-latest, and Traefik/ACME backup are not implemented.
 
 ## Diagnostics
 

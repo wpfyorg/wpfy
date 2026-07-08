@@ -2,12 +2,12 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
+from typing import Final
 
 from .php_runtime import DEFAULT_PHP_VERSION
 
 
-MYSQL_FLAVORS = {
-    "mysql",
+WORDPRESS_FLAVORS: Final = frozenset({
     "wp",
     "wpfc",
     "wpredis",
@@ -16,7 +16,8 @@ MYSQL_FLAVORS = {
     "wpce",
     "wpsubdir",
     "wpsubdomain",
-}
+})
+MYSQL_FLAVORS: Final = frozenset({"mysql", *WORDPRESS_FLAVORS})
 
 
 @dataclass(frozen=True)

@@ -1,14 +1,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import json
+import json, shutil, stat, subprocess
 from pathlib import Path
-import stat
-import subprocess
 
 from . import registry, traefik
 from .certificate_lifecycle import cert_expiry_days, get_cert_info
 from .settings import PATHS
+from .site_definition import MYSQL_FLAVORS
 from .site_layout import (
     _http_probe_site,
     domain_to_project,
@@ -18,14 +17,14 @@ from .site_layout import (
 )
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class InspectionCheck:
     name: str
     ok: bool | None
     message: str
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class AggregateInfo:
     sites: tuple[dict, ...]
     traefik_message: str
@@ -36,8 +35,10 @@ def aggregate_info() -> AggregateInfo:
     sites = tuple(list_sites())
     try:
         traefik_message = traefik.traefik_status().message
-    except Exception as exc:
+    except (FileNotFoundError, OSError, subprocess.SubprocessError) as exc:
         traefik_message = f"traefik status unavailable ({exc})"
+    if not shutil.which("docker"):
+        return AggregateInfo(sites, traefik_message, "unavailable")
     proc = subprocess.run(
         ["docker", "version", "--format", "{{.Server.Version}}"],
         check=False,
@@ -50,6 +51,8 @@ def aggregate_info() -> AggregateInfo:
 
 def system_diagnostics() -> tuple[InspectionCheck, ...]:
     checks = []
+    if not shutil.which("docker"):
+        return (InspectionCheck("Docker", False, "Docker command not found"),)
     proc = subprocess.run(["docker", "info"], check=False, capture_output=True, text=True)
     docker_ok = proc.returncode == 0
     checks.append(InspectionCheck(
@@ -88,24 +91,22 @@ def system_diagnostics() -> tuple[InspectionCheck, ...]:
 def _registry_consistency() -> InspectionCheck:
     try:
         registered = {site["domain"] for site in registry.list_sites()}
-    except Exception:
+    except (OSError, KeyError):
         registered = set()
     filesystem = set()
     try:
         for child in Path(PATHS.sites_dir).iterdir():
             if child.is_dir() and (child / ".env").exists() and (child / "compose.yaml").exists():
                 filesystem.add(child.name)
-    except Exception:
-        pass
+    except OSError:
+        filesystem = set()
     missing_in_fs = registered - filesystem
     missing_in_registry = filesystem - registered
     if not missing_in_fs and not missing_in_registry:
         return InspectionCheck("Registry", True, f"registry + filesystem consistent ({len(registered)} sites)")
     messages = []
-    if missing_in_fs:
-        messages.append(f"registry has orphaned entries: {', '.join(sorted(missing_in_fs))}")
-    if missing_in_registry:
-        messages.append(f"filesystem has untracked dirs: {', '.join(sorted(missing_in_registry))}")
+    if missing_in_fs: messages.append(f"registry has orphaned entries: {', '.join(sorted(missing_in_fs))}")
+    if missing_in_registry: messages.append(f"filesystem has untracked dirs: {', '.join(sorted(missing_in_registry))}")
     return InspectionCheck("Registry", False, "; ".join(messages))
 
 
@@ -114,8 +115,7 @@ def site_diagnostics(domain: str) -> tuple[InspectionCheck, ...]:
     root = Path(PATHS.sites_dir) / domain
     scaffold_ok = (root / "compose.yaml").exists()
     checks.append(InspectionCheck("scaffold", scaffold_ok, "compose.yaml exists" if scaffold_ok else "scaffold missing"))
-    if not scaffold_ok:
-        return tuple(checks)
+    if not scaffold_ok: return tuple(checks)
 
     proc = subprocess.run(
         ["docker", "compose", "ps", "--format", "json"],
@@ -143,7 +143,7 @@ def site_diagnostics(domain: str) -> tuple[InspectionCheck, ...]:
     try:
         probe = _http_probe_site(domain)
         checks.append(InspectionCheck("http probe", probe.ran and probe.exit_code == 0, probe.message))
-    except Exception as exc:
+    except (OSError, subprocess.SubprocessError, ValueError) as exc:
         checks.append(InspectionCheck("http probe", False, str(exc)))
 
     cert_info = get_cert_info(domain)
@@ -164,10 +164,8 @@ def site_diagnostics(domain: str) -> tuple[InspectionCheck, ...]:
 
     try:
         flavor = site_info(domain).get("flavor", "")
-        needs_db = flavor in {
-            "mysql", "wp", "wpfc", "wpredis", "wpsc", "wprocket", "wpce", "wpsubdir", "wpsubdomain"
-        }
-    except Exception:
+        needs_db = flavor in MYSQL_FLAVORS
+    except (FileNotFoundError, ValueError, OSError):
         needs_db = False
     if not needs_db:
         checks.append(InspectionCheck("db ping", None, "not applicable (no mysql)"))

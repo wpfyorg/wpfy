@@ -5,7 +5,7 @@ import re
 import socket
 import time
 
-from .site_definition import SiteDefinition, sftp_service_lines
+from .site_definition import SiteDefinition
 from .site_layout import (
     RuntimeResult,
     compose_command,
@@ -23,18 +23,6 @@ from .site_layout import (
 _SFTP_IMAGE = "atmoz/sftp:alpine"
 _SFTP_PORT = "2222"
 _SFTP_READY_TIMEOUT_SECONDS = 15.0
-
-
-def _sftp_service_yaml(domain: str, host_port: str = _SFTP_PORT) -> str:
-    definition = SiteDefinition(
-        domain=domain,
-        flavor="site",
-        use_mysql=False,
-        use_redis=False,
-        sftp_password="configured",
-        sftp_port=host_port,
-    )
-    return "\n" + "\n".join(sftp_service_lines(definition))
 
 
 def _compose_has_sftp(domain: str) -> bool:

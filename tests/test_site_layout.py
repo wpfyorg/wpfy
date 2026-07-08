@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import io
 import importlib
+import os
 import stat
 import tarfile
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -457,6 +459,265 @@ def test_backup_archive_is_not_world_readable(tmp_wpfy_home, monkeypatch):
     assert mode == 0o600
 
 
+def test_list_backup_archives_returns_newest_tarballs(tmp_wpfy_home):
+    import wpfy.site_layout
+
+    importlib.reload(wpfy.site_layout)
+    backups = wpfy.site_layout.backups_dir("list.example.com")
+    backups.mkdir(parents=True)
+    older = backups / "list.example.com-1.tar.gz"
+    newer = backups / "list.example.com-2.tar.gz"
+    ignored = backups / "list.example.com.sql"
+    older.write_text("older", encoding="utf-8")
+    newer.write_text("newer", encoding="utf-8")
+    ignored.write_text("ignored", encoding="utf-8")
+    older.touch()
+    newer.touch()
+    os.utime(older, (100, 100))
+    os.utime(newer, (200, 200))
+
+    assert wpfy.site_layout.list_backup_archives("list.example.com") == [newer, older]
+
+
+def test_list_backup_archives_missing_directory_is_empty(tmp_wpfy_home):
+    import wpfy.site_layout
+
+    importlib.reload(wpfy.site_layout)
+
+    assert wpfy.site_layout.list_backup_archives("missing.example.com") == []
+
+
+def test_list_backup_archives_rejects_invalid_domain(tmp_wpfy_home):
+    import wpfy.site_layout
+
+    importlib.reload(wpfy.site_layout)
+
+    with pytest.raises(ValueError, match="invalid domain"):
+        wpfy.site_layout.list_backup_archives("../escape")
+
+
+def test_backup_site_copies_verified_archive_to_destination(tmp_wpfy_home, monkeypatch, tmp_path):
+    import wpfy.site_layout
+
+    importlib.reload(wpfy.site_layout)
+    monkeypatch.setenv("WPFY_SKIP_RUNTIME", "1")
+    domain = "copy.example.com"
+    spec = wpfy.site_layout.SiteSpec(domain=domain, flavor="site", use_mysql=False, use_redis=False)
+    wpfy.site_layout.ensure_site_scaffold(spec)
+
+    result = wpfy.site_layout.backup_site(domain, destination_dir=tmp_path / "exports")
+
+    assert result.exit_code == 0
+    canonical = next(wpfy.site_layout.backups_dir(domain).glob("*.tar.gz"))
+    copied = tmp_path / "exports" / canonical.name
+    assert canonical.exists()
+    assert copied.exists()
+    assert stat.S_IMODE(copied.stat().st_mode) == 0o600
+    assert f"copied to: {copied}" in result.message
+
+
+def test_backup_site_does_not_overwrite_same_second_archive(tmp_wpfy_home, monkeypatch):
+    import wpfy.site_layout
+
+    importlib.reload(wpfy.site_layout)
+    monkeypatch.setenv("WPFY_SKIP_RUNTIME", "1")
+    domain = "same-second.example.com"
+    spec = wpfy.site_layout.SiteSpec(domain=domain, flavor="site", use_mysql=False, use_redis=False)
+    wpfy.site_layout.ensure_site_scaffold(spec)
+
+    class FixedDatetime:
+        @classmethod
+        def now(cls, tz):
+            return datetime(2026, 7, 3, 8, 0, 0, tzinfo=timezone.utc)
+
+    monkeypatch.setattr(wpfy.site_layout, "datetime", FixedDatetime)
+
+    first = wpfy.site_layout.backup_site(domain)
+    second = wpfy.site_layout.backup_site(domain)
+
+    assert first.exit_code == 0
+    assert second.exit_code == 0
+    archives = sorted(wpfy.site_layout.backups_dir(domain).glob("*.tar.gz"))
+    assert [path.name for path in archives] == [
+        "same-second.example.com-20260703080000-1.tar.gz",
+        "same-second.example.com-20260703080000.tar.gz",
+    ]
+
+
+def test_backup_site_does_not_copy_when_archive_verification_fails(tmp_wpfy_home, monkeypatch, tmp_path):
+    import wpfy.site_layout
+
+    importlib.reload(wpfy.site_layout)
+    monkeypatch.setenv("WPFY_SKIP_RUNTIME", "1")
+    domain = "verify-copy.example.com"
+    spec = wpfy.site_layout.SiteSpec(domain=domain, flavor="site", use_mysql=False, use_redis=False)
+    wpfy.site_layout.ensure_site_scaffold(spec)
+
+    class Proc:
+        returncode = 1
+        stdout = ""
+        stderr = "bad archive"
+
+    monkeypatch.setattr(wpfy.site_layout.subprocess, "run", lambda *args, **kwargs: Proc())
+
+    result = wpfy.site_layout.backup_site(domain, destination_dir=tmp_path / "exports")
+
+    assert result.exit_code == 3
+    assert not (tmp_path / "exports").exists()
+
+
+def test_backup_site_uploads_verified_archive_to_s3(tmp_wpfy_home, monkeypatch):
+    import wpfy.site_layout
+
+    importlib.reload(wpfy.site_layout)
+    monkeypatch.setenv("WPFY_SKIP_RUNTIME", "1")
+    monkeypatch.setenv("WPFY_BACKUP_S3_ENDPOINT", "https://storage.example.test")
+    monkeypatch.setenv("WPFY_BACKUP_S3_BUCKET", "site-backups")
+    monkeypatch.setenv("WPFY_BACKUP_S3_REGION", "auto")
+    monkeypatch.setenv("WPFY_BACKUP_S3_ACCESS_KEY", "access-key")
+    monkeypatch.setenv("WPFY_BACKUP_S3_SECRET_KEY", "secret-key")
+    monkeypatch.setenv("WPFY_BACKUP_S3_PREFIX", "daily")
+    domain = "s3.example.com"
+    spec = wpfy.site_layout.SiteSpec(domain=domain, flavor="site", use_mysql=False, use_redis=False)
+    wpfy.site_layout.ensure_site_scaffold(spec)
+    captured = {}
+
+    class FakeUploader:
+        def upload_archive(self, config, archive_path, domain_arg):
+            captured["bucket"] = config.bucket
+            captured["key"] = f"{config.prefix}/{domain_arg}/{archive_path.name}"
+            return f"s3://{config.bucket}/{captured['key']}"
+
+    result = wpfy.site_layout.backup_site(domain, upload_s3=True, uploader=FakeUploader())
+
+    assert result.exit_code == 0
+    assert captured["bucket"] == "site-backups"
+    assert captured["key"].startswith("daily/s3.example.com/s3.example.com-")
+    assert "uploaded to: s3://site-backups/daily/s3.example.com/" in result.message
+    assert "secret-key" not in result.message
+
+
+def test_backup_site_skips_s3_upload_until_archive_verifies(tmp_wpfy_home, monkeypatch):
+    import wpfy.site_layout
+
+    importlib.reload(wpfy.site_layout)
+    monkeypatch.setenv("WPFY_SKIP_RUNTIME", "1")
+    domain = "verify-s3.example.com"
+    spec = wpfy.site_layout.SiteSpec(domain=domain, flavor="site", use_mysql=False, use_redis=False)
+    wpfy.site_layout.ensure_site_scaffold(spec)
+    calls = []
+
+    class Proc:
+        returncode = 1
+        stdout = ""
+        stderr = "bad archive"
+
+    class FakeUploader:
+        def upload_archive(self, config, archive_path, domain_arg):
+            calls.append((config, archive_path, domain_arg))
+            return "s3://never"
+
+    monkeypatch.setattr(wpfy.site_layout.subprocess, "run", lambda *args, **kwargs: Proc())
+
+    result = wpfy.site_layout.backup_site(domain, upload_s3=True, uploader=FakeUploader())
+
+    assert result.exit_code == 3
+    assert calls == []
+
+
+def test_backup_site_s3_failure_preserves_local_archive_and_redacts_secret(tmp_wpfy_home, monkeypatch):
+    import wpfy.site_layout
+
+    importlib.reload(wpfy.site_layout)
+    monkeypatch.setenv("WPFY_SKIP_RUNTIME", "1")
+    monkeypatch.setenv("WPFY_BACKUP_S3_ENDPOINT", "https://storage.example.test")
+    monkeypatch.setenv("WPFY_BACKUP_S3_BUCKET", "site-backups")
+    monkeypatch.setenv("WPFY_BACKUP_S3_REGION", "auto")
+    monkeypatch.setenv("WPFY_BACKUP_S3_ACCESS_KEY", "access-key")
+    monkeypatch.setenv("WPFY_BACKUP_S3_SECRET_KEY", "secret-key")
+    domain = "failed-s3.example.com"
+    spec = wpfy.site_layout.SiteSpec(domain=domain, flavor="site", use_mysql=False, use_redis=False)
+    wpfy.site_layout.ensure_site_scaffold(spec)
+
+    class FakeUploader:
+        def upload_archive(self, config, archive_path, domain_arg):
+            raise OSError(f"upload denied for {config.secret_key}")
+
+    result = wpfy.site_layout.backup_site(domain, upload_s3=True, uploader=FakeUploader())
+
+    local_path = Path(result.message.split("; ", maxsplit=1)[0].removeprefix("backup created: "))
+    assert result.exit_code == 4
+    assert local_path.exists()
+    assert "secret-key" not in result.message
+    assert "***REDACTED***" in result.message
+
+
+def test_s3_uploader_uses_path_style_endpoint():
+    from wpfy.s3_backup import S3Config, signed_put_request
+
+    config = S3Config(
+        endpoint="https://storage.example.test",
+        bucket="site-backups",
+        region="auto",
+        prefix="daily",
+        access_key="access-key",
+        secret_key="secret-key",
+    )
+
+    request = signed_put_request(config, "daily/example.com/archive.tar.gz", b"payload")
+
+    assert request.full_url == "https://storage.example.test/site-backups/daily/example.com/archive.tar.gz"
+    assert "Authorization" in request.headers
+
+
+def test_load_s3_config_reads_stored_file_when_env_missing(tmp_wpfy_home, monkeypatch):
+    import wpfy.s3_backup
+
+    importlib.reload(wpfy.s3_backup)
+    config = wpfy.s3_backup.S3Config(
+        endpoint="https://stored.example.test",
+        bucket="stored-bucket",
+        region="auto",
+        prefix="weekly",
+        access_key="stored-access",
+        secret_key="stored-secret",
+    )
+
+    wpfy.s3_backup.write_s3_config(config)
+    loaded = wpfy.s3_backup.load_s3_config()
+
+    assert loaded == config
+    assert stat.S_IMODE(wpfy.s3_backup.s3_config_path().stat().st_mode) == 0o600
+
+
+def test_load_s3_config_env_overrides_stored_file(tmp_wpfy_home, monkeypatch):
+    import wpfy.s3_backup
+
+    importlib.reload(wpfy.s3_backup)
+    wpfy.s3_backup.write_s3_config(
+        wpfy.s3_backup.S3Config(
+            endpoint="https://stored.example.test",
+            bucket="stored-bucket",
+            region="auto",
+            prefix="stored",
+            access_key="stored-access",
+            secret_key="stored-secret",
+        )
+    )
+    monkeypatch.setenv("WPFY_BACKUP_S3_ENDPOINT", "https://env.example.test")
+    monkeypatch.setenv("WPFY_BACKUP_S3_BUCKET", "env-bucket")
+    monkeypatch.setenv("WPFY_BACKUP_S3_REGION", "us-east-1")
+    monkeypatch.setenv("WPFY_BACKUP_S3_ACCESS_KEY", "env-access")
+    monkeypatch.setenv("WPFY_BACKUP_S3_SECRET_KEY", "env-secret")
+    monkeypatch.setenv("WPFY_BACKUP_S3_PREFIX", "env-prefix")
+
+    loaded = wpfy.s3_backup.load_s3_config()
+
+    assert loaded.endpoint == "https://env.example.test"
+    assert loaded.bucket == "env-bucket"
+    assert loaded.secret_key == "env-secret"
+
+
 def test_provision_wordpress_runs_expected_wp_cli_sequence(tmp_wpfy_home, monkeypatch):
     import wpfy.site_layout
     from wpfy.site_layout import RuntimeResult
@@ -776,6 +1037,31 @@ def test_restore_valid_archive_preserves_private_env(tmp_wpfy_home, monkeypatch)
     assert result.exit_code == 0
     mode = stat.S_IMODE(wpfy.site_layout.env_path("valid.example.com").stat().st_mode)
     assert mode == 0o600
+
+
+def test_restore_reapplies_site_ownership_after_copy(tmp_wpfy_home, monkeypatch):
+    import wpfy.site_layout
+
+    importlib.reload(wpfy.site_layout)
+    monkeypatch.setenv("WPFY_SKIP_RUNTIME", "1")
+    archive = Path(tmp_wpfy_home.state_dir) / "ownership.tar.gz"
+    archive.parent.mkdir(parents=True, exist_ok=True)
+    _write_tar_with_text(archive, {
+        "ownership.example.com/compose.yaml": "services: {}\n",
+        "ownership.example.com/.env": "DOMAIN=ownership.example.com\nSITE_UID=100042\n",
+    })
+
+    calls: list[str] = []
+    monkeypatch.setattr(
+        wpfy.site_layout,
+        "apply_site_ownership",
+        lambda domain: calls.append(domain) or wpfy.site_layout.RuntimeResult(0, "owned", ran=True),
+    )
+
+    result = wpfy.site_layout.restore_site("ownership.example.com", str(archive))
+
+    assert result.exit_code == 0
+    assert calls == ["ownership.example.com"]
 
 
 def test_nginx_conf_allows_large_uploads_and_long_requests(tmp_wpfy_home, monkeypatch):

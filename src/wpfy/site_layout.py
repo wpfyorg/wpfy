@@ -16,11 +16,11 @@ from urllib.request import urlopen
 from .settings import PATHS
 from . import registry
 from .php_runtime import PHP_IMAGE_REPOSITORY as _PHP_IMAGE_REPOSITORY, php_image
-from .site_definition import SiteDefinition, sftp_service_lines
+from .s3_backup import S3ConfigError, S3Uploader, load_s3_config, redact_s3_secrets
+from .site_definition import MYSQL_FLAVORS, WORDPRESS_FLAVORS, SiteDefinition, sftp_service_lines
 
 
 PHP_IMAGE_REPOSITORY = _PHP_IMAGE_REPOSITORY
-WORDPRESS_FLAVORS = {"wp", "wpfc", "wpredis", "wpsc", "wprocket", "wpce", "wpsubdir", "wpsubdomain"}
 
 # Single source of truth for non-PHP service images: compose_content renders
 # these and `wpfy stack install` pre-pulls the same tags.
@@ -112,6 +112,15 @@ def validate_domain(domain: str) -> None:
     label = r"[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?"
     if not re.fullmatch(rf"{label}(?:\.{label})+", domain):
         raise ValueError(f"invalid domain: {domain}")
+
+
+def list_backup_archives(domain: str) -> list[Path]:
+    validate_domain(domain)
+    backups = backups_dir(domain)
+    if not backups.exists():
+        return []
+    archives = [path for path in backups.glob("*.tar.gz") if path.is_file()]
+    return sorted(archives, key=lambda path: (path.stat().st_mtime, path.name), reverse=True)
 
 
 def compose_content(spec: SiteSpec) -> str:
@@ -476,7 +485,7 @@ def _site_needs_mysql(domain: str) -> bool:
         flavor = site_info(domain).get("flavor", "unknown")
     except FileNotFoundError:
         return False
-    return flavor in {"mysql", "wp", "wpfc", "wpredis", "wpsc", "wprocket", "wpce", "wpsubdir", "wpsubdomain"}
+    return flavor in MYSQL_FLAVORS
 
 
 def _site_needs_redis(domain: str) -> bool:
@@ -654,7 +663,13 @@ def bootstrap_site_files(domain: str) -> RuntimeResult:
         return RuntimeResult(0, "wordpress bootstrap fallback created placeholder files", skipped=True)
 
 
-def backup_site(domain: str) -> RuntimeResult:
+def backup_site(
+    domain: str,
+    *,
+    destination_dir: str | Path | None = None,
+    upload_s3: bool = False,
+    uploader: S3Uploader | None = None,
+) -> RuntimeResult:
     validate_domain(domain)
     if not site_exists(domain):
         return RuntimeResult(2, f"site not found: {domain}")
@@ -665,6 +680,11 @@ def backup_site(domain: str) -> RuntimeResult:
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
     archive_path = backups / f"{domain}-{stamp}.tar.gz"
     sql_path = backups / f"{domain}-{stamp}.sql"
+    suffix = 1
+    while archive_path.exists() or sql_path.exists():
+        archive_path = backups / f"{domain}-{stamp}-{suffix}.tar.gz"
+        sql_path = backups / f"{domain}-{stamp}-{suffix}.sql"
+        suffix += 1
 
     if docker_available() and not runtime_skip_requested():
         proc = compose_command(domain, "exec", "-T", "db", "sh", "-lc", 'mariadb-dump --single-transaction -u"$MARIADB_USER" -p"$MARIADB_PASSWORD" "$MARIADB_DATABASE"')
@@ -690,7 +710,29 @@ def backup_site(domain: str) -> RuntimeResult:
         err = verify.stderr.strip() or verify.stdout.strip() or "tar verification failed"
         return RuntimeResult(3, f"backup archive verification failed: {err}")
 
-    return RuntimeResult(0, f"backup created: {archive_path}", ran=True)
+    message = f"backup created: {archive_path}"
+    if destination_dir is not None:
+        destination = Path(destination_dir)
+        destination.mkdir(parents=True, exist_ok=True)
+        destination.chmod(0o700)
+        copied_archive = destination / archive_path.name
+        shutil.copy2(archive_path, copied_archive)
+        copied_archive.chmod(0o600)
+        message = f"{message}; copied to: {copied_archive}"
+
+    if upload_s3:
+        try:
+            config = load_s3_config()
+        except S3ConfigError as exc:
+            return RuntimeResult(2, f"{message}; s3 upload skipped: {exc}", ran=True)
+        active_uploader = uploader or S3Uploader()
+        try:
+            uploaded_to = active_uploader.upload_archive(config, archive_path, domain)
+        except (OSError, S3ConfigError) as exc:
+            return RuntimeResult(4, f"{message}; s3 upload failed: {redact_s3_secrets(str(exc), config)}", ran=True)
+        message = f"{message}; uploaded to: {uploaded_to}"
+
+    return RuntimeResult(0, message, ran=True)
 
 
 def _wait_for_service(domain: str, service: str, timeout_seconds: int = 60) -> RuntimeResult:
@@ -974,6 +1016,7 @@ def restore_site(domain: str, archive_path: str) -> RuntimeResult:
 
         _preserve_live_db_credentials(domain, live_env)
         _harden_restored_permissions(domain)
+        apply_site_ownership(domain)
         sql_files = sorted((target / "backups").glob("*.sql")) if (target / "backups").exists() else []
         if docker_available() and not runtime_skip_requested():
             start_result = start_site_runtime(domain)

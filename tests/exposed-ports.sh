@@ -23,16 +23,27 @@ export WPFY_LOG_DIR="$tmp_dir/log"
 export WPFY_SKIP_RUNTIME=1
 
 python3 - <<'PY'
+from wpfy.site_definition import SiteDefinition, sftp_service_lines
 from wpfy.site_layout import SiteSpec, ensure_site_scaffold, compose_path
-from wpfy.sftp import _sftp_service_yaml
 from wpfy.traefik import traefik_compose_content
+
+def sftp_service_yaml(domain, host_port="2222"):
+    definition = SiteDefinition(
+        domain=domain,
+        flavor="site",
+        use_mysql=False,
+        use_redis=False,
+        sftp_password="configured",
+        sftp_port=host_port,
+    )
+    return "\n" + "\n".join(sftp_service_lines(definition))
 
 ensure_site_scaffold(SiteSpec(domain="audit.example.com", flavor="wpredis", use_mysql=True, use_redis=True))
 print(f"SITE_COMPOSE={compose_path('audit.example.com')}")
 print("---TRAEFIK---")
 print(traefik_compose_content())
 print("---SFTP---")
-print(_sftp_service_yaml("audit.example.com", "2222"))
+print(sftp_service_yaml("audit.example.com", "2222"))
 PY
 
 site_compose="$WPFY_INSTALL_ROOT/sites/audit.example.com/compose.yaml"
@@ -54,8 +65,17 @@ grep -q '"443:443"' <<<"$traefik_content" && pass "Traefik publishes HTTPS 443" 
 grep -q '/var/run/docker.sock:/var/run/docker.sock:ro' <<<"$traefik_content" && warn "Traefik mounts Docker socket read-only; still high-impact if Traefik is compromised" || fail "Traefik Docker provider socket mount not found"
 
 sftp_content="$(PYTHONPATH=src python3 - <<'PY'
-from wpfy.sftp import _sftp_service_yaml
-print(_sftp_service_yaml("audit.example.com", "2222"))
+from wpfy.site_definition import SiteDefinition, sftp_service_lines
+
+definition = SiteDefinition(
+    domain="audit.example.com",
+    flavor="site",
+    use_mysql=False,
+    use_redis=False,
+    sftp_password="configured",
+    sftp_port="2222",
+)
+print("\n" + "\n".join(sftp_service_lines(definition)))
 PY
 )"
 grep -q '"127.0.0.1:2222:22"' <<<"$sftp_content" && pass "SFTP sidecar binds loopback only" || fail "SFTP sidecar is not loopback-bound"

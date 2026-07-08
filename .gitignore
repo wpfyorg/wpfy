@@ -6,11 +6,28 @@ __pycache__/
 .context/
 conductor.json
 
+# Graphify generated cache (machine-specific absolute paths)
+graphify-out/cache/
+
 # Never commit environment files or local secrets (defensive; none exist in-repo)
 .env
 .env.*
 *.local
 
-# Agent tooling
-.omc/
+# VitePress KB
+kb/.vitepress/dist
+kb/.vitepress/cache
+node_modules
 
+.tmp-screenshots/
+
+# Local editor, agent, and generated tool state
+.gitignore
+.cursor/mcp.json
+.cursor/rules/bricks.mdc
+.cursor/skills/bricks
+.github/workflows/deploy-kb.yml
+.omc/
+.playwright-mcp/page-*.yml
+.superpowers/brainstorm/
+.vitepress/cache/

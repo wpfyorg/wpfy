@@ -1,11 +1,22 @@
 from __future__ import annotations
 
+import io
 import importlib
 import json
 import stat
+import sys
+from dataclasses import dataclass
+from pathlib import Path
 
 import pytest
 from wpfy.cli import build_parser, run
+
+
+class FakeProc:
+    def __init__(self, returncode=0, stdout="", stderr=""):
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
 
 
 def test_build_parser_returns_parser():
@@ -20,8 +31,38 @@ def test_parser_has_expected_subcommands():
     for action in subparsers_actions:
         if action.choices:
             subcommand_names.extend(action.choices.keys())
-    assert "site" in subcommand_names
-    assert "stack" in subcommand_names
+    assert {
+        "site",
+        "run",
+        "backup",
+        "cron",
+        "smtp",
+        "restore",
+        "rm",
+        "wp",
+        "version",
+        "compose",
+        "up",
+        "down",
+        "exec",
+        "cp",
+        "pull",
+        "config",
+        "edit",
+        "refresh",
+        "healthcheck",
+        "motd",
+        "utility",
+        "stack",
+        "sftp",
+        "clean",
+        "info",
+        "log",
+        "secure",
+        "maintenance",
+        "update",
+        "debug",
+    }.issubset(subcommand_names)
 
 
 def test_help_exits_zero():
@@ -61,6 +102,54 @@ def test_site_create_help_shows_examples(capsys):
 def test_stack_subcommand_exists():
     with pytest.raises(SystemExit) as exc_info:
         run(["stack", "--help"])
+    assert exc_info.value.code == 0
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "run",
+        "backup",
+        "restore",
+        "rm",
+        "wp",
+        "version",
+        "compose",
+        "up",
+        "down",
+        "exec",
+        "cp",
+        "pull",
+        "config",
+        "edit",
+        "refresh",
+        "healthcheck",
+        "motd",
+        "utility",
+    ],
+)
+def test_flat_alias_help_exits_zero(command):
+    with pytest.raises(SystemExit) as exc_info:
+        run([command, "--help"])
+    assert exc_info.value.code == 0
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["healthcheck", "--help"],
+        ["motd", "--help"],
+        ["utility", "--help"],
+        ["utility", "password", "--help"],
+        ["utility", "username", "--help"],
+        ["utility", "uid", "--help"],
+        ["utility", "token", "--help"],
+        ["utility", "htpasswd", "--help"],
+    ],
+)
+def test_page5_help_exits_zero(argv):
+    with pytest.raises(SystemExit) as exc_info:
+        run(argv)
     assert exc_info.value.code == 0
 
 
@@ -193,6 +282,638 @@ def test_site_create_default_php_version_is_84(monkeypatch):
 
     assert result == 0
     assert captured["request"].php_version == "8.4"
+
+
+def test_run_alias_uses_site_create_path(monkeypatch):
+    import wpfy.cli as cli
+
+    captured = {}
+
+    def fake_create(request, **kwargs):
+        captured["request"] = request
+        return cli.site_lifecycle.CreateSiteResult(
+            spec=cli.site_lifecycle.SiteSpec(
+                request.domain, request.flavor, True, False, php_version=request.php_version
+            ),
+            touched=(),
+            bootstrap=cli.site_lifecycle.RuntimeResult(0, "ok", ran=True),
+            runtime=cli.site_lifecycle.RuntimeResult(0, "started", ran=True),
+            wordpress_message="installed",
+        )
+
+    monkeypatch.setattr(cli.site_lifecycle, "create_site", fake_create)
+
+    result = cli.run(["run", "example.com", "--wp"])
+
+    assert result == 0
+    assert captured["request"].domain == "example.com"
+    assert captured["request"].flavor == "wp"
+    assert captured["request"].php_version == "8.4"
+
+
+def test_backup_alias_uses_site_backup_path(monkeypatch, capsys):
+    import wpfy.cli as cli
+    from wpfy.site_layout import RuntimeResult
+
+    calls = []
+    monkeypatch.setattr(
+        cli,
+        "backup_site",
+        lambda domain, **kwargs: calls.append((domain, kwargs)) or RuntimeResult(0, "backup created", ran=True),
+    )
+
+    result = cli.run(["backup", "example.com"])
+    output = capsys.readouterr().out
+
+    assert result == 0
+    assert calls == [("example.com", {"destination_dir": None, "upload_s3": False})]
+    assert "=== site backup ===" in output
+    assert "backup: OK backup created" in output
+
+
+def test_backup_list_alias_prints_archive_paths(monkeypatch, capsys):
+    import wpfy.cli as cli
+
+    monkeypatch.setattr(cli, "list_backup_archives", lambda domain: [Path("/tmp/example.com/archive.tar.gz")])
+
+    result = cli.run(["backup", "example.com", "--list"])
+    output = capsys.readouterr().out
+
+    assert result == 0
+    assert "=== backup archives ===" in output
+    assert "/tmp/example.com/archive.tar.gz" in output
+
+
+def test_grouped_backup_list_prints_archive_paths(monkeypatch, capsys):
+    import wpfy.cli as cli
+
+    monkeypatch.setattr(cli, "list_backup_archives", lambda domain: [Path("/tmp/grouped/archive.tar.gz")])
+
+    result = cli.run(["site", "backup", "example.com", "--list"])
+    output = capsys.readouterr().out
+
+    assert result == 0
+    assert "/tmp/grouped/archive.tar.gz" in output
+
+
+def test_backup_alias_passes_destination_and_s3(monkeypatch, capsys):
+    import wpfy.cli as cli
+    from wpfy.site_layout import RuntimeResult
+
+    captured = {}
+
+    def fake_backup(domain, **kwargs):
+        captured["domain"] = domain
+        captured["kwargs"] = kwargs
+        return RuntimeResult(0, "backup created", ran=True)
+
+    monkeypatch.setattr(cli, "backup_site", fake_backup)
+
+    result = cli.run(["backup", "example.com", "--path", "/tmp/export", "--s3"])
+    capsys.readouterr()
+
+    assert result == 0
+    assert captured == {
+        "domain": "example.com",
+        "kwargs": {"destination_dir": "/tmp/export", "upload_s3": True},
+    }
+
+
+def test_backup_all_continues_after_failure(monkeypatch, capsys):
+    import wpfy.cli as cli
+    from wpfy.site_layout import RuntimeResult
+
+    calls = []
+    monkeypatch.setattr(
+        cli,
+        "list_sites",
+        lambda: [{"domain": "b.example.com"}, {"domain": "a.example.com"}, {"domain": "c.example.com"}],
+    )
+
+    def fake_backup(domain, **kwargs):
+        calls.append((domain, kwargs))
+        if domain == "b.example.com":
+            return RuntimeResult(4, "offsite failed", ran=True)
+        return RuntimeResult(0, "backup created", ran=True)
+
+    monkeypatch.setattr(cli, "backup_site", fake_backup)
+
+    result = cli.run(["backup", "all", "--path", "/tmp/export", "--s3"])
+    output = capsys.readouterr().out
+
+    assert result == 1
+    assert [call[0] for call in calls] == ["a.example.com", "b.example.com", "c.example.com"]
+    assert all(call[1] == {"destination_dir": "/tmp/export", "upload_s3": True} for call in calls)
+    assert "b.example.com: FAIL offsite failed" in output
+    assert "c.example.com: OK backup created" in output
+
+
+def test_backup_all_empty_site_list_exits_zero(monkeypatch, capsys):
+    import wpfy.cli as cli
+
+    monkeypatch.setattr(cli, "list_sites", lambda: [])
+
+    result = cli.run(["backup", "all"])
+    output = capsys.readouterr().out
+
+    assert result == 0
+    assert "no managed sites found" in output
+
+
+def test_backup_storage_set_writes_secret_from_stdin(tmp_wpfy_home, monkeypatch, capsys):
+    import wpfy.cli as cli
+    import wpfy.s3_backup
+
+    importlib.reload(wpfy.s3_backup)
+    monkeypatch.setattr(sys, "stdin", io.StringIO("stored-secret\n"))
+
+    result = cli.run([
+        "backup",
+        "storage",
+        "set",
+        "--endpoint",
+        "https://storage.example.test",
+        "--bucket",
+        "site-backups",
+        "--region",
+        "auto",
+        "--prefix",
+        "daily",
+        "--access-key",
+        "stored-access",
+        "--secret-key-stdin",
+    ])
+    output = capsys.readouterr().out
+    stored = wpfy.s3_backup.load_s3_config()
+
+    assert result == 0
+    assert stored.bucket == "site-backups"
+    assert stored.secret_key == "stored-secret"
+    assert stat.S_IMODE(wpfy.s3_backup.s3_config_path().stat().st_mode) == 0o600
+    assert "stored-secret" not in output
+    assert "stored-access" not in output
+    assert "secret key: configured" in output
+
+
+def test_backup_storage_status_redacts_secret(tmp_wpfy_home, capsys):
+    import wpfy.cli as cli
+    import wpfy.s3_backup
+
+    importlib.reload(wpfy.s3_backup)
+    wpfy.s3_backup.write_s3_config(
+        wpfy.s3_backup.S3Config(
+            endpoint="https://storage.example.test",
+            bucket="site-backups",
+            region="auto",
+            prefix="daily",
+            access_key="stored-access",
+            secret_key="stored-secret",
+        )
+    )
+
+    result = cli.run(["backup", "storage", "status"])
+    output = capsys.readouterr().out
+
+    assert result == 0
+    assert "bucket: site-backups" in output
+    assert "secret key: configured" in output
+    assert "stored-secret" not in output
+    assert "stored-access" not in output
+
+
+def test_backup_storage_test_uses_fake_uploader(tmp_wpfy_home, monkeypatch, capsys):
+    import wpfy.cli as cli
+    import wpfy.s3_backup
+
+    importlib.reload(wpfy.s3_backup)
+    wpfy.s3_backup.write_s3_config(
+        wpfy.s3_backup.S3Config(
+            endpoint="https://storage.example.test",
+            bucket="site-backups",
+            region="auto",
+            prefix="daily",
+            access_key="stored-access",
+            secret_key="stored-secret",
+        )
+    )
+    calls = []
+
+    class FakeUploader:
+        def upload_bytes(self, config, key, payload):
+            calls.append((config.bucket, key, payload))
+            return f"s3://{config.bucket}/{key}"
+
+    monkeypatch.setattr(cli, "S3Uploader", lambda: FakeUploader())
+
+    result = cli.run(["backup", "storage", "test"])
+    output = capsys.readouterr().out
+
+    assert result == 0
+    assert calls == [("site-backups", "daily/.wpfy-test", b"wpfy backup storage test\n")]
+    assert "upload: OK s3://site-backups/daily/.wpfy-test" in output
+    assert "stored-secret" not in output
+
+
+def test_backup_storage_missing_config_exits_two(tmp_wpfy_home, capsys):
+    import wpfy.cli as cli
+    import wpfy.s3_backup
+
+    importlib.reload(wpfy.s3_backup)
+
+    result = cli.run(["backup", "storage", "status"])
+    output = capsys.readouterr().out
+
+    assert result == 2
+    assert "backup storage is not configured" in output
+
+
+def test_backup_storage_clear_requires_force(tmp_wpfy_home, capsys):
+    import wpfy.cli as cli
+
+    result = cli.run(["backup", "storage", "clear"])
+    output = capsys.readouterr().out
+
+    assert result == 2
+    assert "--force required" in output
+
+
+def test_backup_schedule_daily_writes_systemd_units(tmp_wpfy_home, monkeypatch, tmp_path, capsys):
+    import wpfy.cli as cli
+    import wpfy.backup_schedule
+    import wpfy.s3_backup
+
+    importlib.reload(wpfy.backup_schedule)
+    importlib.reload(wpfy.s3_backup)
+    monkeypatch.setenv("WPFY_SYSTEMD_DIR", str(tmp_path / "systemd"))
+    wpfy.s3_backup.write_s3_config(
+        wpfy.s3_backup.S3Config(
+            endpoint="https://storage.example.test",
+            bucket="site-backups",
+            region="auto",
+            prefix="daily",
+            access_key="stored-access",
+            secret_key="stored-secret",
+        )
+    )
+    commands = []
+    monkeypatch.setattr(wpfy.backup_schedule.subprocess, "run", lambda cmd, **kwargs: commands.append(cmd) or FakeProc())
+
+    result = cli.run(["backup", "schedule", "daily", "--time", "02:30", "--path", "/backups", "--s3"])
+    output = capsys.readouterr().out
+    service = (tmp_path / "systemd" / "wpfy-backup.service").read_text(encoding="utf-8")
+    timer = (tmp_path / "systemd" / "wpfy-backup.timer").read_text(encoding="utf-8")
+
+    assert result == 0
+    assert "ExecStart=/usr/local/bin/wpfy backup all --path /backups --s3" in service
+    assert "OnCalendar=*-*-* 02:30:00" in timer
+    assert commands == [["systemctl", "daemon-reload"], ["systemctl", "enable", "--now", "wpfy-backup.timer"]]
+    assert "schedule: enabled daily at 02:30" in output
+
+
+def test_backup_schedule_weekly_writes_weekday_timer(tmp_wpfy_home, monkeypatch, tmp_path, capsys):
+    import wpfy.cli as cli
+    import wpfy.backup_schedule
+
+    importlib.reload(wpfy.backup_schedule)
+    monkeypatch.setenv("WPFY_SYSTEMD_DIR", str(tmp_path / "systemd"))
+    commands = []
+    monkeypatch.setattr(wpfy.backup_schedule.subprocess, "run", lambda cmd, **kwargs: commands.append(cmd) or FakeProc())
+
+    result = cli.run(["backup", "schedule", "weekly", "--weekday", "sun", "--time", "03:00"])
+    output = capsys.readouterr().out
+    timer = (tmp_path / "systemd" / "wpfy-backup.timer").read_text(encoding="utf-8")
+
+    assert result == 0
+    assert "OnCalendar=sun *-*-* 03:00:00" in timer
+    assert "schedule: enabled weekly on sun at 03:00" in output
+    assert commands == [["systemctl", "daemon-reload"], ["systemctl", "enable", "--now", "wpfy-backup.timer"]]
+
+
+def test_backup_schedule_disable_leaves_storage_config(tmp_wpfy_home, monkeypatch, tmp_path, capsys):
+    import wpfy.cli as cli
+    import wpfy.backup_schedule
+    import wpfy.s3_backup
+
+    importlib.reload(wpfy.backup_schedule)
+    importlib.reload(wpfy.s3_backup)
+    monkeypatch.setenv("WPFY_SYSTEMD_DIR", str(tmp_path / "systemd"))
+    wpfy.s3_backup.write_s3_config(
+        wpfy.s3_backup.S3Config(
+            endpoint="https://storage.example.test",
+            bucket="site-backups",
+            region="auto",
+            prefix="daily",
+            access_key="stored-access",
+            secret_key="stored-secret",
+        )
+    )
+    commands = []
+    monkeypatch.setattr(wpfy.backup_schedule.subprocess, "run", lambda cmd, **kwargs: commands.append(cmd) or FakeProc())
+
+    result = cli.run(["backup", "schedule", "disable"])
+    output = capsys.readouterr().out
+
+    assert result == 0
+    assert wpfy.s3_backup.s3_config_path().exists()
+    assert commands == [
+        ["systemctl", "disable", "--now", "wpfy-backup.timer"],
+        ["systemctl", "daemon-reload"],
+    ]
+    assert "schedule: disabled" in output
+
+
+def test_backup_schedule_rejects_bad_time(capsys):
+    import wpfy.cli as cli
+
+    result = cli.run(["backup", "schedule", "daily", "--time", "25:99"])
+    output = capsys.readouterr().out
+
+    assert result == 2
+    assert "invalid time" in output
+
+
+def test_backup_schedule_s3_requires_storage_config(tmp_wpfy_home, capsys):
+    import wpfy.cli as cli
+    import wpfy.s3_backup
+
+    importlib.reload(wpfy.s3_backup)
+
+    result = cli.run(["backup", "schedule", "daily", "--time", "02:30", "--s3"])
+    output = capsys.readouterr().out
+
+    assert result == 2
+    assert "backup storage is not configured" in output
+
+
+def test_cron_interval_runs_sorted_wordpress_sites_and_skips_non_wp(tmp_wpfy_home, monkeypatch, capsys):
+    import wpfy.cli as cli
+    import wpfy.cron
+
+    importlib.reload(wpfy.cron)
+    calls = []
+    monkeypatch.setattr(wpfy.cron.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(
+        wpfy.cron,
+        "list_sites",
+        lambda: [
+            {"domain": "z.example.com", "flavor": "wp"},
+            {"domain": "a.example.com", "flavor": "wpredis"},
+            {"domain": "static.example.com", "flavor": "html"},
+        ],
+    )
+    monkeypatch.setattr(
+        wpfy.cron,
+        "wp_cli_command",
+        lambda domain, *args: calls.append((domain, args)) or FakeProc(stdout="ok"),
+    )
+
+    result = cli.run(["cron", "minute"])
+    output = capsys.readouterr().out
+
+    assert result == 0
+    assert calls == [
+        ("a.example.com", ("cron", "event", "run", "--due-now", "--allow-root")),
+        ("z.example.com", ("cron", "event", "run", "--due-now", "--allow-root")),
+    ]
+    assert "a.example.com: wp cron OK" in output
+    assert "static.example.com" not in output
+
+
+def test_cron_install_writes_all_interval_timers(tmp_wpfy_home, monkeypatch, tmp_path, capsys):
+    import wpfy.cli as cli
+    import wpfy.cron
+
+    importlib.reload(wpfy.cron)
+    monkeypatch.setenv("WPFY_SYSTEMD_DIR", str(tmp_path / "systemd"))
+    commands = []
+    monkeypatch.setattr(wpfy.cron.subprocess, "run", lambda cmd, **kwargs: commands.append(cmd) or FakeProc())
+
+    result = cli.run(["cron", "install"])
+    output = capsys.readouterr().out
+    service = (tmp_path / "systemd" / "wpfy-cron-five-minute.service").read_text(encoding="utf-8")
+    timer = (tmp_path / "systemd" / "wpfy-cron-five-minute.timer").read_text(encoding="utf-8")
+
+    assert result == 0
+    assert "ExecStart=/usr/local/bin/wpfy cron five-minute" in service
+    assert "OnCalendar=*-*-* *:0/5:00" in timer
+    assert commands == [
+        ["systemctl", "daemon-reload"],
+        ["systemctl", "enable", "--now", *wpfy.cron.timer_names()],
+    ]
+    assert "cron timers installed" in output
+
+
+def test_cron_refuses_world_writable_custom_hook(tmp_wpfy_home, monkeypatch, capsys):
+    import wpfy.cli as cli
+    import wpfy.cron
+
+    importlib.reload(wpfy.cron)
+    monkeypatch.setenv("WPFY_SKIP_RUNTIME", "1")
+    hook = Path(tmp_wpfy_home.config_dir) / "custom" / "cron" / "daily.sh"
+    hook.parent.mkdir(parents=True)
+    hook.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    hook.chmod(0o777)
+    monkeypatch.setattr(wpfy.cron, "list_sites", lambda: [])
+
+    result = cli.run(["cron", "daily"])
+    output = capsys.readouterr().out
+    log = (Path(tmp_wpfy_home.log_dir) / "cron.log").read_text(encoding="utf-8")
+
+    assert result == 1
+    assert "custom hook: refused unsafe hook" in output
+    assert "custom hook: refused unsafe hook" in log
+
+
+def test_log_cron_reads_tail(tmp_wpfy_home, capsys):
+    import wpfy.cli as cli
+    import wpfy.cron
+
+    importlib.reload(wpfy.cron)
+    log = Path(tmp_wpfy_home.log_dir) / "cron.log"
+    log.parent.mkdir(parents=True)
+    log.write_text("one\ntwo\nthree\n", encoding="utf-8")
+
+    result = cli.run(["log", "cron", "--lines", "2"])
+    output = capsys.readouterr().out
+
+    assert result == 0
+    assert output == "two\nthree\n"
+
+
+def test_smtp_set_writes_config_mode_and_redacts_status(tmp_wpfy_home, monkeypatch, capsys):
+    import wpfy.cli as cli
+    import wpfy.smtp
+
+    importlib.reload(wpfy.smtp)
+    monkeypatch.setattr(sys, "stdin", io.StringIO("smtp-secret\n"))
+
+    result = cli.run([
+        "smtp",
+        "set",
+        "--host",
+        "smtp.example.test",
+        "--port",
+        "587",
+        "--sender",
+        "ops@example.test",
+        "--username",
+        "smtp-user",
+        "--password-stdin",
+    ])
+    output = capsys.readouterr().out
+    path = wpfy.smtp.smtp_config_path()
+
+    assert result == 0
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    assert "username: configured" in output
+    assert "password: configured" in output
+    assert "smtp-secret" not in output
+
+    status_result = cli.run(["smtp", "status"])
+    status_output = capsys.readouterr().out
+
+    assert status_result == 0
+    assert "smtp-user" not in status_output
+    assert "smtp-secret" not in status_output
+
+
+def test_smtp_status_missing_config_exits_two(tmp_wpfy_home, capsys):
+    import wpfy.cli as cli
+    import wpfy.smtp
+
+    importlib.reload(wpfy.smtp)
+
+    result = cli.run(["smtp", "status"])
+    output = capsys.readouterr().out
+
+    assert result == 2
+    assert "smtp is not configured" in output
+
+
+def test_smtp_test_dry_run_avoids_network(tmp_wpfy_home, monkeypatch, capsys):
+    import wpfy.cli as cli
+    import wpfy.smtp
+
+    importlib.reload(wpfy.smtp)
+    wpfy.smtp.write_smtp_config(
+        wpfy.smtp.SMTPConfig(
+            host="smtp.example.test",
+            port=587,
+            sender="ops@example.test",
+            username="smtp-user",
+            password="smtp-secret",
+        )
+    )
+    monkeypatch.setattr(wpfy.smtp.smtplib, "SMTP", lambda *args, **kwargs: pytest.fail("network should not run"))
+
+    result = cli.run(["smtp", "test", "--dry-run"])
+    output = capsys.readouterr().out
+
+    assert result == 0
+    assert "dry-run: validated SMTP config for ops@example.test" in output
+
+
+def test_smtp_test_to_sends_with_fake_transport(tmp_wpfy_home, monkeypatch, capsys):
+    import wpfy.cli as cli
+    import wpfy.smtp
+
+    importlib.reload(wpfy.smtp)
+    wpfy.smtp.write_smtp_config(
+        wpfy.smtp.SMTPConfig(
+            host="127.0.0.1",
+            port=2525,
+            sender="ops@example.test",
+            username="smtp-user",
+            password="smtp-secret",
+            tls="none",
+        )
+    )
+    sent = []
+
+    class FakeSMTP:
+        def __init__(self, host, port, timeout):
+            sent.append(("connect", host, port, timeout))
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def login(self, username, password):
+            sent.append(("login", username, password))
+
+        def send_message(self, message):
+            sent.append(("send", message["To"], message["From"]))
+
+    monkeypatch.setattr(wpfy.smtp.smtplib, "SMTP", FakeSMTP)
+
+    result = cli.run(["smtp", "test", "--to", "owner@example.test"])
+    output = capsys.readouterr().out
+
+    assert result == 0
+    assert sent == [
+        ("connect", "127.0.0.1", 2525, 15),
+        ("login", "smtp-user", "smtp-secret"),
+        ("send", "owner@example.test", "ops@example.test"),
+    ]
+    assert "sent: owner@example.test" in output
+
+
+def test_restore_alias_uses_site_restore_path(monkeypatch, capsys):
+    import wpfy.cli as cli
+    from wpfy.site_layout import RuntimeResult
+
+    calls = []
+    monkeypatch.setattr(
+        cli,
+        "restore_site",
+        lambda domain, backup: calls.append((domain, backup)) or RuntimeResult(0, "restored", ran=True),
+    )
+
+    result = cli.run(["restore", "example.com", "/tmp/example-backup.tar.gz"])
+    output = capsys.readouterr().out
+
+    assert result == 0
+    assert calls == [("example.com", "/tmp/example-backup.tar.gz")]
+    assert "=== site restore ===" in output
+    assert "restore: OK restored" in output
+
+
+def test_restore_list_alias_prints_archive_paths(monkeypatch, capsys):
+    import wpfy.cli as cli
+
+    monkeypatch.setattr(cli, "list_backup_archives", lambda domain: [Path("/tmp/example.com/archive.tar.gz")])
+
+    result = cli.run(["restore", "example.com", "--list"])
+    output = capsys.readouterr().out
+
+    assert result == 0
+    assert "=== restore archives ===" in output
+    assert "/tmp/example.com/archive.tar.gz" in output
+
+
+def test_grouped_restore_list_prints_archive_paths(monkeypatch, capsys):
+    import wpfy.cli as cli
+
+    monkeypatch.setattr(cli, "list_backup_archives", lambda domain: [Path("/tmp/grouped/archive.tar.gz")])
+
+    result = cli.run(["site", "restore", "example.com", "--list"])
+    output = capsys.readouterr().out
+
+    assert result == 0
+    assert "/tmp/grouped/archive.tar.gz" in output
+
+
+def test_restore_without_archive_exits_cleanly(capsys):
+    import wpfy.cli as cli
+
+    result = cli.run(["restore", "example.com"])
+    output = capsys.readouterr().out
+
+    assert result == 2
+    assert "restore backup archive required unless --list is used" in output
+    assert "Traceback" not in output
 
 
 def test_stack_install_php_flag_pulls_default_84(monkeypatch, capsys):
@@ -509,6 +1230,801 @@ def test_site_delete_missing_returns_clean_error(tmp_wpfy_home, monkeypatch):
     assert result == 2
 
 
+def test_rm_alias_requires_force_when_stdin_is_not_tty(monkeypatch, capsys):
+    import wpfy.cli as cli
+
+    calls = []
+    monkeypatch.setattr(cli, "site_exists", lambda domain: True)
+    monkeypatch.setattr(cli, "backup_site", lambda domain: calls.append(("backup", domain)))
+    monkeypatch.setattr(cli, "stop_site_runtime", lambda domain, remove_volumes=False: calls.append(("stop", domain)))
+    monkeypatch.setattr(cli, "remove_site_scaffold", lambda domain: calls.append(("remove", domain)) or True)
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: False)
+
+    result = run(["rm", "example.com"])
+    output = capsys.readouterr().out
+
+    assert result == 2
+    assert "--force required when stdin is not a TTY" in output
+    assert calls == []
+
+
+def test_rm_alias_force_uses_existing_delete_flow(monkeypatch, capsys):
+    import wpfy.cli as cli
+    from wpfy.site_layout import RuntimeResult
+
+    calls = []
+    monkeypatch.setattr(cli, "site_exists", lambda domain: True)
+    monkeypatch.setattr(
+        cli,
+        "backup_site",
+        lambda domain: calls.append(("backup", domain)) or RuntimeResult(0, "backup created", ran=True),
+    )
+    monkeypatch.setattr(
+        cli,
+        "stop_site_runtime",
+        lambda domain, remove_volumes=False: calls.append(("stop", domain, remove_volumes)) or RuntimeResult(
+            0, "stopped", ran=True
+        ),
+    )
+    monkeypatch.setattr(cli, "remove_site_scaffold", lambda domain: calls.append(("remove", domain)) or True)
+
+    result = run(["rm", "example.com", "--force"])
+    output = capsys.readouterr().out
+
+    assert result == 0
+    assert calls == [
+        ("backup", "example.com"),
+        ("stop", "example.com", True),
+        ("remove", "example.com"),
+    ]
+    assert "=== site deleted ===" in output
+    assert "backup: OK backup created" in output
+    assert "runtime: OK stopped" in output
+
+
+def test_site_delete_keeps_scaffold_when_runtime_stop_fails(monkeypatch, capsys):
+    import wpfy.cli as cli
+    from wpfy.site_layout import RuntimeResult
+
+    removed = []
+    monkeypatch.setattr(cli, "site_exists", lambda domain: True)
+    monkeypatch.setattr(cli, "backup_site", lambda domain: RuntimeResult(0, "backup created", ran=True))
+    monkeypatch.setattr(
+        cli,
+        "stop_site_runtime",
+        lambda domain, remove_volumes=False: RuntimeResult(17, "compose down failed", ran=True),
+    )
+    monkeypatch.setattr(cli, "remove_site_scaffold", lambda domain: removed.append(domain) or True)
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr("builtins.input", lambda prompt: "yes")
+
+    result = run(["site", "delete", "example.com"])
+    output = capsys.readouterr().out
+
+    assert result == 17
+    assert removed == []
+    assert "runtime: FAIL compose down failed" in output
+    assert "files: kept" in output
+
+
+def test_wp_alias_uses_existing_wp_cli_path(monkeypatch):
+    from pathlib import Path
+
+    import wpfy.cli as cli
+
+    captured = {}
+
+    class Proc:
+        returncode = 0
+
+    def fake_run(cmd, *args, **kwargs):
+        captured["cmd"] = cmd
+        captured["cwd"] = kwargs["cwd"]
+        return Proc()
+
+    monkeypatch.setattr(cli, "site_exists", lambda domain: True)
+    monkeypatch.setattr(cli, "compose_path", lambda domain: Path("/tmp/example/compose.yaml"))
+    monkeypatch.setattr(cli, "site_dir", lambda domain: Path("/tmp/example"))
+    monkeypatch.setattr(cli.subprocess, "run", fake_run)
+
+    result = run(["wp", "example.com", "option", "get", "siteurl"])
+
+    assert result == 0
+    assert captured["cmd"] == [
+        "docker",
+        "compose",
+        "-f",
+        "/tmp/example/compose.yaml",
+        "run",
+        "--rm",
+        "wpcli",
+        "option",
+        "get",
+        "siteurl",
+        "--allow-root",
+    ]
+    assert captured["cwd"] == "/tmp/example"
+
+
+def test_wp_alias_missing_site_exits_two(monkeypatch):
+    import wpfy.cli as cli
+
+    monkeypatch.setattr(cli, "site_exists", lambda domain: False)
+    monkeypatch.setattr(cli.subprocess, "run", lambda *args, **kwargs: pytest.fail("subprocess should not run"))
+
+    result = run(["wp", "missing.test", "option", "get", "siteurl"])
+
+    assert result == 2
+
+
+def test_version_command_matches_argparse_version(capsys):
+    import wpfy.cli as cli
+
+    result = run(["version"])
+    output = capsys.readouterr().out
+
+    assert result == 0
+    assert output == f"wpfy {cli.__version__}\n"
+
+    with pytest.raises(SystemExit) as exc_info:
+        run(["--version"])
+    version_output = capsys.readouterr().out
+
+    assert exc_info.value.code == 0
+    assert version_output == f"wpfy {cli.__version__}\n"
+
+
+def test_up_uses_start_site_runtime(monkeypatch, capsys):
+    import wpfy.cli as cli
+    from wpfy.site_layout import RuntimeResult
+
+    calls = []
+    monkeypatch.setattr(cli, "site_exists", lambda domain: True)
+    monkeypatch.setattr(
+        cli,
+        "start_site_runtime",
+        lambda domain: calls.append(domain) or RuntimeResult(7, "started oddly", ran=True),
+    )
+
+    result = run(["up", "example.com"])
+    output = capsys.readouterr().out
+
+    assert result == 7
+    assert calls == ["example.com"]
+    assert "=== site up ===" in output
+    assert "runtime: FAIL started oddly" in output
+
+
+def test_up_missing_site_does_not_start_runtime(monkeypatch):
+    import wpfy.cli as cli
+
+    monkeypatch.setattr(cli, "site_exists", lambda domain: False)
+    monkeypatch.setattr(cli, "start_site_runtime", lambda domain: pytest.fail("runtime should not start"))
+
+    result = run(["up", "missing.test"])
+
+    assert result == 2
+
+
+def test_up_invalid_domain_does_not_start_runtime(monkeypatch):
+    import wpfy.cli as cli
+
+    monkeypatch.setattr(cli, "site_exists", lambda domain: pytest.fail("site_exists should not run"))
+    monkeypatch.setattr(cli, "start_site_runtime", lambda domain: pytest.fail("runtime should not start"))
+
+    result = run(["up", "../../etc"])
+
+    assert result == 2
+
+
+def test_down_uses_stop_site_runtime_without_volumes(monkeypatch, capsys):
+    import wpfy.cli as cli
+    from wpfy.site_layout import RuntimeResult
+
+    calls = []
+    monkeypatch.setattr(cli, "site_exists", lambda domain: True)
+    monkeypatch.setattr(
+        cli,
+        "stop_site_runtime",
+        lambda domain, remove_volumes=False: calls.append((domain, remove_volumes)) or RuntimeResult(
+            0, "stopped", ran=True
+        ),
+    )
+
+    result = run(["down", "example.com"])
+    output = capsys.readouterr().out
+
+    assert result == 0
+    assert calls == [("example.com", False)]
+    assert "volumes: kept" in output
+
+
+def test_down_uses_stop_site_runtime_with_volumes(monkeypatch, capsys):
+    import wpfy.cli as cli
+    from wpfy.site_layout import RuntimeResult
+
+    calls = []
+    monkeypatch.setattr(cli, "site_exists", lambda domain: True)
+    monkeypatch.setattr(
+        cli,
+        "stop_site_runtime",
+        lambda domain, remove_volumes=False: calls.append((domain, remove_volumes)) or RuntimeResult(
+            0, "stopped", ran=True
+        ),
+    )
+
+    result = run(["down", "example.com", "--volumes"])
+    output = capsys.readouterr().out
+
+    assert result == 0
+    assert calls == [("example.com", True)]
+    assert "volumes: removed" in output
+
+
+def test_down_missing_site_does_not_stop_runtime(monkeypatch):
+    import wpfy.cli as cli
+
+    monkeypatch.setattr(cli, "site_exists", lambda domain: False)
+    monkeypatch.setattr(cli, "stop_site_runtime", lambda *args, **kwargs: pytest.fail("runtime should not stop"))
+
+    result = run(["down", "missing.test"])
+
+    assert result == 2
+
+
+def test_compose_uses_compose_command_and_preserves_return_code(monkeypatch, capsys):
+    import wpfy.cli as cli
+
+    calls = []
+    monkeypatch.setattr(cli, "site_exists", lambda domain: True)
+    monkeypatch.setattr(
+        cli,
+        "compose_command",
+        lambda domain, *args: calls.append((domain, args)) or FakeProc(17, stdout="compose out\n"),
+    )
+
+    result = run(["compose", "example.com", "--", "ps"])
+    output = capsys.readouterr().out
+
+    assert result == 17
+    assert calls == [("example.com", ("ps",))]
+    assert output == "compose out\n"
+
+
+def test_compose_prints_stderr_when_stdout_is_empty(monkeypatch, capsys):
+    import wpfy.cli as cli
+
+    monkeypatch.setattr(cli, "site_exists", lambda domain: True)
+    monkeypatch.setattr(cli, "compose_command", lambda domain, *args: FakeProc(1, stderr="compose err\n"))
+
+    result = run(["compose", "example.com", "--", "ps"])
+    output = capsys.readouterr().out
+
+    assert result == 1
+    assert output == "compose err\n"
+
+
+def test_compose_requires_arguments_after_domain(monkeypatch):
+    import wpfy.cli as cli
+
+    monkeypatch.setattr(cli, "site_exists", lambda domain: True)
+    monkeypatch.setattr(cli, "compose_command", lambda *args: pytest.fail("compose should not run"))
+
+    result = run(["compose", "example.com"])
+
+    assert result == 2
+
+
+def test_compose_missing_site_does_not_call_docker(monkeypatch):
+    import wpfy.cli as cli
+
+    monkeypatch.setattr(cli, "site_exists", lambda domain: False)
+    monkeypatch.setattr(cli, "compose_command", lambda *args: pytest.fail("compose should not run"))
+
+    result = run(["compose", "missing.test", "--", "ps"])
+
+    assert result == 2
+
+
+def test_exec_defaults_to_app_service(monkeypatch):
+    import wpfy.cli as cli
+
+    calls = []
+    monkeypatch.setattr(cli, "site_exists", lambda domain: True)
+    monkeypatch.setattr(cli, "compose_command", lambda domain, *args: calls.append((domain, args)) or FakeProc())
+
+    result = run(["exec", "example.com", "--", "php", "-v"])
+
+    assert result == 0
+    assert calls == [("example.com", ("exec", "app", "php", "-v"))]
+
+
+def test_exec_accepts_explicit_service(monkeypatch):
+    import wpfy.cli as cli
+
+    calls = []
+    monkeypatch.setattr(cli, "site_exists", lambda domain: True)
+    monkeypatch.setattr(cli, "compose_command", lambda domain, *args: calls.append((domain, args)) or FakeProc())
+
+    result = run(["exec", "example.com", "web", "--", "nginx", "-v"])
+
+    assert result == 0
+    assert calls == [("example.com", ("exec", "web", "nginx", "-v"))]
+
+
+def test_exec_rejects_invalid_service(monkeypatch):
+    import wpfy.cli as cli
+
+    monkeypatch.setattr(cli, "site_exists", lambda domain: True)
+    monkeypatch.setattr(cli, "compose_command", lambda *args: pytest.fail("compose should not run"))
+
+    result = run(["exec", "example.com", "unknown", "--", "date"])
+
+    assert result == 2
+
+
+def test_exec_requires_command(monkeypatch):
+    import wpfy.cli as cli
+
+    monkeypatch.setattr(cli, "site_exists", lambda domain: True)
+    monkeypatch.setattr(cli, "compose_command", lambda *args: pytest.fail("compose should not run"))
+
+    result = run(["exec", "example.com", "app"])
+
+    assert result == 2
+
+
+def test_cp_copies_into_site(monkeypatch):
+    import wpfy.cli as cli
+
+    calls = []
+    monkeypatch.setattr(cli, "site_exists", lambda domain: True)
+    monkeypatch.setattr(cli, "compose_command", lambda domain, *args: calls.append((domain, args)) or FakeProc())
+
+    result = run(["cp", "example.com", "./local.txt", "app:/var/www/html/local.txt"])
+
+    assert result == 0
+    assert calls == [("example.com", ("cp", "./local.txt", "app:/var/www/html/local.txt"))]
+
+
+def test_cp_copies_out_of_site(monkeypatch):
+    import wpfy.cli as cli
+
+    calls = []
+    monkeypatch.setattr(cli, "site_exists", lambda domain: True)
+    monkeypatch.setattr(cli, "compose_command", lambda domain, *args: calls.append((domain, args)) or FakeProc())
+
+    result = run(["cp", "example.com", "app:/var/www/html/file.txt", "./file.txt"])
+
+    assert result == 0
+    assert calls == [("example.com", ("cp", "app:/var/www/html/file.txt", "./file.txt"))]
+
+
+def test_cp_missing_site_does_not_call_compose(monkeypatch):
+    import wpfy.cli as cli
+
+    monkeypatch.setattr(cli, "site_exists", lambda domain: False)
+    monkeypatch.setattr(cli, "compose_command", lambda *args: pytest.fail("compose should not run"))
+
+    result = run(["cp", "missing.test", "./local.txt", "app:/var/www/html/local.txt"])
+
+    assert result == 2
+
+
+def test_cp_rejects_dangerous_broad_path(monkeypatch):
+    import wpfy.cli as cli
+
+    monkeypatch.setattr(cli, "site_exists", lambda domain: True)
+    monkeypatch.setattr(cli, "compose_command", lambda *args: pytest.fail("compose should not run"))
+
+    result = run(["cp", "example.com", "/", "app:/var/www/html/root-copy"])
+
+    assert result == 2
+
+
+def test_pull_defaults_to_all_site_services(monkeypatch):
+    import wpfy.cli as cli
+
+    calls = []
+    monkeypatch.setattr(cli, "site_exists", lambda domain: True)
+    monkeypatch.setattr(cli, "compose_command", lambda domain, *args: calls.append((domain, args)) or FakeProc())
+
+    result = run(["pull", "example.com"])
+
+    assert result == 0
+    assert calls == [("example.com", ("pull",))]
+
+
+def test_pull_all_uses_plain_pull(monkeypatch):
+    import wpfy.cli as cli
+
+    calls = []
+    monkeypatch.setattr(cli, "site_exists", lambda domain: True)
+    monkeypatch.setattr(cli, "compose_command", lambda domain, *args: calls.append((domain, args)) or FakeProc())
+
+    result = run(["pull", "example.com", "--all"])
+
+    assert result == 0
+    assert calls == [("example.com", ("pull",))]
+
+
+def test_pull_service_uses_service_arg(monkeypatch):
+    import wpfy.cli as cli
+
+    calls = []
+    monkeypatch.setattr(cli, "site_exists", lambda domain: True)
+    monkeypatch.setattr(cli, "compose_command", lambda domain, *args: calls.append((domain, args)) or FakeProc())
+
+    result = run(["pull", "example.com", "--service", "app"])
+
+    assert result == 0
+    assert calls == [("example.com", ("pull", "app"))]
+
+
+def test_pull_rejects_invalid_service(monkeypatch):
+    import wpfy.cli as cli
+
+    monkeypatch.setattr(cli, "site_exists", lambda domain: True)
+    monkeypatch.setattr(cli, "compose_command", lambda *args: pytest.fail("compose should not run"))
+
+    result = run(["pull", "example.com", "--service", "unknown"])
+
+    assert result == 2
+
+
+def test_config_status_prints_sanitized_summary(tmp_path, monkeypatch, capsys):
+    import wpfy.cli as cli
+
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "\n".join([
+            "DOMAIN=example.com",
+            "SITE_FLAVOR=wpredis",
+            "PHP_VERSION=8.4",
+            "DB_PASSWORD=db-secret",
+            "DB_ROOT_PASSWORD=root-secret",
+            "SFTP_PASSWORD=sftp-secret",
+            "SFTP_PORT=2222",
+            "LETSENCRYPT_MODE=default",
+            "PROXIED=1",
+        ]),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(cli, "site_exists", lambda domain: True)
+    monkeypatch.setattr(cli, "env_path", lambda domain: env_file)
+    monkeypatch.setattr(cli, "compose_path", lambda domain: tmp_path / "compose.yaml")
+
+    result = run(["config", "example.com"])
+    output = capsys.readouterr().out
+
+    assert result == 0
+    assert "=== site config ===" in output
+    assert "domain: example.com" in output
+    assert "flavor: wpredis" in output
+    assert "database password: configured" in output
+    assert "sftp password: configured" in output
+    assert "DB_PASSWORD=" not in output
+    assert "DB_ROOT_PASSWORD=" not in output
+    assert "SFTP_PASSWORD=" not in output
+    assert "db-secret" not in output
+    assert "root-secret" not in output
+    assert "sftp-secret" not in output
+
+
+def test_config_update_routes_through_update_site(monkeypatch):
+    import wpfy.cli as cli
+
+    captured = []
+
+    def fake_update(request):
+        captured.append(request)
+        return cli.site_lifecycle.UpdateSiteResult(
+            spec=cli.site_lifecycle.SiteSpec(request.domain, "wp", True, False),
+            touched=("/tmp/compose.yaml",),
+            runtime=cli.site_lifecycle.RuntimeResult(0, "started", ran=True),
+            changes=("php 8.3→8.4",),
+        )
+
+    monkeypatch.setattr(cli, "site_exists", lambda domain: True)
+    monkeypatch.setattr(cli.site_lifecycle, "update_site", fake_update)
+
+    result = run(["config", "example.com", "--php", "8.4"])
+
+    assert result == 0
+    assert captured[0].domain == "example.com"
+    assert captured[0].php_version == "8.4"
+
+
+def test_config_update_routes_wpredis_letsencrypt_and_proxied(monkeypatch):
+    import wpfy.cli as cli
+
+    captured = []
+
+    def fake_update(request):
+        captured.append(request)
+        return cli.site_lifecycle.UpdateSiteResult(
+            spec=cli.site_lifecycle.SiteSpec(request.domain, "wpredis", True, True),
+            touched=(),
+            runtime=cli.site_lifecycle.RuntimeResult(0, "started", ran=True),
+            changes=(),
+        )
+
+    monkeypatch.setattr(cli, "site_exists", lambda domain: True)
+    monkeypatch.setattr(cli.site_lifecycle, "update_site", fake_update)
+
+    assert run(["config", "example.com", "--wpredis"]) == 0
+    assert run(["config", "example.com", "--letsencrypt", "off"]) == 0
+    assert run(["config", "example.com", "--proxied"]) == 0
+    assert run(["config", "example.com", "--no-proxied"]) == 0
+
+    assert captured[0].wpredis is True
+    assert captured[1].letsencrypt == "off"
+    assert captured[2].proxied_override is True
+    assert captured[3].proxied_override is False
+
+
+def test_config_missing_site_does_not_update(monkeypatch):
+    import wpfy.cli as cli
+
+    monkeypatch.setattr(cli, "site_exists", lambda domain: False)
+    monkeypatch.setattr(cli.site_lifecycle, "update_site", lambda request: pytest.fail("update should not run"))
+
+    result = run(["config", "missing.test", "--php", "8.4"])
+
+    assert result == 2
+
+
+def test_config_invalid_domain_does_not_update(monkeypatch):
+    import wpfy.cli as cli
+
+    monkeypatch.setattr(cli, "site_exists", lambda domain: pytest.fail("site_exists should not run"))
+    monkeypatch.setattr(cli.site_lifecycle, "update_site", lambda request: pytest.fail("update should not run"))
+
+    result = run(["config", "../../etc", "--php", "8.4"])
+
+    assert result == 2
+
+
+def test_config_password_prompt_passes_password_without_printing(monkeypatch, capsys):
+    import wpfy.cli as cli
+
+    captured = []
+
+    def fake_update(request):
+        captured.append(request)
+        return cli.site_lifecycle.UpdateSiteResult(
+            spec=cli.site_lifecycle.SiteSpec(request.domain, "wp", True, False),
+            touched=(),
+            runtime=cli.site_lifecycle.RuntimeResult(0, "started", ran=True),
+            changes=(),
+            password_summary="OK password updated for admin",
+        )
+
+    monkeypatch.setattr(cli, "site_exists", lambda domain: True)
+    monkeypatch.setattr(cli.sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr(cli.getpass, "getpass", lambda prompt: "prompt-secret")
+    monkeypatch.setattr(cli.site_lifecycle, "update_site", fake_update)
+
+    result = run(["config", "example.com", "--password"])
+    output = capsys.readouterr().out
+
+    assert result == 0
+    assert captured[0].password == "prompt-secret"
+    assert "prompt-secret" not in output
+
+
+def test_config_password_stdin_passes_password_without_printing(monkeypatch, capsys):
+    import wpfy.cli as cli
+
+    captured = []
+
+    def fake_update(request):
+        captured.append(request)
+        return cli.site_lifecycle.UpdateSiteResult(
+            spec=cli.site_lifecycle.SiteSpec(request.domain, "wp", True, False),
+            touched=(),
+            runtime=cli.site_lifecycle.RuntimeResult(0, "started", ran=True),
+            changes=(),
+            password_summary="OK password updated for admin",
+        )
+
+    monkeypatch.setattr(cli, "site_exists", lambda domain: True)
+    monkeypatch.setattr(cli.sys, "stdin", io.StringIO("stdin-secret\n"))
+    monkeypatch.setattr(cli.site_lifecycle, "update_site", fake_update)
+
+    result = run(["config", "example.com", "--password-stdin"])
+    output = capsys.readouterr().out
+
+    assert result == 0
+    assert captured[0].password == "stdin-secret"
+    assert "stdin-secret" not in output
+
+
+def test_config_password_does_not_accept_plain_argument():
+    with pytest.raises(SystemExit) as exc_info:
+        run(["config", "example.com", "--password", "secret"])
+    assert exc_info.value.code == 2
+
+
+def test_edit_print_path_does_not_print_contents(tmp_path, monkeypatch, capsys):
+    import wpfy.cli as cli
+
+    env_file = tmp_path / ".env"
+    env_file.write_text("DOMAIN=example.com\nDB_PASSWORD=secret\n", encoding="utf-8")
+    monkeypatch.setattr(cli, "site_exists", lambda domain: True)
+    monkeypatch.setattr(cli, "env_path", lambda domain: env_file)
+
+    result = run(["edit", "example.com", "--print-path"])
+    output = capsys.readouterr().out
+
+    assert result == 0
+    assert output == f"{env_file}\n"
+    assert "DB_PASSWORD" not in output
+    assert "secret" not in output
+
+
+def test_edit_refuses_non_tty_without_editor_or_refresh(tmp_path, monkeypatch):
+    import wpfy.cli as cli
+
+    env_file = tmp_path / ".env"
+    env_file.write_text("DOMAIN=example.com\n", encoding="utf-8")
+    monkeypatch.delenv("EDITOR", raising=False)
+    monkeypatch.delenv("VISUAL", raising=False)
+    monkeypatch.setattr(cli, "site_exists", lambda domain: True)
+    monkeypatch.setattr(cli, "env_path", lambda domain: env_file)
+    monkeypatch.setattr(cli.sys.stdin, "isatty", lambda: False)
+    monkeypatch.setattr(cli.subprocess, "run", lambda *args, **kwargs: pytest.fail("editor should not run"))
+    monkeypatch.setattr(cli, "ensure_site_scaffold", lambda spec: pytest.fail("refresh should not run"))
+
+    result = run(["edit", "example.com"])
+
+    assert result == 2
+
+
+def test_edit_success_backs_up_opens_editor_and_refreshes(tmp_path, monkeypatch, capsys):
+    import wpfy.cli as cli
+
+    env_file = tmp_path / ".env"
+    env_file.write_text("DOMAIN=example.com\nSITE_FLAVOR=wp\nDB_PASSWORD=secret\n", encoding="utf-8")
+    calls = []
+
+    monkeypatch.setenv("EDITOR", "fake-editor")
+    monkeypatch.setattr(cli, "site_exists", lambda domain: True)
+    monkeypatch.setattr(cli, "env_path", lambda domain: env_file)
+    monkeypatch.setattr(cli.sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr(cli.sys.stdout, "isatty", lambda: True)
+    monkeypatch.setattr(cli.subprocess, "run", lambda cmd, **kwargs: calls.append(cmd) or FakeProc())
+    monkeypatch.setattr(
+        cli,
+        "ensure_site_scaffold",
+        lambda spec: calls.append(("refresh", spec.domain)) or ["compose.yaml"],
+    )
+
+    result = run(["edit", "example.com"])
+    output = capsys.readouterr().out
+
+    backups = list(tmp_path.glob(".env.bak-*"))
+    assert result == 0
+    assert calls == [["fake-editor", str(env_file)], ("refresh", "example.com")]
+    assert len(backups) == 1
+    assert "backup:" in output
+    assert "refresh: updated 1 paths" in output
+    assert "secret" not in output
+
+
+def test_refresh_single_regenerates_without_restart(tmp_path, monkeypatch, capsys):
+    import wpfy.cli as cli
+
+    env_file = tmp_path / ".env"
+    env_file.write_text("DOMAIN=example.com\nSITE_FLAVOR=html\n", encoding="utf-8")
+    calls = []
+    monkeypatch.setattr(cli, "site_exists", lambda domain: True)
+    monkeypatch.setattr(cli, "env_path", lambda domain: env_file)
+    monkeypatch.setattr(cli, "ensure_site_scaffold", lambda spec: calls.append(spec.domain) or ["compose.yaml", ".env"])
+    monkeypatch.setattr(cli, "start_site_runtime", lambda domain: pytest.fail("runtime should not start"))
+
+    result = run(["refresh", "example.com"])
+    output = capsys.readouterr().out
+
+    assert result == 0
+    assert calls == ["example.com"]
+    assert "scaffold: updated 2 paths" in output
+    assert "runtime: skipped" in output
+
+
+def test_refresh_restart_preserves_runtime_exit_code(tmp_path, monkeypatch):
+    import wpfy.cli as cli
+    from wpfy.site_layout import RuntimeResult
+
+    env_file = tmp_path / ".env"
+    env_file.write_text("DOMAIN=example.com\nSITE_FLAVOR=html\n", encoding="utf-8")
+    monkeypatch.setattr(cli, "site_exists", lambda domain: True)
+    monkeypatch.setattr(cli, "env_path", lambda domain: env_file)
+    monkeypatch.setattr(cli, "ensure_site_scaffold", lambda spec: [])
+    monkeypatch.setattr(cli, "start_site_runtime", lambda domain: RuntimeResult(9, "failed", ran=True))
+
+    result = run(["refresh", "example.com", "--restart"])
+
+    assert result == 9
+
+
+def test_refresh_all_uses_sorted_domains_and_returns_nonzero_on_failure(tmp_path, monkeypatch, capsys):
+    import wpfy.cli as cli
+
+    env_files = {
+        "a.example.com": tmp_path / "a.env",
+        "b.example.com": tmp_path / "b.env",
+    }
+    env_files["a.example.com"].write_text("DOMAIN=a.example.com\nSITE_FLAVOR=html\n", encoding="utf-8")
+    env_files["b.example.com"].write_text("DOMAIN=wrong.example.com\nSITE_FLAVOR=html\n", encoding="utf-8")
+    calls = []
+
+    monkeypatch.setattr(cli, "list_sites", lambda: [{"domain": "b.example.com"}, {"domain": "a.example.com"}])
+    monkeypatch.setattr(cli, "site_exists", lambda domain: True)
+    monkeypatch.setattr(cli, "env_path", lambda domain: env_files[domain])
+
+    def fake_scaffold(spec):
+        calls.append(spec.domain)
+        return []
+
+    monkeypatch.setattr(cli, "ensure_site_scaffold", fake_scaffold)
+
+    result = run(["refresh", "all"])
+    output = capsys.readouterr().out
+
+    assert result == 2
+    assert calls == ["a.example.com"]
+    assert output.index("a.example.com: OK") < output.index("b.example.com: FAIL")
+
+
+def test_refresh_missing_site_does_not_mutate(monkeypatch):
+    import wpfy.cli as cli
+
+    monkeypatch.setattr(cli, "site_exists", lambda domain: False)
+    monkeypatch.setattr(cli, "ensure_site_scaffold", lambda spec: pytest.fail("refresh should not run"))
+
+    result = run(["refresh", "missing.test"])
+
+    assert result == 2
+
+
+def test_refresh_invalid_config_does_not_mutate(tmp_path, monkeypatch):
+    import wpfy.cli as cli
+
+    env_file = tmp_path / ".env"
+    env_file.write_text("DOMAIN=example.com\nSITE_FLAVOR=html\nSITE_UID=bad\n", encoding="utf-8")
+    monkeypatch.setattr(cli, "site_exists", lambda domain: True)
+    monkeypatch.setattr(cli, "env_path", lambda domain: env_file)
+    monkeypatch.setattr(cli, "ensure_site_scaffold", lambda spec: pytest.fail("refresh should not run"))
+
+    result = run(["refresh", "example.com"])
+
+    assert result == 2
+
+
+def test_refresh_preserves_unmanaged_env_keys(tmp_wpfy_home, monkeypatch, capsys):
+    import wpfy.cli
+    import wpfy.site_layout
+
+    importlib.reload(wpfy.site_layout)
+    importlib.reload(wpfy.cli)
+
+    domain = "preserve.example.com"
+    spec = wpfy.site_layout.SiteSpec(domain=domain, flavor="wp", use_mysql=True, use_redis=False)
+    wpfy.site_layout.ensure_site_scaffold(spec)
+    env_file = wpfy.site_layout.env_path(domain)
+    with env_file.open("a", encoding="utf-8") as handle:
+        handle.write("CUSTOM_OPERATOR_KEY=keep-me\n")
+
+    result = wpfy.cli.run(["refresh", domain])
+    output = capsys.readouterr().out
+
+    assert result == 0
+    assert "CUSTOM_OPERATOR_KEY=keep-me" in env_file.read_text(encoding="utf-8")
+    assert "CUSTOM_OPERATOR_KEY" not in output
+    assert "keep-me" not in output
+
+
 def test_site_ssl_preflight_only_failure_exits_nonzero(monkeypatch):
     import wpfy.cli
     from wpfy.certificate_lifecycle import SSLPreflightResult
@@ -738,3 +2254,317 @@ def test_secure_reports_container_hardening_baseline(tmp_wpfy_home, monkeypatch,
     assert f"[PASS] {project}-web: pids_limit=256" in output
     assert f"[PASS] {project}-web: memory limit configured" in output
     assert f"[PASS] {project}-web: log rotation configured" in output
+
+
+@dataclass(frozen=True, slots=True)
+class DiskUsage:
+    total: int
+    used: int
+    free: int
+
+
+def test_healthcheck_disk_pass_warn_and_fail(monkeypatch, capsys):
+    import wpfy.cli as cli
+
+    monkeypatch.setattr(cli.shutil, "disk_usage", lambda path: DiskUsage(100, 42, 58))
+    result = run(["healthcheck", "disk", "--path", "/", "--warn", "80", "--fail", "90"])
+    output = capsys.readouterr().out
+    assert result == 0
+    assert "[PASS] disk: 42.0% used at /" in output
+
+    monkeypatch.setattr(cli.shutil, "disk_usage", lambda path: DiskUsage(100, 85, 15))
+    result = run(["healthcheck", "disk", "--warn", "80", "--fail", "90"])
+    output = capsys.readouterr().out
+    assert result == 0
+    assert "[WARN] disk: 85.0% used at /" in output
+
+    monkeypatch.setattr(cli.shutil, "disk_usage", lambda path: DiskUsage(100, 95, 5))
+    result = run(["healthcheck", "disk", "--warn", "80", "--fail", "90"])
+    output = capsys.readouterr().out
+    assert result == 1
+    assert "[FAIL] disk: 95.0% used at /" in output
+
+
+def test_healthcheck_disk_invalid_thresholds_return_two():
+    assert run(["healthcheck", "disk", "--warn", "95", "--fail", "90"]) == 2
+
+
+def test_healthcheck_load_pass_fail_and_unavailable(monkeypatch, capsys):
+    import wpfy.cli as cli
+
+    monkeypatch.setattr(cli.os, "getloadavg", lambda: (2.0, 1.0, 0.5))
+    monkeypatch.setattr(cli.os, "cpu_count", lambda: 4)
+    result = run(["healthcheck", "load", "--warn", "1.5", "--fail", "3.0"])
+    output = capsys.readouterr().out
+    assert result == 0
+    assert "[PASS] load: 0.50 per CPU" in output
+
+    monkeypatch.setattr(cli.os, "getloadavg", lambda: (12.0, 1.0, 0.5))
+    result = run(["healthcheck", "load", "--warn", "1.5", "--fail", "3.0"])
+    output = capsys.readouterr().out
+    assert result == 1
+    assert "[FAIL] load: 3.00 per CPU" in output
+
+    def unavailable():
+        raise OSError("unsupported")
+
+    monkeypatch.setattr(cli.os, "getloadavg", unavailable)
+    result = run(["healthcheck", "load"])
+    output = capsys.readouterr().out
+    assert result == 0
+    assert "[WARN] load: load average unavailable" in output
+
+
+def test_healthcheck_load_invalid_thresholds_return_two():
+    assert run(["healthcheck", "load", "--warn", "3", "--fail", "1"]) == 2
+
+
+def test_healthcheck_system_renders_labels_and_failure(monkeypatch, capsys):
+    import wpfy.cli as cli
+    from wpfy.operational_inspection import InspectionCheck
+
+    monkeypatch.delenv("WPFY_SKIP_RUNTIME", raising=False)
+    monkeypatch.setattr(
+        cli.operational_inspection,
+        "system_diagnostics",
+        lambda: (
+            InspectionCheck("Docker", True, "Docker daemon responding"),
+            InspectionCheck("Traefik", None, "status unavailable"),
+            InspectionCheck("registry", False, "registry mismatch"),
+        ),
+    )
+
+    result = run(["healthcheck", "system"])
+    output = capsys.readouterr().out
+
+    assert result == 1
+    assert "[PASS] Docker: Docker daemon responding" in output
+    assert "[WARN] Traefik: status unavailable" in output
+    assert "[FAIL] registry: registry mismatch" in output
+    assert "secret" not in output.lower()
+
+
+def test_healthcheck_system_runtime_skip_is_warning(monkeypatch, capsys):
+    monkeypatch.setenv("WPFY_SKIP_RUNTIME", "1")
+
+    result = run(["healthcheck", "system"])
+    output = capsys.readouterr().out
+
+    assert result == 0
+    assert "[WARN] runtime: runtime skipped by WPFY_SKIP_RUNTIME=1" in output
+
+
+def test_healthcheck_app_single_site_success_and_failure(monkeypatch, capsys):
+    import wpfy.cli as cli
+    from wpfy.site_layout import HealthResult
+
+    monkeypatch.setattr(cli, "site_exists", lambda domain: True)
+    monkeypatch.setattr(
+        cli,
+        "site_health",
+        lambda domain: HealthResult(domain, True, True, True, True, "ready", "web=1 app=1 http=ok"),
+    )
+    result = run(["healthcheck", "app", "example.com"])
+    output = capsys.readouterr().out
+    assert result == 0
+    assert "example.com: PASS ready - web=1 app=1 http=ok" in output
+
+    monkeypatch.setattr(
+        cli,
+        "site_health",
+        lambda domain: HealthResult(domain, True, True, False, False, "down", "no healthy compose services"),
+    )
+    result = run(["healthcheck", "app", "example.com"])
+    output = capsys.readouterr().out
+    assert result == 1
+    assert "example.com: FAIL down - no healthy compose services" in output
+
+
+def test_healthcheck_app_missing_or_invalid_site_does_not_probe(monkeypatch):
+    import wpfy.cli as cli
+
+    monkeypatch.setattr(cli, "site_exists", lambda domain: False)
+    monkeypatch.setattr(cli, "site_health", lambda domain: pytest.fail("site_health should not run"))
+    assert run(["healthcheck", "app", "missing.test"]) == 2
+
+    monkeypatch.setattr(cli, "site_exists", lambda domain: pytest.fail("site_exists should not run"))
+    assert run(["healthcheck", "app", "../../etc"]) == 2
+
+
+def test_healthcheck_app_all_sites_sorted_and_nonzero_on_failure(monkeypatch, capsys):
+    import wpfy.cli as cli
+    from wpfy.site_layout import HealthResult
+
+    monkeypatch.setattr(cli, "list_sites", lambda: [{"domain": "z.example.com"}, {"domain": "a.example.com"}])
+    monkeypatch.setattr(cli, "site_exists", lambda domain: True)
+
+    def fake_health(domain):
+        if domain == "z.example.com":
+            return HealthResult(domain, True, True, False, False, "down", "runtime failed")
+        return HealthResult(domain, True, True, True, True, "ready", "runtime ready")
+
+    monkeypatch.setattr(cli, "site_health", fake_health)
+
+    result = run(["healthcheck", "app", "--all-sites"])
+    output = capsys.readouterr().out
+
+    assert result == 1
+    assert output.index("a.example.com: PASS ready") < output.index("z.example.com: FAIL down")
+
+
+def test_healthcheck_app_all_sites_empty(monkeypatch, capsys):
+    import wpfy.cli as cli
+
+    monkeypatch.setattr(cli, "list_sites", lambda: [])
+
+    result = run(["healthcheck", "app", "--all-sites"])
+    output = capsys.readouterr().out
+
+    assert result == 0
+    assert "no managed sites found" in output
+
+
+def test_healthcheck_all_and_default_use_component_results(monkeypatch, capsys):
+    import wpfy.cli as cli
+
+    monkeypatch.setattr(cli, "_healthcheck_disk", lambda *args: cli.CommandResult("disk ok"))
+    monkeypatch.setattr(cli, "_healthcheck_load", lambda *args: cli.CommandResult("load ok"))
+    monkeypatch.setattr(cli, "_healthcheck_system", lambda: cli.CommandResult("system fail", exit_code=1))
+    monkeypatch.setattr(cli, "_healthcheck_all_sites", lambda: cli.CommandResult("sites ok"))
+
+    result = run(["healthcheck", "all"])
+    output = capsys.readouterr().out
+    assert result == 1
+    assert "disk ok" in output
+    assert "system fail" in output
+
+    result = run(["healthcheck"])
+    output = capsys.readouterr().out
+    assert result == 1
+    assert "sites ok" in output
+
+
+def test_motd_prints_safe_summary(monkeypatch, capsys):
+    import wpfy.cli as cli
+    from wpfy.operational_inspection import AggregateInfo
+
+    monkeypatch.setattr(
+        cli.operational_inspection,
+        "aggregate_info",
+        lambda: AggregateInfo(
+            sites=(
+                {"domain": "example.com", "flavor": "wp", "ssl_enabled": True, "cache_type": "redis"},
+                {"domain": "second.test", "flavor": "html", "ssl": "disabled", "redis": "0"},
+            ),
+            traefik_message="Traefik running",
+            docker_version="24.0.0",
+        ),
+    )
+
+    result = run(["motd"])
+    output = capsys.readouterr().out
+
+    assert result == 0
+    assert "version:" in output
+    assert "docker: 24.0.0" in output
+    assert "traefik: Traefik running" in output
+    assert "sites: 2 managed" in output
+    assert "- example.com wp ssl=enabled cache=redis" in output
+    assert "password" not in output.lower()
+    assert "secret" not in output.lower()
+
+
+def test_motd_compact_handles_unavailable_docker(monkeypatch, capsys):
+    import wpfy.cli as cli
+    from wpfy.operational_inspection import AggregateInfo
+
+    monkeypatch.setattr(
+        cli.operational_inspection,
+        "aggregate_info",
+        lambda: AggregateInfo(sites=(), traefik_message="traefik status unavailable", docker_version="unavailable"),
+    )
+
+    result = run(["motd", "--compact"])
+    output = capsys.readouterr().out
+
+    assert result == 0
+    assert "docker=unavailable" in output
+    assert "warnings=2" in output
+
+
+def test_utility_password_length_and_no_symbols(capsys):
+    result = run(["utility", "password", "--length", "32"])
+    output = capsys.readouterr().out.strip()
+    assert result == 0
+    assert len(output) == 32
+
+    result = run(["utility", "password", "--length", "32", "--no-symbols"])
+    output = capsys.readouterr().out.strip()
+    assert result == 0
+    assert len(output) == 32
+    assert all(ch.isalnum() for ch in output)
+
+    assert run(["utility", "password", "--length", "8"]) == 2
+
+
+def test_utility_token_length_validation(capsys):
+    result = run(["utility", "token", "--bytes", "32"])
+    output = capsys.readouterr().out.strip()
+    assert result == 0
+    assert output
+
+    assert run(["utility", "token", "--bytes", "8"]) == 2
+
+
+def test_utility_username_normalizes_values(capsys):
+    result = run(["utility", "username", "Arnab Mohapatra"])
+    output = capsys.readouterr().out
+    assert result == 0
+    assert output == "arnab-mohapatra\n"
+
+    result = run(["utility", "username", "!!!"])
+    output = capsys.readouterr().out
+    assert result == 0
+    assert output == "admin\n"
+
+
+def test_utility_uid_existing_and_missing_sites(tmp_path, monkeypatch, capsys):
+    import wpfy.cli as cli
+
+    env_file = tmp_path / ".env"
+    env_file.write_text("SITE_UID=100001\n", encoding="utf-8")
+
+    monkeypatch.setattr(cli, "site_exists", lambda domain: domain == "example.com")
+    monkeypatch.setattr(cli, "env_path", lambda domain: env_file)
+
+    result = run(["utility", "uid", "example.com"])
+    output = capsys.readouterr().out
+    assert result == 0
+    assert "project: example-com" in output
+    assert "site_uid: 100001" in output
+
+    result = run(["utility", "uid", "missing.test"])
+    output = capsys.readouterr().out
+    assert result == 0
+    assert "project: missing-test" in output
+    assert "site_uid: not allocated" in output
+
+    assert run(["utility", "uid", "../../etc"]) == 2
+
+
+def test_utility_htpasswd_generated_and_stdin(monkeypatch, capsys):
+    result = run(["utility", "htpasswd", "--username", "admin"])
+    output = capsys.readouterr().out
+    assert result == 0
+    assert "username: admin" in output
+    assert "password: " in output
+    assert "htpasswd: admin:{SHA}" in output
+
+    monkeypatch.setattr(sys, "stdin", io.StringIO("stdin-secret\n"))
+    result = run(["utility", "htpasswd", "--username", "admin", "--password-stdin"])
+    output = capsys.readouterr().out
+    assert result == 0
+    assert output.startswith("htpasswd: admin:{SHA}")
+    assert "stdin-secret" not in output
+
+    assert run(["utility", "htpasswd", "--username", "bad:name"]) == 2

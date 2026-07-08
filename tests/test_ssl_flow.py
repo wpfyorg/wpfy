@@ -55,9 +55,9 @@ def test_preflight_ssl_non_cf_mismatch_still_fails(monkeypatch):
 
 
 def test_read_acme_file_merges_multiple_resolvers(monkeypatch):
-    import wpfy.certificate_lifecycle as ssl_flow
+    import wpfy.certificate_lifecycle as certificate_lifecycle
 
-    monkeypatch.setattr(ssl_flow.os.path, "exists", lambda path: False)
+    monkeypatch.setattr(certificate_lifecycle.os.path, "exists", lambda path: False)
 
     class Proc:
         returncode = 0
@@ -66,18 +66,18 @@ def test_read_acme_file_merges_multiple_resolvers(monkeypatch):
             '"le-http":{"Certificates":[{"domain":{"main":"proxied.com"}}]}}'
         )
 
-    monkeypatch.setattr(ssl_flow.subprocess, "run", lambda *args, **kwargs: Proc())
+    monkeypatch.setattr(certificate_lifecycle.subprocess, "run", lambda *args, **kwargs: Proc())
 
-    certs = ssl_flow._read_acme_file()
+    certs = certificate_lifecycle._read_acme_file()
     mains = {c["domain"]["main"] for c in certs}
     assert mains == {"direct.com", "proxied.com"}
 
 
 def test_get_cert_info_finds_cert_under_second_resolver(monkeypatch):
-    import wpfy.certificate_lifecycle as ssl_flow
+    import wpfy.certificate_lifecycle as certificate_lifecycle
 
     monkeypatch.setattr(
-        ssl_flow,
+        certificate_lifecycle,
         "_read_acme_file",
         lambda: [
             {"domain": {"main": "direct.com"}, "certificate": "bad"},
@@ -90,15 +90,15 @@ def test_get_cert_info_finds_cert_under_second_resolver(monkeypatch):
 
 
 def test_get_cert_info_reads_acme_from_traefik_container(monkeypatch):
-    import wpfy.certificate_lifecycle as ssl_flow
+    import wpfy.certificate_lifecycle as certificate_lifecycle
 
-    monkeypatch.setattr(ssl_flow.os.path, "exists", lambda path: False)
+    monkeypatch.setattr(certificate_lifecycle.os.path, "exists", lambda path: False)
 
     class Proc:
         returncode = 0
         stdout = '{"le":{"Certificates":[{"domain":{"main":"example.com"},"certificate":"bad"}]}}'
 
-    monkeypatch.setattr(ssl_flow.subprocess, "run", lambda *args, **kwargs: Proc())
+    monkeypatch.setattr(certificate_lifecycle.subprocess, "run", lambda *args, **kwargs: Proc())
 
     info = get_cert_info("example.com")
 
@@ -106,10 +106,10 @@ def test_get_cert_info_reads_acme_from_traefik_container(monkeypatch):
 
 
 def test_get_cert_info_matches_domain_case_insensitively(monkeypatch):
-    import wpfy.certificate_lifecycle as ssl_flow
+    import wpfy.certificate_lifecycle as certificate_lifecycle
 
     monkeypatch.setattr(
-        ssl_flow,
+        certificate_lifecycle,
         "_read_acme_file",
         lambda: [{"domain": {"main": "ssl.example.test"}, "certificate": "bad"}],
     )
@@ -120,14 +120,14 @@ def test_get_cert_info_matches_domain_case_insensitively(monkeypatch):
 
 
 def test_get_cert_info_returns_unavailable_when_docker_is_missing(monkeypatch):
-    import wpfy.certificate_lifecycle as ssl_flow
+    import wpfy.certificate_lifecycle as certificate_lifecycle
 
-    monkeypatch.setattr(ssl_flow.os.path, "exists", lambda path: False)
+    monkeypatch.setattr(certificate_lifecycle.os.path, "exists", lambda path: False)
 
     def missing_docker(*args, **kwargs):
         raise FileNotFoundError("docker")
 
-    monkeypatch.setattr(ssl_flow.subprocess, "run", missing_docker)
+    monkeypatch.setattr(certificate_lifecycle.subprocess, "run", missing_docker)
 
     info = get_cert_info("example.com")
 
@@ -135,11 +135,11 @@ def test_get_cert_info_returns_unavailable_when_docker_is_missing(monkeypatch):
 
 
 def test_cert_expiry_days_uses_issued_certificate_metadata(monkeypatch):
-    import wpfy.certificate_lifecycle as ssl_flow
+    import wpfy.certificate_lifecycle as certificate_lifecycle
 
     future = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=45)
     monkeypatch.setattr(
-        ssl_flow,
+        certificate_lifecycle,
         "get_cert_info",
         lambda domain: {
             "status": "issued",

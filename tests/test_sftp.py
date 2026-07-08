@@ -4,30 +4,39 @@ import importlib
 import stat
 
 import pytest
+from wpfy.site_definition import SiteDefinition, sftp_service_lines
 from wpfy.site_layout import compose_content, SiteSpec
 
 
+def sftp_service_yaml(domain: str, host_port: str = "2222") -> str:
+    definition = SiteDefinition(
+        domain=domain,
+        flavor="site",
+        use_mysql=False,
+        use_redis=False,
+        sftp_password="configured",
+        sftp_port=host_port,
+    )
+    return "\n" + "\n".join(sftp_service_lines(definition))
+
+
 def test_sftp_service_image():
-    from wpfy.sftp import _sftp_service_yaml
-    yaml = _sftp_service_yaml("example.com")
+    yaml = sftp_service_yaml("example.com")
     assert "image: atmoz/sftp:alpine" in yaml
 
 
 def test_sftp_service_container_name():
-    from wpfy.sftp import _sftp_service_yaml
-    yaml = _sftp_service_yaml("example.com")
+    yaml = sftp_service_yaml("example.com")
     assert "container_name: example-com-sftp" in yaml
 
 
 def test_sftp_service_restart_policy():
-    from wpfy.sftp import _sftp_service_yaml
-    yaml = _sftp_service_yaml("example.com")
+    yaml = sftp_service_yaml("example.com")
     assert "restart: unless-stopped" in yaml
 
 
 def test_sftp_service_has_baseline_hardening():
-    from wpfy.sftp import _sftp_service_yaml
-    yaml = _sftp_service_yaml("example.com")
+    yaml = sftp_service_yaml("example.com")
     assert "security_opt:" in yaml
     assert "no-new-privileges:true" in yaml
     assert "cap_drop:" in yaml
@@ -38,28 +47,24 @@ def test_sftp_service_has_baseline_hardening():
 
 
 def test_sftp_service_has_port_mapping():
-    from wpfy.sftp import _sftp_service_yaml
-    yaml = _sftp_service_yaml("example.com")
+    yaml = sftp_service_yaml("example.com")
     assert '"127.0.0.1:2222:22"' in yaml
     assert '"2222:22"' not in yaml
 
 
 def test_sftp_service_command_uses_password_env_var():
-    from wpfy.sftp import _sftp_service_yaml
-    yaml = _sftp_service_yaml("example.com")
+    yaml = sftp_service_yaml("example.com")
     assert "sftpuser:${SFTP_PASSWORD}:1000:1000:app" in yaml
 
 
 def test_sftp_service_has_networks():
-    from wpfy.sftp import _sftp_service_yaml
-    yaml = _sftp_service_yaml("example.com")
+    yaml = sftp_service_yaml("example.com")
     assert "networks:" in yaml
     assert "site" in yaml
 
 
 def test_sftp_service_has_volume():
-    from wpfy.sftp import _sftp_service_yaml
-    yaml = _sftp_service_yaml("example.com")
+    yaml = sftp_service_yaml("example.com")
     assert "volumes:" in yaml
     assert "./app:/home/sftpuser/app" in yaml
 
@@ -71,8 +76,7 @@ def test_ensure_sftp_container_invalid_domain():
 
 
 def test_sftp_domain_with_hyphen_converts_to_project():
-    from wpfy.sftp import _sftp_service_yaml
-    yaml = _sftp_service_yaml("my-site.org")
+    yaml = sftp_service_yaml("my-site.org")
     assert "container_name: my-site-org-sftp" in yaml
 
 
@@ -171,6 +175,7 @@ def test_ensure_sftp_container_waits_for_port_when_restarting(tmp_path, monkeypa
     monkeypatch.setattr("wpfy.sftp.site_exists", lambda value: value == domain)
     monkeypatch.setattr("wpfy.sftp.compose_path", lambda value: site_root / "compose.yaml")
     monkeypatch.setattr("wpfy.sftp.env_path", lambda value: site_root / ".env")
+    monkeypatch.setattr("wpfy.sftp.ensure_site_scaffold", lambda definition: None)
 
     class Proc:
         returncode = 0
@@ -240,7 +245,7 @@ def test_ensure_sftp_container_reuses_existing_port_without_duplicate_block(tmp_
     env_file.write_text(env_file.read_text(encoding="utf-8") + "SFTP_PASSWORD=secret\nSFTP_PORT=2230\n", encoding="utf-8")
     wpfy.site_layout.compose_path("sftp-reuse.example.com").write_text(
         wpfy.site_layout.compose_path("sftp-reuse.example.com").read_text(encoding="utf-8")
-        + wpfy.sftp._sftp_service_yaml("sftp-reuse.example.com", "2230")
+        + sftp_service_yaml("sftp-reuse.example.com", "2230")
         + "\n",
         encoding="utf-8",
     )
@@ -275,7 +280,7 @@ def test_ensure_sftp_container_repairs_partial_sftp_public_binding(tmp_wpfy_home
     compose_file = wpfy.site_layout.compose_path(domain)
     compose_file.write_text(
         compose_file.read_text(encoding="utf-8")
-        + wpfy.sftp._sftp_service_yaml(domain).replace("127.0.0.1:2222:22", "2222:22")
+        + sftp_service_yaml(domain).replace("127.0.0.1:2222:22", "2222:22")
         + "\n",
         encoding="utf-8",
     )
