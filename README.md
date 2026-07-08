@@ -45,10 +45,11 @@ Traditional WordPress stack managers install Nginx, PHP, and MySQL directly on t
 | Diagnostics (`wpfy debug`) | ✅ Implemented |
 | Per-site SFTP lifecycle | ✅ Implemented |
 | Security audit (`wpfy secure`) | ✅ Implemented |
-| Wildcard SSL certificates | ❌ Not yet supported |
-| phpMyAdmin / Adminer / Composer / MySQLTuner helpers | ⏳ Deferred to v2 |
+| Wildcard SSL certificates | ✅ Implemented for Cloudflare DNS |
+| phpMyAdmin / Adminer / Composer helpers | ✅ Pull-only helper images |
+| MySQLTuner helper | ⏳ Skipped until a vetted pinned image exists |
 | Migration from host-level stacks (`stack migrate`) | ❌ Not implemented in v1 |
-| Automatic backup retention/rotation | ❌ Not implemented (manual cleanup) |
+| Backup retention/remote ops/edge backup | ✅ Implemented |
 
 ## Installation
 
@@ -149,12 +150,16 @@ Flat commands are the canonical VM/operator target surface. During migration, gr
 | `wpfy cron minute\|five-minute\|hourly\|six-hour\|daily\|weekly` | Run due WordPress cron events and small safe interval tasks |
 | `wpfy cron install\|status\|disable` | Manage systemd timers for the cron intervals |
 | `wpfy smtp set\|status\|test\|clear` | Store redacted SMTP settings and run explicit dry-run/test sends |
+| `wpfy dns cloudflare set\|status\|test\|clear` | Store redacted Cloudflare token for wildcard SSL |
 | `wpfy site backup <domain>` | Create a backup archive (files + database) |
-| `wpfy backup <domain>` | Create a backup through the flat CLI (currently delegates to `wpfy site backup`) |
-| `wpfy backup storage set\|status\|test\|clear` | Manage one S3-compatible upload target |
+| `wpfy backup <domain>` | Create a backup through the flat CLI |
+| `wpfy backup prune <domain\|all> --keep N` | Prune local backup archives |
+| `wpfy backup remote list\|restore\|delete\|prune <domain>` | Manage S3-compatible remote archives |
+| `wpfy backup edge` | Back up Traefik config and ACME state |
+| `wpfy backup storage set\|status\|test\|clear` | Manage default or named S3-compatible storage profiles |
 | `wpfy backup schedule daily\|weekly\|status\|disable` | Manage one recurring all-site backup timer |
-| `wpfy site restore <domain> <backup>` | Restore a site from a backup archive |
-| `wpfy restore <domain> <backup>` | Restore through the flat CLI (currently delegates to `wpfy site restore`) |
+| `wpfy site restore <domain> <backup\|--latest>` | Restore a site from an explicit backup archive |
+| `wpfy restore <domain> <backup\|--latest>` | Restore through the flat CLI |
 | `wpfy site delete <domain>` | Remove a site and its resources (asks for confirmation) |
 | `wpfy rm <domain>` | Delete through the flat CLI with the same confirmation rules as `wpfy site delete` |
 | `wpfy wp <domain> <wp-cli args>` | Run wp-cli through the flat CLI (currently delegates to `wpfy site wp`) |
@@ -248,18 +253,23 @@ Before any certificate is requested, wpfy runs a **preflight check**:
 
 Certificates are obtained and renewed by **Traefik's ACME resolver**. For Cloudflare-proxied domains, wpfy automatically switches to HTTP-01 challenge mode (force with `--proxied` / `--no-proxied`). Check status anytime with `wpfy site ssl <domain> --status`; run only the preflight with `--preflight-only`.
 
-**Wildcard certificates are not yet supported.**
+**Wildcard certificates are supported with Cloudflare DNS only.**
 
 ## Backups and restore
 
 ```bash
 wpfy backup example.com --list
 wpfy backup example.com --path /root/wpfy-backups
-wpfy backup example.com --s3
+wpfy backup example.com --s3 --profile weekly --keep-local 7
+wpfy backup prune example.com --keep 7 --dry-run
+wpfy backup remote list example.com --profile weekly
+wpfy backup remote restore example.com --latest --profile weekly
+wpfy backup edge --path /root/wpfy-edge-backups
 wpfy backup all --path /root/wpfy-backups
-wpfy backup storage set --endpoint https://s3.example.com --bucket site-backups --region auto --access-key ... --secret-key-stdin
+printf '%s\n' '<secret-key>' | wpfy backup storage set --profile weekly --endpoint https://s3.example.com --bucket site-backups --region auto --access-key ... --secret-key-stdin
 wpfy backup schedule daily --time 02:30 --s3
 wpfy restore example.com --list
+wpfy restore example.com --latest
 wpfy site backup example.com
 wpfy site restore example.com /var/lib/wpfy/backups/example.com/example.com-20260611120000.tar.gz
 ```
@@ -269,13 +279,18 @@ wpfy site restore example.com /var/lib/wpfy/backups/example.com/example.com-2026
 - `wpfy backup <domain> --path <directory>` keeps the canonical local archive and copies the verified archive to the destination directory with `0600` permissions.
 - `wpfy backup all [--path <directory>] [--s3]` processes every managed site in sorted order and reports per-site failures without stopping the whole run.
 - `wpfy backup <domain> --s3` uploads the verified local archive to S3-compatible storage using `WPFY_BACKUP_S3_ENDPOINT`, `WPFY_BACKUP_S3_BUCKET`, `WPFY_BACKUP_S3_REGION`, `WPFY_BACKUP_S3_ACCESS_KEY`, `WPFY_BACKUP_S3_SECRET_KEY`, and optional `WPFY_BACKUP_S3_PREFIX`.
-- `wpfy backup storage set/status/test/clear` stores one default S3-compatible target in `/etc/wpfy/backup-storage.env` with `0600` permissions. Environment variables still override the stored config.
+- `wpfy backup <domain> --keep-local N` prunes older local archives only after the new archive verifies.
+- `wpfy backup prune <domain|all> --keep N [--dry-run]` prunes local archives explicitly.
+- `wpfy restore <domain> --latest` restores the newest local archive only when explicitly requested; restore never chooses latest by default.
+- `wpfy backup storage set/status/test/clear [--profile NAME]` stores the default target in `/etc/wpfy/backup-storage.env` or named targets in `/etc/wpfy/backup-storage.d/<profile>.env`, mode `0600`. Environment variables override only the default profile.
+- `wpfy backup remote list|restore|delete|prune <domain> [--profile NAME]` operates only under the managed `<prefix>/<domain>/` key prefix. Delete/prune require `--force`; remote restore downloads to a temp file and validates before live mutation.
+- `wpfy backup edge [--path DIR] [--s3 --profile NAME]` captures Traefik compose/static config and `acme.json` when available; `wpfy restore edge <archive> --force` validates members before writing and restarting Traefik.
 - `wpfy backup schedule daily|weekly` installs one `systemd` timer that runs `wpfy backup all`; `status` shows whether it is configured, and `disable` stops the timer without deleting backup storage config.
 - An archive contains the site's `compose.yaml`, `.env`, `app/` (WordPress files), `nginx/`, `php/`, and a SQL dump taken with `mariadb-dump --single-transaction` when the database is running.
 - Every archive is verified after creation.
 - Restore validates the archive and checks free disk space **before** touching the live site, stops the runtime, restores files and ownership, preserves the live database credentials, restarts the stack, and imports the SQL dump. An invalid archive aborts the restore with no changes made.
 
-**There is no automatic retention or rotation yet** — old backups stay until you delete them, so monitor disk usage. S3 support is upload-only; remote restore/list/delete, lifecycle policies, restore-latest, and Traefik/ACME backup are not implemented.
+Remote lifecycle policy is wpfy-managed prune, not a provider bucket lifecycle API.
 
 ## Diagnostics
 
@@ -334,10 +349,10 @@ wpfy site delete example.com      # prompts: Delete example.com? [y/N]
 
 - **Beta software** — interfaces and behavior may change between releases.
 - **Ubuntu-first** — other distributions are untested for v1.
-- **No wildcard SSL** — one certificate per exact domain.
-- **No backup retention policy** — archives accumulate until manually removed, and are stored on the same host.
+- **Wildcard SSL is Cloudflare-only** — use `wpfy dns cloudflare set --token-stdin` and `--letsencrypt wildcard --dns cloudflare`.
+- **Remote lifecycle is explicit** — wpfy prunes managed keys; it does not configure provider bucket lifecycle policies.
 - **`wpfy stack migrate` is not implemented** — there is no automated migration from host-level (non-Docker) stacks yet.
-- **Helper tools deferred** — `--phpmyadmin`, `--adminer`, `--composer`, and `--mysqltuner` stack options are planned for v2 and currently print a warning. Host-level options from classic stack managers (`--fail2ban`, `--ufw`, `--netdata`, etc.) are intentionally not managed by wpfy's Docker-first design — configure them on the host yourself.
+- **Helper tools are opt-in prep only** — `--phpmyadmin`, `--adminer`, and `--composer` pull pinned-major helper images but do not expose a public dashboard. `--mysqltuner` skips until a vetted pinned image exists. Host-level options from classic stack managers (`--fail2ban`, `--ufw`, `--netdata`, etc.) are intentionally not managed by wpfy's Docker-first design — configure them on the host yourself.
 - **Destructive commands:**
   - `wpfy site delete` asks for confirmation interactively, but proceeds without a prompt when run non-interactively (e.g., in scripts) — treat it as immediate in automation. `--force` skips the prompt explicitly.
   - `wpfy stack purge` removes the edge proxy Compose project **without a confirmation prompt**. Know what you're running.
@@ -345,7 +360,7 @@ wpfy site delete example.com      # prompts: Delete example.com? [y/N]
 
 ## Roadmap
 
-See [ROADMAP.md](ROADMAP.md). Headlines: beta hardening on real-world VPS providers, installer hardening (signed/checksummed release artifacts, pinned-version installs), expanded documentation, and v2 features (wildcard SSL, helper tools, backup retention, host-stack migration).
+See [ROADMAP.md](ROADMAP.md). Headlines: beta hardening on real-world VPS providers, installer hardening (signed/checksummed release artifacts, pinned-version installs), expanded documentation, and deferred host-stack migration.
 
 ## Security
 

@@ -1,4 +1,5 @@
 from __future__ import annotations
+# noqa: SIZE_OK — stdlib SigV4 client kept together to avoid a backup framework dependency.
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -6,6 +7,9 @@ import hashlib
 import hmac
 import os
 from pathlib import Path
+import re
+from types import TracebackType
+import xml.etree.ElementTree as ET
 from typing import Final, Protocol
 from urllib.error import URLError
 from urllib.parse import quote, urlparse, urlunparse
@@ -17,6 +21,8 @@ from .settings import PATHS
 SERVICE: Final = "s3"
 ALGORITHM: Final = "AWS4-HMAC-SHA256"
 CONFIG_FILENAME: Final = "backup-storage.env"
+PROFILE_DIRNAME: Final = "backup-storage.d"
+PROFILE_RE: Final = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,62}")
 REQUIRED_ENV: Final = (
     "WPFY_BACKUP_S3_ENDPOINT",
     "WPFY_BACKUP_S3_BUCKET",
@@ -40,8 +46,26 @@ class S3ConfigError(RuntimeError):
     pass
 
 
+class Response(Protocol):
+    status: int
+
+    def read(self) -> bytes:
+        pass
+
+    def __enter__(self) -> Response:
+        pass
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> bool | None:
+        pass
+
+
 class Opener(Protocol):
-    def __call__(self, request: Request, *, timeout: int) -> object:
+    def __call__(self, request: Request, *, timeout: int) -> Response:
         pass
 
 
@@ -55,7 +79,7 @@ class S3Uploader:
         return self.upload_bytes(config, key, payload)
 
     def upload_bytes(self, config: S3Config, key: str, payload: bytes) -> str:
-        request = signed_put_request(config, key, payload)
+        request = signed_request(config, "PUT", key, payload)
         try:
             with self._opener(request, timeout=60) as response:
                 status = getattr(response, "status", 200)
@@ -65,13 +89,65 @@ class S3Uploader:
             raise OSError(f"status {status}")
         return f"s3://{config.bucket}/{key}"
 
+    def list_keys(self, config: S3Config, prefix: str) -> list[str]:
+        query = f"list-type=2&prefix={quote(prefix, safe='/')}"
+        request = signed_request(config, "GET", "", b"", query=query)
+        try:
+            with self._opener(request, timeout=60) as response:
+                status = getattr(response, "status", 200)
+                payload = response.read()
+        except URLError as exc:
+            raise OSError(str(exc.reason)) from exc
+        if status >= 400:
+            raise OSError(f"status {status}")
+        root = ET.fromstring(payload)
+        return [
+            element.text or ""
+            for element in root.findall(".//{*}Contents/{*}Key")
+            if element.text
+        ]
 
-def s3_config_path() -> Path:
-    return Path(PATHS.config_dir) / CONFIG_FILENAME
+    def download_bytes(self, config: S3Config, key: str) -> bytes:
+        request = signed_request(config, "GET", key)
+        try:
+            with self._opener(request, timeout=60) as response:
+                status = getattr(response, "status", 200)
+                payload = response.read()
+        except URLError as exc:
+            raise OSError(str(exc.reason)) from exc
+        if status >= 400:
+            raise OSError(f"status {status}")
+        return payload
+
+    def delete_key(self, config: S3Config, key: str) -> str:
+        request = signed_request(config, "DELETE", key)
+        try:
+            with self._opener(request, timeout=60) as response:
+                status = getattr(response, "status", 204)
+        except URLError as exc:
+            raise OSError(str(exc.reason)) from exc
+        if status >= 400:
+            raise OSError(f"status {status}")
+        return f"s3://{config.bucket}/{key}"
 
 
-def write_s3_config(config: S3Config) -> Path:
-    path = s3_config_path()
+def _profile_name(profile: str | None) -> str | None:
+    if profile in {None, "", "default"}:
+        return None
+    if not PROFILE_RE.fullmatch(profile):
+        raise S3ConfigError("invalid backup storage profile")
+    return profile
+
+
+def s3_config_path(profile: str | None = None) -> Path:
+    name = _profile_name(profile)
+    if name is None:
+        return Path(PATHS.config_dir) / CONFIG_FILENAME
+    return Path(PATHS.config_dir) / PROFILE_DIRNAME / f"{name}.env"
+
+
+def write_s3_config(config: S3Config, profile: str | None = None) -> Path:
+    path = s3_config_path(profile)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
         "\n".join([
@@ -89,17 +165,18 @@ def write_s3_config(config: S3Config) -> Path:
     return path
 
 
-def clear_s3_config() -> None:
-    path = s3_config_path()
+def clear_s3_config(profile: str | None = None) -> None:
+    path = s3_config_path(profile)
     if path.exists():
         path.unlink()
 
 
-def load_s3_config() -> S3Config:
-    env_config = _load_env_config()
-    if env_config is not None:
-        return env_config
-    stored_config = _load_stored_config()
+def load_s3_config(profile: str | None = None) -> S3Config:
+    if _profile_name(profile) is None:
+        env_config = _load_env_config()
+        if env_config is not None:
+            return env_config
+    stored_config = _load_stored_config(profile)
     if stored_config is not None:
         return stored_config
     raise S3ConfigError("backup storage is not configured; run `wpfy backup storage set`")
@@ -128,8 +205,8 @@ def _load_env_config() -> S3Config | None:
     )
 
 
-def _load_stored_config() -> S3Config | None:
-    path = s3_config_path()
+def _load_stored_config(profile: str | None = None) -> S3Config | None:
+    path = s3_config_path(profile)
     if not path.exists():
         return None
     values: dict[str, str] = {}
@@ -172,6 +249,10 @@ def redact_s3_secrets(message: str, config: S3Config) -> str:
 
 
 def signed_put_request(config: S3Config, key: str, payload: bytes) -> Request:
+    return signed_request(config, "PUT", key, payload)
+
+
+def signed_request(config: S3Config, method: str, key: str = "", payload: bytes = b"", *, query: str = "") -> Request:
     parsed = urlparse(config.endpoint)
     if not parsed.scheme or not parsed.netloc:
         raise S3ConfigError("invalid WPFY_BACKUP_S3_ENDPOINT")
@@ -180,7 +261,9 @@ def signed_put_request(config: S3Config, key: str, payload: bytes) -> Request:
     amz_date = now.strftime("%Y%m%dT%H%M%SZ")
     encoded_bucket = quote(config.bucket, safe="")
     encoded_key = quote(key, safe="/")
-    canonical_uri = f"{parsed.path.rstrip('/')}/{encoded_bucket}/{encoded_key}"
+    canonical_uri = f"{parsed.path.rstrip('/')}/{encoded_bucket}"
+    if encoded_key:
+        canonical_uri = f"{canonical_uri}/{encoded_key}"
     payload_hash = hashlib.sha256(payload).hexdigest()
     host = parsed.netloc
     headers = {
@@ -191,9 +274,9 @@ def signed_put_request(config: S3Config, key: str, payload: bytes) -> Request:
     signed_headers = "host;x-amz-content-sha256;x-amz-date"
     canonical_headers = "\n".join(f"{name.lower()}:{headers[name]}" for name in sorted(headers)) + "\n"
     canonical_request = "\n".join([
-        "PUT",
+        method,
         canonical_uri,
-        "",
+        query,
         canonical_headers,
         signed_headers,
         payload_hash,
@@ -214,8 +297,9 @@ def signed_put_request(config: S3Config, key: str, payload: bytes) -> Request:
         f"{ALGORITHM} Credential={config.access_key}/{credential_scope}, "
         f"SignedHeaders={signed_headers}, Signature={signature}"
     )
-    url = urlunparse((parsed.scheme, parsed.netloc, canonical_uri, "", "", ""))
-    return Request(url, data=payload, headers=headers, method="PUT")
+    url = urlunparse((parsed.scheme, parsed.netloc, canonical_uri, "", query, ""))
+    data = payload if method in {"PUT", "POST"} else None
+    return Request(url, data=data, headers=headers, method=method)
 
 
 def signing_key(secret_key: str, date_stamp: str, region: str) -> bytes:

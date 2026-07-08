@@ -379,6 +379,28 @@ def test_backup_alias_passes_destination_and_s3(monkeypatch, capsys):
     }
 
 
+def test_backup_alias_passes_retention_and_profile(monkeypatch, capsys):
+    import wpfy.cli as cli
+    from wpfy.site_layout import RuntimeResult
+
+    captured = {}
+    monkeypatch.setattr(
+        cli,
+        "backup_site",
+        lambda domain, **kwargs: captured.update(domain=domain, kwargs=kwargs)
+        or RuntimeResult(0, "backup created", ran=True),
+    )
+
+    result = cli.run(["backup", "example.com", "--s3", "--profile", "weekly", "--keep-local", "2"])
+    capsys.readouterr()
+
+    assert result == 0
+    assert captured == {
+        "domain": "example.com",
+        "kwargs": {"destination_dir": None, "upload_s3": True, "s3_profile": "weekly", "keep_local": 2},
+    }
+
+
 def test_backup_all_continues_after_failure(monkeypatch, capsys):
     import wpfy.cli as cli
     from wpfy.site_layout import RuntimeResult
@@ -420,6 +442,26 @@ def test_backup_all_empty_site_list_exits_zero(monkeypatch, capsys):
     assert "no managed sites found" in output
 
 
+def test_restore_latest_uses_newest_archive(monkeypatch, capsys):
+    import wpfy.cli as cli
+    from wpfy.site_layout import RuntimeResult
+
+    calls = []
+    monkeypatch.setattr(cli, "latest_backup_archive", lambda domain: RuntimeResult(0, "/tmp/newest.tar.gz", ran=True))
+    monkeypatch.setattr(
+        cli,
+        "restore_site",
+        lambda domain, archive: calls.append((domain, archive)) or RuntimeResult(0, "restored", ran=True),
+    )
+
+    result = cli.run(["restore", "example.com", "--latest"])
+    output = capsys.readouterr().out
+
+    assert result == 0
+    assert calls == [("example.com", "/tmp/newest.tar.gz")]
+    assert "restore: OK restored" in output
+
+
 def test_backup_storage_set_writes_secret_from_stdin(tmp_wpfy_home, monkeypatch, capsys):
     import wpfy.cli as cli
     import wpfy.s3_backup
@@ -453,6 +495,38 @@ def test_backup_storage_set_writes_secret_from_stdin(tmp_wpfy_home, monkeypatch,
     assert "stored-secret" not in output
     assert "stored-access" not in output
     assert "secret key: configured" in output
+
+
+def test_backup_storage_profile_uses_profile_path(tmp_wpfy_home, monkeypatch, capsys):
+    import wpfy.cli as cli
+    import wpfy.s3_backup
+
+    importlib.reload(wpfy.s3_backup)
+    monkeypatch.setattr(sys, "stdin", io.StringIO("stored-secret\n"))
+
+    result = cli.run([
+        "backup",
+        "storage",
+        "set",
+        "--endpoint",
+        "https://storage.example.test",
+        "--bucket",
+        "site-backups",
+        "--region",
+        "auto",
+        "--prefix",
+        "weekly",
+        "--access-key",
+        "stored-access",
+        "--profile",
+        "weekly",
+        "--secret-key-stdin",
+    ])
+    output = capsys.readouterr().out
+
+    assert result == 0
+    assert "backup-storage.d/weekly.env" in output
+    assert wpfy.s3_backup.load_s3_config("weekly").prefix == "weekly"
 
 
 def test_backup_storage_status_redacts_secret(tmp_wpfy_home, capsys):
@@ -525,6 +599,88 @@ def test_backup_storage_missing_config_exits_two(tmp_wpfy_home, capsys):
 
     assert result == 2
     assert "backup storage is not configured" in output
+
+
+def test_backup_remote_list_reads_managed_prefix(tmp_wpfy_home, monkeypatch, capsys):
+    import wpfy.cli as cli
+    import wpfy.s3_backup
+
+    importlib.reload(wpfy.s3_backup)
+    wpfy.s3_backup.write_s3_config(
+        wpfy.s3_backup.S3Config(
+            endpoint="https://storage.example.test",
+            bucket="site-backups",
+            region="auto",
+            prefix="daily",
+            access_key="stored-access",
+            secret_key="stored-secret",
+        )
+    )
+    prefixes = []
+
+    class FakeUploader:
+        def list_keys(self, config, prefix):
+            prefixes.append(prefix)
+            return [
+                "daily/example.com/example.com-20260701000000.tar.gz",
+                "daily/example.com/nested/bad.tar.gz",
+                "daily/other.com/other.tar.gz",
+            ]
+
+    monkeypatch.setattr(cli, "S3Uploader", FakeUploader)
+
+    result = cli.run(["backup", "remote", "list", "example.com"])
+    output = capsys.readouterr().out
+
+    assert result == 0
+    assert prefixes == ["daily/example.com/"]
+    assert "s3://site-backups/daily/example.com/example.com-20260701000000.tar.gz" in output
+    assert "nested/bad" not in output
+
+
+def test_backup_remote_delete_requires_force(tmp_wpfy_home, monkeypatch, capsys):
+    import wpfy.cli as cli
+    import wpfy.s3_backup
+
+    importlib.reload(wpfy.s3_backup)
+    wpfy.s3_backup.write_s3_config(
+        wpfy.s3_backup.S3Config(
+            endpoint="https://storage.example.test",
+            bucket="site-backups",
+            region="auto",
+            prefix="daily",
+            access_key="stored-access",
+            secret_key="stored-secret",
+        )
+    )
+
+    result = cli.run([
+        "backup",
+        "remote",
+        "delete",
+        "example.com",
+        "--key",
+        "daily/example.com/example.com-20260701000000.tar.gz",
+    ])
+    output = capsys.readouterr().out
+
+    assert result == 2
+    assert "backup remote delete aborted: --force required" in output
+
+
+def test_dns_cloudflare_set_status_redacts_token(tmp_wpfy_home, monkeypatch, capsys):
+    import wpfy.cli as cli
+
+    importlib.reload(cli.dns)
+    monkeypatch.setattr(sys, "stdin", io.StringIO("cf-secret-token\n"))
+
+    result = cli.run(["dns", "cloudflare", "set", "--token-stdin"])
+    output = capsys.readouterr().out
+
+    assert result == 0
+    assert "token: configured" in output
+    assert "cf-secret-token" not in output
+    assert stat.S_IMODE(cli.dns.cloudflare_config_path().stat().st_mode) == 0o600
 
 
 def test_backup_storage_clear_requires_force(tmp_wpfy_home, capsys):
@@ -2038,6 +2194,26 @@ def test_site_ssl_preflight_only_failure_exits_nonzero(monkeypatch):
     result = wpfy.cli.run(["site", "ssl", "bad.example.com", "--letsencrypt", "--preflight-only"])
 
     assert result == 2
+
+
+def test_site_ssl_wildcard_requires_cloudflare_config_before_site_mutation(tmp_wpfy_home, monkeypatch, capsys):
+    import wpfy.cli as cli
+    from wpfy.certificate_lifecycle import SSLPreflightResult
+
+    importlib.reload(cli.dns)
+    importlib.reload(cli.site_lifecycle)
+    monkeypatch.setattr(
+        cli.site_lifecycle,
+        "preflight_ssl",
+        lambda domain: SSLPreflightResult(domain, ("203.0.113.10",), (), ("203.0.113.10",), (), True, "ok"),
+    )
+    monkeypatch.setattr(cli.site_lifecycle, "site_info", lambda domain: pytest.fail("site should not mutate"))
+
+    result = cli.run(["site", "ssl", "example.com", "--letsencrypt", "wildcard", "--dns", "cloudflare"])
+    output = capsys.readouterr().out
+
+    assert result == 2
+    assert "Cloudflare DNS is not configured" in output
 
 
 def test_site_create_proxied_preflight_sets_spec_proxied(monkeypatch):

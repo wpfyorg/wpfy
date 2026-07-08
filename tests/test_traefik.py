@@ -121,6 +121,13 @@ def test_traefik_static_config_has_http_challenge_resolver():
     assert "        entryPoint: web" in config
 
 
+def test_traefik_static_config_has_cloudflare_dns_resolver():
+    config = traefik_static_config()
+    assert "  le-dns-cloudflare:" in config
+    assert "      dnsChallenge:" in config
+    assert "        provider: cloudflare" in config
+
+
 def test_traefik_static_config_is_text():
     config = traefik_static_config()
     assert isinstance(config, str)

@@ -140,6 +140,23 @@ def test_compose_content_with_ssl_labels():
     assert "traefik.http.routers.example-com-http.service=example-com" in content
 
 
+def test_compose_content_with_wildcard_ssl_labels():
+    content = compose_content(_spec(
+        domain="example.com",
+        flavor="wp",
+        use_mysql=True,
+        use_redis=False,
+        letsencrypt="wildcard",
+        dns_provider="cloudflare",
+        ssl_enabled=True,
+    ))
+
+    assert "traefik.http.routers.example-com.tls.certresolver=le-dns-cloudflare" in content
+    assert "traefik.http.routers.example-com.tls.domains[0].main=example.com" in content
+    assert "traefik.http.routers.example-com.tls.domains[0].sans=*.example.com" in content
+    assert "HostRegexp(`^.+\\.example\\.com$`)" in content
+
+
 def test_compose_content_proxied_uses_le_http_resolver():
     spec = _spec(
         domain="example.com",
@@ -494,6 +511,27 @@ def test_list_backup_archives_rejects_invalid_domain(tmp_wpfy_home):
 
     with pytest.raises(ValueError, match="invalid domain"):
         wpfy.site_layout.list_backup_archives("../escape")
+
+
+def test_prune_backup_archives_keeps_newest(tmp_wpfy_home):
+    import wpfy.site_layout
+
+    importlib.reload(wpfy.site_layout)
+    backups = wpfy.site_layout.backups_dir("prune.example.com")
+    backups.mkdir(parents=True)
+    oldest = backups / "prune.example.com-1.tar.gz"
+    middle = backups / "prune.example.com-2.tar.gz"
+    newest = backups / "prune.example.com-3.tar.gz"
+    for index, path in enumerate((oldest, middle, newest), start=1):
+        path.write_text(str(index), encoding="utf-8")
+        os.utime(path, (index, index))
+
+    result = wpfy.site_layout.prune_backup_archives("prune.example.com", 2)
+
+    assert result.exit_code == 0
+    assert not oldest.exists()
+    assert middle.exists()
+    assert newest.exists()
 
 
 def test_backup_site_copies_verified_archive_to_destination(tmp_wpfy_home, monkeypatch, tmp_path):

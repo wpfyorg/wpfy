@@ -8,6 +8,7 @@ from pathlib import Path
 
 from .settings import PATHS
 from .site_layout import RuntimeResult, runtime_skip_requested, docker_available
+from .dns import cloudflare_config_path
 
 
 TRAEFIK_IMAGE = "traefik:v3.6.17"
@@ -129,6 +130,12 @@ def traefik_static_config() -> str:
         "      storage: /letsencrypt/acme.json",
         "      httpChallenge:",
         "        entryPoint: web",
+        "  le-dns-cloudflare:",
+        "    acme:",
+        f"      email: {acme_email}",
+        "      storage: /letsencrypt/acme.json",
+        "      dnsChallenge:",
+        "        provider: cloudflare",
     ]
     return "\n".join(lines) + "\n"
 
@@ -157,6 +164,14 @@ def traefik_compose_content() -> str:
         "    ports:",
         '      - "80:80"',
         '      - "443:443"',
+    ]
+    cf_config = cloudflare_config_path()
+    if cf_config.exists():
+        lines.extend([
+            "    env_file:",
+            f"      - {cf_config}",
+        ])
+    lines.extend([
         "    volumes:",
         "      - /var/run/docker.sock:/var/run/docker.sock:ro",
         f"      - {config_mount}:/etc/traefik/traefik.yml:ro",
@@ -175,7 +190,7 @@ def traefik_compose_content() -> str:
         "",
         "volumes:",
         "  letsencrypt_data:",
-    ]
+    ])
     return "\n".join(lines) + "\n"
 
 
@@ -217,6 +232,22 @@ def start_traefik() -> RuntimeResult:
         message = proc.stderr.strip() or proc.stdout.strip() or "docker compose up failed"
         return RuntimeResult(proc.returncode, message)
     message = proc.stdout.strip() or proc.stderr.strip() or "traefik started"
+    return RuntimeResult(0, message, ran=True)
+
+
+def restart_traefik_existing() -> RuntimeResult:
+    if runtime_skip_requested():
+        return RuntimeResult(0, "traefik restart skipped by WPFY_SKIP_RUNTIME=1", skipped=True)
+    if not docker_available():
+        return RuntimeResult(0, "traefik restart skipped (Docker/Compose not available)", skipped=True)
+    net_result = ensure_traefik_network()
+    if net_result.exit_code != 0:
+        return net_result
+    proc = _traefik_compose("up", "-d")
+    if proc.returncode != 0:
+        message = proc.stderr.strip() or proc.stdout.strip() or "docker compose up failed"
+        return RuntimeResult(proc.returncode, message)
+    message = proc.stdout.strip() or proc.stderr.strip() or "traefik restarted"
     return RuntimeResult(0, message, ran=True)
 
 

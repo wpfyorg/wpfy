@@ -16,6 +16,7 @@ import smtplib
 import subprocess
 import string
 import sys
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Final, Iterable
@@ -25,6 +26,8 @@ from urllib.request import Request, urlopen
 from . import __version__
 from . import backup_schedule
 from . import cron
+from . import dns
+from . import edge_backup
 from . import registry
 from . import smtp
 from . import sftp
@@ -56,11 +59,13 @@ from .site_layout import (
     env_path,
     ensure_site_scaffold,
     generated_secret,
+    latest_backup_archive,
     list_backup_archives,
     list_sites,
     nginx_conf_path,
     read_env,
     remove_site_scaffold,
+    prune_backup_archives,
     restore_site,
     runtime_skip_requested,
     site_health,
@@ -224,11 +229,16 @@ def build_parser() -> argparse.ArgumentParser:
     add_site_parser(subparsers)
     add_run_parser(subparsers)
     add_backup_parser(subparsers)
+    add_backup_prune_parser(subparsers)
+    add_backup_remote_parser(subparsers)
+    add_backup_edge_parser(subparsers)
     add_backup_storage_parser(subparsers)
     add_backup_schedule_parser(subparsers)
     add_cron_parser(subparsers)
     add_smtp_parser(subparsers)
+    add_dns_parser(subparsers)
     add_restore_parser(subparsers)
+    add_restore_edge_parser(subparsers)
     add_rm_parser(subparsers)
     add_wp_parser(subparsers)
     add_version_parser(subparsers)
@@ -817,12 +827,81 @@ def add_backup_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentPa
     parser.add_argument("domain")
     parser.add_argument("--list", action="store_true", help="list existing backup archives for the site")
     parser.add_argument("--path", dest="destination_dir", help="copy the verified archive to this directory")
+    parser.add_argument("--keep-local", type=int, help="keep newest N local archives after verified backup")
+    parser.add_argument("--profile", help="backup storage profile for --s3")
     parser.add_argument(
         "--s3",
         action="store_true",
         help="upload the verified archive to configured S3-compatible storage",
     )
     parser.set_defaults(handler=handle_site_backup)
+
+
+def add_backup_prune_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+    parser = subparsers.add_parser(
+        "backup-prune",
+        prog="wpfy backup prune",
+        help=argparse.SUPPRESS,
+        description="Prune local backup archives.",
+        formatter_class=WpfyHelpFormatter,
+    )
+    parser.add_argument("domain")
+    parser.add_argument("--keep", type=int, required=True)
+    parser.add_argument("--dry-run", action="store_true")
+    parser.set_defaults(handler=handle_backup_prune)
+
+
+def add_backup_remote_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+    parser = subparsers.add_parser(
+        "backup-remote",
+        prog="wpfy backup remote",
+        help=argparse.SUPPRESS,
+        description="List, restore, delete, and prune S3-compatible backup objects.",
+        formatter_class=WpfyHelpFormatter,
+    )
+    remote_subparsers = parser.add_subparsers(dest="remote_command")
+
+    list_parser = remote_subparsers.add_parser("list", help="list remote archives")
+    list_parser.add_argument("domain")
+    list_parser.add_argument("--profile")
+    list_parser.set_defaults(handler=handle_backup_remote)
+
+    restore = remote_subparsers.add_parser("restore", help="restore from a remote archive")
+    restore.add_argument("domain")
+    key_group = restore.add_mutually_exclusive_group(required=True)
+    key_group.add_argument("--key")
+    key_group.add_argument("--latest", action="store_true")
+    restore.add_argument("--profile")
+    restore.set_defaults(handler=handle_backup_remote)
+
+    delete = remote_subparsers.add_parser("delete", help="delete one remote archive")
+    delete.add_argument("domain")
+    delete.add_argument("--key", required=True)
+    delete.add_argument("--profile")
+    delete.add_argument("--force", action="store_true")
+    delete.set_defaults(handler=handle_backup_remote)
+
+    prune = remote_subparsers.add_parser("prune", help="prune remote archives")
+    prune.add_argument("domain")
+    prune.add_argument("--keep", type=int, required=True)
+    prune.add_argument("--profile")
+    prune.add_argument("--force", action="store_true")
+    prune.add_argument("--dry-run", action="store_true")
+    prune.set_defaults(handler=handle_backup_remote)
+
+
+def add_backup_edge_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+    parser = subparsers.add_parser(
+        "backup-edge",
+        prog="wpfy backup edge",
+        help=argparse.SUPPRESS,
+        description="Back up Traefik config and ACME state.",
+        formatter_class=WpfyHelpFormatter,
+    )
+    parser.add_argument("--path", dest="destination_dir")
+    parser.add_argument("--s3", action="store_true")
+    parser.add_argument("--profile")
+    parser.set_defaults(handler=handle_backup_edge)
 
 
 def add_backup_storage_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
@@ -844,17 +923,21 @@ def add_backup_storage_parser(subparsers: argparse._SubParsersAction[argparse.Ar
     set_parser.add_argument("--bucket", required=True)
     set_parser.add_argument("--region", required=True)
     set_parser.add_argument("--prefix", default="")
+    set_parser.add_argument("--profile")
     set_parser.add_argument("--access-key", required=True)
     set_parser.add_argument("--secret-key-stdin", action="store_true")
     set_parser.set_defaults(handler=handle_backup_storage)
 
     status = storage_subparsers.add_parser("status", help="show sanitized backup storage status")
+    status.add_argument("--profile")
     status.set_defaults(handler=handle_backup_storage)
 
     test = storage_subparsers.add_parser("test", help="upload a tiny test object")
+    test.add_argument("--profile")
     test.set_defaults(handler=handle_backup_storage)
 
     clear = storage_subparsers.add_parser("clear", help="remove stored backup storage config")
+    clear.add_argument("--profile")
     clear.add_argument("--force", action="store_true")
     clear.set_defaults(handler=handle_backup_storage)
 
@@ -942,6 +1025,31 @@ def add_smtp_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentPars
     clear.set_defaults(handler=handle_smtp)
 
 
+def add_dns_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+    parser = _add_parser(
+        subparsers,
+        "dns",
+        help="Configure DNS provider credentials for wildcard SSL.",
+    )
+    dns_subparsers = parser.add_subparsers(dest="dns_provider")
+    cloudflare = dns_subparsers.add_parser("cloudflare", help="manage Cloudflare DNS credentials")
+    cloudflare_subparsers = cloudflare.add_subparsers(dest="dns_command")
+
+    set_parser = cloudflare_subparsers.add_parser("set", help="store Cloudflare token")
+    set_parser.add_argument("--token-stdin", action="store_true")
+    set_parser.set_defaults(handler=handle_dns)
+
+    status = cloudflare_subparsers.add_parser("status", help="show sanitized Cloudflare DNS status")
+    status.set_defaults(handler=handle_dns)
+
+    test = cloudflare_subparsers.add_parser("test", help="verify Cloudflare token")
+    test.set_defaults(handler=handle_dns)
+
+    clear = cloudflare_subparsers.add_parser("clear", help="remove Cloudflare DNS token")
+    clear.add_argument("--force", action="store_true")
+    clear.set_defaults(handler=handle_dns)
+
+
 def add_restore_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
     parser = _add_parser(
         subparsers,
@@ -952,7 +1060,21 @@ def add_restore_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentP
     parser.add_argument("domain")
     parser.add_argument("backup", nargs="?")
     parser.add_argument("--list", action="store_true", help="list existing backup archives for the site")
+    parser.add_argument("--latest", action="store_true", help="restore newest local archive explicitly")
     parser.set_defaults(handler=handle_site_restore)
+
+
+def add_restore_edge_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+    parser = subparsers.add_parser(
+        "restore-edge",
+        prog="wpfy restore edge",
+        help=argparse.SUPPRESS,
+        description="Restore Traefik config and ACME state.",
+        formatter_class=WpfyHelpFormatter,
+    )
+    parser.add_argument("archive")
+    parser.add_argument("--force", action="store_true")
+    parser.set_defaults(handler=handle_restore_edge)
 
 
 def add_rm_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
@@ -1261,6 +1383,7 @@ def add_config_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentPa
     parser.add_argument("--wpsubdir", action="store_true")
     parser.add_argument("--wpsubdomain", action="store_true")
     parser.add_argument("-le", "--letsencrypt", nargs="?", const="default", default=None)
+    parser.add_argument("--dns")
     parser.add_argument(
         "--proxied",
         action=argparse.BooleanOptionalAction,
@@ -1350,6 +1473,7 @@ def handle_config(args: argparse.Namespace) -> CommandResult:
         wpsubdir=args.wpsubdir,
         wpsubdomain=args.wpsubdomain,
         letsencrypt=args.letsencrypt,
+        dns_provider=getattr(args, "dns", None),
         proxied_override=args.proxied,
         password=password,
     )
@@ -1915,6 +2039,8 @@ def add_site_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentPars
     backup.add_argument("domain")
     backup.add_argument("--list", action="store_true", help="list existing backup archives for the site")
     backup.add_argument("--path", dest="destination_dir", help="copy the verified archive to this directory")
+    backup.add_argument("--keep-local", type=int, help="keep newest N local archives after verified backup")
+    backup.add_argument("--profile", help="backup storage profile for --s3")
     backup.add_argument(
         "--s3",
         action="store_true",
@@ -1930,6 +2056,7 @@ def add_site_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentPars
     restore.add_argument("domain")
     restore.add_argument("backup", nargs="?")
     restore.add_argument("--list", action="store_true", help="list existing backup archives for the site")
+    restore.add_argument("--latest", action="store_true", help="restore newest local archive explicitly")
     restore.set_defaults(handler=handle_site_restore)
 
     wp = _add_parser(
@@ -1980,6 +2107,7 @@ def add_site_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentPars
     update.add_argument("--password")
     update.add_argument("--wpsubdir", action="store_true")
     update.add_argument("--wpsubdomain", action="store_true")
+    update.add_argument("--dns")
     update.set_defaults(handler=handle_site_update)
 
 
@@ -2327,6 +2455,10 @@ def make_site_handler(name: str):
 
 def _pull_php_image(php_ver: str) -> tuple[bool, str]:
     image = php_image(php_ver)
+    return _pull_image(image)
+
+
+def _pull_image(image: str) -> tuple[bool, str]:
     proc = subprocess.run(["docker", "pull", image], check=False, capture_output=True, text=True)
     if proc.returncode == 0:
         return True, f"pulled {image}"
@@ -2396,10 +2528,20 @@ def handle_stack_install(args: argparse.Namespace) -> CommandResult:
         if getattr(args, flag, False):
             results.append(f"{flag}: WARN not applicable in Docker-first wpfy (use host-level tooling separately)")
 
-    deferred_flags = ["phpmyadmin", "adminer", "composer", "mysqltuner"]
-    for flag in deferred_flags:
+    helper_images = {
+        "phpmyadmin": "phpmyadmin:5-apache",
+        "adminer": "adminer:5",
+        "composer": "composer:2",
+    }
+    for flag, image in helper_images.items():
         if getattr(args, flag, False):
-            results.append(f"{flag}: WARN not yet implemented, deferred to v2")
+            _progress(f"Pulling helper image {image}...")
+            ok, msg = _pull_image(image)
+            results.append(f"{flag}: {'OK' if ok else 'FAIL'} {msg}")
+            if not ok:
+                exit_code = 1
+    if getattr(args, "mysqltuner", False):
+        results.append("mysqltuner: WARN skipped; no vetted pinned container image yet")
 
     if len(results) == 1:
         results.append("nothing selected")
@@ -2569,6 +2711,7 @@ def handle_site_update(args: argparse.Namespace) -> CommandResult:
         wpsubdir=args.wpsubdir,
         wpsubdomain=args.wpsubdomain,
         letsencrypt=args.letsencrypt,
+        dns_provider=getattr(args, "dns", None),
         proxied_override=getattr(args, "proxied", None),
         password=args.password,
     )
@@ -2581,9 +2724,6 @@ def handle_site_ssl(args: argparse.Namespace) -> CommandResult:
     renew = getattr(args, "renew", False)
     status_flag = getattr(args, "status", False)
     letsencrypt = getattr(args, "letsencrypt", None)
-
-    if letsencrypt == "wildcard":
-        return CommandResult(_render_summary("ssl", ["wildcard SSL is not yet supported; no certificate was requested"]), exit_code=2)
 
     if preflight_only:
         result = preflight_ssl(domain)
@@ -2672,6 +2812,17 @@ def handle_site_ssl(args: argparse.Namespace) -> CommandResult:
 
 
 def handle_site_backup(args: argparse.Namespace) -> CommandResult:
+    keep_local = getattr(args, "keep_local", None)
+    if keep_local is not None and keep_local < 0:
+        return CommandResult("keep-local must be 0 or greater", exit_code=2)
+    backup_kwargs = {
+        "destination_dir": getattr(args, "destination_dir", None),
+        "upload_s3": getattr(args, "s3", False),
+    }
+    if getattr(args, "profile", None):
+        backup_kwargs["s3_profile"] = getattr(args, "profile", None)
+    if keep_local is not None:
+        backup_kwargs["keep_local"] = keep_local
     if getattr(args, "list", False):
         if args.domain == "all":
             return CommandResult("backup all does not support --list", exit_code=2)
@@ -2692,8 +2843,7 @@ def handle_site_backup(args: argparse.Namespace) -> CommandResult:
             domain = site.get("domain", "")
             result = backup_site(
                 domain,
-                destination_dir=getattr(args, "destination_dir", None),
-                upload_s3=getattr(args, "s3", False),
+                **backup_kwargs,
             )
             if result.exit_code != 0:
                 exit_code = 1
@@ -2702,8 +2852,7 @@ def handle_site_backup(args: argparse.Namespace) -> CommandResult:
 
     result = backup_site(
         args.domain,
-        destination_dir=getattr(args, "destination_dir", None),
-        upload_s3=getattr(args, "s3", False),
+        **backup_kwargs,
     )
     return CommandResult(_render_summary("site backup", [_step_line("backup", result)]), exit_code=result.exit_code)
 
@@ -2719,9 +2868,9 @@ def _s3_config_summary(config: S3Config) -> list[str]:
     ]
 
 
-def _load_backup_storage() -> tuple[S3Config | None, CommandResult | None]:
+def _load_backup_storage(profile: str | None = None) -> tuple[S3Config | None, CommandResult | None]:
     try:
-        return load_s3_config(), None
+        return load_s3_config(profile), None
     except RuntimeError as exc:
         return None, CommandResult(str(exc), exit_code=2)
 
@@ -2741,6 +2890,7 @@ def _secret_from_args(args: argparse.Namespace) -> tuple[str | None, CommandResu
 
 
 def handle_backup_storage(args: argparse.Namespace) -> CommandResult:
+    profile = getattr(args, "profile", None)
     if args.storage_command == "set":
         secret_key, secret_error = _secret_from_args(args)
         if secret_error:
@@ -2755,14 +2905,14 @@ def handle_backup_storage(args: argparse.Namespace) -> CommandResult:
             access_key=args.access_key,
             secret_key=secret_key,
         )
-        path = write_s3_config(config)
-        stored = load_s3_config()
+        path = write_s3_config(config, profile)
+        stored = load_s3_config(profile)
         return CommandResult(
             _render_summary("backup storage", [*_s3_config_summary(stored), f"config: {path}"])
         )
 
     if args.storage_command == "status":
-        config, error = _load_backup_storage()
+        config, error = _load_backup_storage(profile)
         if error:
             return error
         if config is None:
@@ -2770,7 +2920,7 @@ def handle_backup_storage(args: argparse.Namespace) -> CommandResult:
         return CommandResult(_render_summary("backup storage", _s3_config_summary(config)))
 
     if args.storage_command == "test":
-        config, error = _load_backup_storage()
+        config, error = _load_backup_storage(profile)
         if error:
             return error
         if config is None:
@@ -2785,10 +2935,133 @@ def handle_backup_storage(args: argparse.Namespace) -> CommandResult:
     if args.storage_command == "clear":
         if not args.force:
             return CommandResult("backup storage clear aborted: --force required", exit_code=2)
-        clear_s3_config()
-        return CommandResult(_render_summary("backup storage", [f"removed: {s3_config_path()}"]))
+        clear_s3_config(profile)
+        return CommandResult(_render_summary("backup storage", [f"removed: {s3_config_path(profile)}"]))
 
     return CommandResult("backup storage command required", exit_code=2)
+
+
+def handle_backup_prune(args: argparse.Namespace) -> CommandResult:
+    if args.domain == "all":
+        sites = sorted(list_sites(), key=lambda site: site.get("domain", ""))
+        if not sites:
+            return CommandResult("no managed sites found")
+        lines = []
+        exit_code = 0
+        for site in sites:
+            result = prune_backup_archives(site.get("domain", ""), args.keep, dry_run=args.dry_run)
+            if result.exit_code != 0:
+                exit_code = 1
+            lines.append(_step_line(site.get("domain", ""), result))
+        return CommandResult(_render_summary("backup prune", lines), exit_code=exit_code)
+    result = prune_backup_archives(args.domain, args.keep, dry_run=args.dry_run)
+    return CommandResult(_render_summary("backup prune", [_step_line("prune", result)]), exit_code=result.exit_code)
+
+
+def handle_backup_edge(args: argparse.Namespace) -> CommandResult:
+    result = edge_backup.backup_edge(
+        destination_dir=getattr(args, "destination_dir", None),
+        upload_s3=getattr(args, "s3", False),
+        s3_profile=getattr(args, "profile", None),
+    )
+    return CommandResult(_render_summary("backup edge", [_step_line("edge", result)]), exit_code=result.exit_code)
+
+
+def _remote_prefix(config: S3Config, domain: str) -> str:
+    return f"{s3_object_key(config.prefix, domain, '')}/"
+
+
+def _remote_key_allowed(config: S3Config, domain: str, key: str) -> bool:
+    prefix = _remote_prefix(config, domain)
+    return key.startswith(prefix) and key.endswith(".tar.gz") and "/" not in key.removeprefix(prefix).strip("/")
+
+
+def _remote_archive_keys(config: S3Config, domain: str, uploader: S3Uploader) -> list[str]:
+    prefix = _remote_prefix(config, domain)
+    keys = uploader.list_keys(config, prefix)
+    return sorted([key for key in keys if _remote_key_allowed(config, domain, key)], reverse=True)
+
+
+def _load_remote(profile: str | None) -> tuple[S3Config | None, S3Uploader | None, CommandResult | None]:
+    config, error = _load_backup_storage(profile)
+    if error:
+        return None, None, error
+    if config is None:
+        return None, None, CommandResult("backup storage is not configured", exit_code=2)
+    return config, S3Uploader(), None
+
+
+def handle_backup_remote(args: argparse.Namespace) -> CommandResult:
+    config, uploader, error = _load_remote(getattr(args, "profile", None))
+    if error:
+        return error
+    if config is None or uploader is None:
+        return CommandResult("backup storage is not configured", exit_code=2)
+    try:
+        validate_domain(args.domain)
+    except ValueError as exc:
+        return CommandResult(redact_s3_secrets(str(exc), config), exit_code=2)
+
+    if args.remote_command == "delete":
+        if not args.force:
+            return CommandResult("backup remote delete aborted: --force required", exit_code=2)
+        if not _remote_key_allowed(config, args.domain, args.key):
+            return CommandResult("remote key outside managed backup prefix", exit_code=2)
+        try:
+            deleted = uploader.delete_key(config, args.key)
+        except (OSError, RuntimeError) as exc:
+            return CommandResult(f"delete: FAIL {redact_s3_secrets(str(exc), config)}", exit_code=4)
+        return CommandResult(_render_summary("backup remote delete", [f"deleted: {deleted}"]))
+
+    try:
+        keys = _remote_archive_keys(config, args.domain, uploader)
+    except (OSError, RuntimeError) as exc:
+        return CommandResult(redact_s3_secrets(str(exc), config), exit_code=2)
+
+    if args.remote_command == "list":
+        lines = [f"s3://{config.bucket}/{key}" for key in keys] or ["no remote backup archives found"]
+        return CommandResult(_render_summary("backup remote list", lines))
+
+    if args.remote_command == "restore":
+        key = keys[0] if getattr(args, "latest", False) and keys else getattr(args, "key", "")
+        if not key:
+            return CommandResult("no remote backup archives found", exit_code=2)
+        if not _remote_key_allowed(config, args.domain, key):
+            return CommandResult("remote key outside managed backup prefix", exit_code=2)
+        try:
+            payload = uploader.download_bytes(config, key)
+        except (OSError, RuntimeError) as exc:
+            return CommandResult(f"download: FAIL {redact_s3_secrets(str(exc), config)}", exit_code=4)
+        with tempfile.NamedTemporaryFile(prefix="wpfy-remote-restore-", suffix=".tar.gz", delete=False) as archive:
+            archive.write(payload)
+            archive_path = archive.name
+        try:
+            result = restore_site(args.domain, archive_path)
+        finally:
+            Path(archive_path).unlink(missing_ok=True)
+        return CommandResult(_render_summary("backup remote restore", [_step_line("restore", result)]), result.exit_code)
+
+    if args.remote_command == "prune":
+        if args.keep < 0:
+            return CommandResult("keep must be 0 or greater", exit_code=2)
+        victims = keys[args.keep:]
+        if not victims:
+            return CommandResult(_render_summary("backup remote prune", ["no remote backups pruned"]))
+        if args.dry_run:
+            return CommandResult(_render_summary("backup remote prune", [f"would delete: s3://{config.bucket}/{key}" for key in victims]))
+        if not args.force:
+            return CommandResult("backup remote prune aborted: --force required", exit_code=2)
+        lines = []
+        exit_code = 0
+        for key in victims:
+            try:
+                lines.append(f"deleted: {uploader.delete_key(config, key)}")
+            except (OSError, RuntimeError) as exc:
+                exit_code = 4
+                lines.append(f"FAIL {redact_s3_secrets(str(exc), config)}")
+        return CommandResult(_render_summary("backup remote prune", lines), exit_code=exit_code)
+
+    return CommandResult("backup remote command required", exit_code=2)
 
 
 def handle_backup_schedule(args: argparse.Namespace) -> CommandResult:
@@ -2913,6 +3186,41 @@ def handle_smtp(args: argparse.Namespace) -> CommandResult:
     return CommandResult("smtp command required", exit_code=2)
 
 
+def handle_dns(args: argparse.Namespace) -> CommandResult:
+    if args.dns_provider != "cloudflare":
+        return CommandResult("dns provider required", exit_code=2)
+    if args.dns_command == "set":
+        if not getattr(args, "token_stdin", False):
+            return CommandResult("Cloudflare token required on stdin; use --token-stdin", exit_code=2)
+        token = sys.stdin.readline().rstrip("\r\n")
+        if not token:
+            return CommandResult("Cloudflare token cannot be empty", exit_code=2)
+        path = dns.write_cloudflare_config(dns.CloudflareConfig(token=token))
+        return CommandResult(_render_summary("dns cloudflare", ["token: configured", f"config: {path}"]))
+    if args.dns_command == "status":
+        try:
+            dns.load_cloudflare_config()
+        except dns.DNSConfigError as exc:
+            return CommandResult(str(exc), exit_code=2)
+        return CommandResult(_render_summary("dns cloudflare", ["token: configured"]))
+    if args.dns_command == "test":
+        try:
+            config = dns.load_cloudflare_config()
+            message = dns.test_cloudflare_config(config)
+        except (dns.DNSConfigError, OSError) as exc:
+            text = str(exc)
+            if "config" in locals():
+                text = dns.redact_cloudflare_secret(text, config)
+            return CommandResult(f"Cloudflare DNS test failed: {text}", exit_code=4)
+        return CommandResult(_render_summary("dns cloudflare test", [f"test: OK {message}"]))
+    if args.dns_command == "clear":
+        if not args.force:
+            return CommandResult("dns cloudflare clear aborted: --force required", exit_code=2)
+        dns.clear_cloudflare_config()
+        return CommandResult(_render_summary("dns cloudflare", [f"removed: {dns.cloudflare_config_path()}"]))
+    return CommandResult("dns cloudflare command required", exit_code=2)
+
+
 def handle_site_restore(args: argparse.Namespace) -> CommandResult:
     if getattr(args, "list", False):
         try:
@@ -2921,10 +3229,21 @@ def handle_site_restore(args: argparse.Namespace) -> CommandResult:
             return CommandResult(str(exc), exit_code=2)
         lines = [str(path) for path in archives] or ["no backup archives found"]
         return CommandResult(_render_summary("restore archives", lines))
+    if getattr(args, "latest", False):
+        latest = latest_backup_archive(args.domain)
+        if latest.exit_code != 0:
+            return CommandResult(_render_summary("site restore", [_step_line("latest", latest)]), exit_code=latest.exit_code)
+        result = restore_site(args.domain, latest.message)
+        return CommandResult(_render_summary("site restore", [_step_line("restore", result)]), exit_code=result.exit_code)
     if not args.backup:
         return CommandResult("restore backup archive required unless --list is used", exit_code=2)
     result = restore_site(args.domain, args.backup)
     return CommandResult(_render_summary("site restore", [_step_line("restore", result)]), exit_code=result.exit_code)
+
+
+def handle_restore_edge(args: argparse.Namespace) -> CommandResult:
+    result = edge_backup.restore_edge(args.archive, force=getattr(args, "force", False))
+    return CommandResult(_render_summary("restore edge", [_step_line("edge", result)]), exit_code=result.exit_code)
 
 
 def handle_site_wp(args: argparse.Namespace) -> CommandResult:
@@ -3033,8 +3352,10 @@ def _normalize_exec_argv(argv: list[str]) -> list[str]:
 
 
 def _normalize_backup_argv(argv: list[str]) -> list[str]:
-    if len(argv) >= 2 and argv[0] == "backup" and argv[1] in {"storage", "schedule"}:
+    if len(argv) >= 2 and argv[0] == "backup" and argv[1] in {"storage", "schedule", "prune", "remote", "edge"}:
         return [f"backup-{argv[1]}", *argv[2:]]
+    if len(argv) >= 2 and argv[0] == "restore" and argv[1] == "edge":
+        return ["restore-edge", *argv[2:]]
     return argv
 
 

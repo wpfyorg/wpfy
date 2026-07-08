@@ -20,6 +20,7 @@ from .site_layout import (
     wp_cli_command,
 )
 from .certificate_lifecycle import preflight_ssl
+from .dns import DNSConfigError, load_cloudflare_config
 from .site_definition import MYSQL_FLAVORS, WORDPRESS_FLAVORS
 from .traefik import acme_email_problem
 
@@ -51,6 +52,7 @@ class UpdateSiteRequest:
     wpsubdir: bool = False
     wpsubdomain: bool = False
     letsencrypt: str | None = None
+    dns_provider: str | None = None
     proxied_override: bool | None = None
     password: str | None = None
 
@@ -104,6 +106,17 @@ def _require_acme_email() -> None:
     problem = acme_email_problem()
     if problem:
         raise SiteLifecycleError(problem, preflight=True)
+
+
+def _require_wildcard_dns(letsencrypt: str | None, dns_provider: str | None) -> None:
+    if letsencrypt != "wildcard":
+        return
+    if dns_provider != "cloudflare":
+        raise SiteLifecycleError("wildcard SSL requires --dns cloudflare", preflight=True)
+    try:
+        load_cloudflare_config()
+    except DNSConfigError as exc:
+        raise SiteLifecycleError(str(exc), preflight=True) from exc
 
 
 def _resolve_admin_user(domain: str) -> str:
@@ -166,6 +179,7 @@ def create_site(
             raise SiteLifecycleError(preflight.message, preflight=True)
         proxied = _resolve_proxied(request.proxied_override, preflight.mode)
         preflight_message = preflight.message
+        _require_wildcard_dns(request.letsencrypt, request.dns_provider)
 
     spec = _site_spec(
         domain=request.domain,
@@ -242,6 +256,7 @@ def update_site(request: UpdateSiteRequest) -> UpdateSiteResult:
     current_php = existing_env.get("PHP_VERSION", DEFAULT_PHP_VERSION)
     current_letsencrypt = existing_env.get("LETSENCRYPT_MODE", "") or None
     current_dns = existing_env.get("DNS_PROVIDER", "") or None
+    new_dns = request.dns_provider or current_dns
     current_proxied = existing_env.get("PROXIED", "") == "1"
 
     new_flavor = current_flavor
@@ -268,6 +283,8 @@ def update_site(request: UpdateSiteRequest) -> UpdateSiteResult:
         changes.append(f"flavor {current_flavor}→{new_flavor}")
     if (new_letsencrypt or "") != (current_letsencrypt or ""):
         changes.append(f"ssl enabled ({new_letsencrypt})" if new_letsencrypt else "ssl disabled")
+    if (new_dns or "") != (current_dns or ""):
+        changes.append(f"dns provider {current_dns or 'none'}→{new_dns}")
 
     preflight_message: str | None = None
     detected_mode: str | None = None
@@ -278,6 +295,7 @@ def update_site(request: UpdateSiteRequest) -> UpdateSiteResult:
             raise SiteLifecycleError(preflight.message, preflight=True)
         preflight_message = preflight.message
         detected_mode = preflight.mode
+    _require_wildcard_dns(new_letsencrypt, new_dns)
 
     if request.proxied_override is not None:
         new_proxied = request.proxied_override
@@ -291,7 +309,7 @@ def update_site(request: UpdateSiteRequest) -> UpdateSiteResult:
         flavor=new_flavor,
         php_version=new_php,
         letsencrypt=new_letsencrypt,
-        dns_provider=current_dns,
+        dns_provider=new_dns,
         proxied=new_proxied,
         sftp_password=existing_env.get("SFTP_PASSWORD") or None,
         sftp_port=existing_env.get("SFTP_PORT") or None,
@@ -346,6 +364,7 @@ def enable_ssl(
     preflight = preflight_ssl(domain)
     if not preflight.passed:
         raise SiteLifecycleError(preflight.message, preflight=True)
+    _require_wildcard_dns(letsencrypt, dns_provider)
 
     try:
         existing_info = site_info(domain)

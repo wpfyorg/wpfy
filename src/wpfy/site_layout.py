@@ -123,6 +123,35 @@ def list_backup_archives(domain: str) -> list[Path]:
     return sorted(archives, key=lambda path: (path.stat().st_mtime, path.name), reverse=True)
 
 
+def latest_backup_archive(domain: str) -> RuntimeResult:
+    archives = list_backup_archives(domain)
+    if not archives:
+        return RuntimeResult(2, f"no backup archives found for {domain}")
+    return RuntimeResult(0, str(archives[0]), ran=True)
+
+
+def prune_backup_archives(domain: str, keep: int, *, dry_run: bool = False) -> RuntimeResult:
+    validate_domain(domain)
+    if keep < 0:
+        return RuntimeResult(2, "keep must be 0 or greater")
+    archives = list_backup_archives(domain)
+    victims = archives[keep:]
+    if not victims:
+        return RuntimeResult(0, f"no local backups pruned; {len(archives)} retained", ran=not dry_run, skipped=dry_run)
+    if dry_run:
+        return RuntimeResult(0, f"would prune {len(victims)} local backup(s): " + ", ".join(path.name for path in victims), skipped=True)
+    for path in victims:
+        path.unlink()
+    return RuntimeResult(0, f"pruned {len(victims)} local backup(s); kept {min(keep, len(archives))}", ran=True)
+
+
+def _router_rule(domain: str, *, wildcard: bool) -> str:
+    if not wildcard:
+        return f"Host(`{domain}`)"
+    escaped = re.escape(domain)
+    return f"Host(`{domain}`) || HostRegexp(`^.+\\.{escaped}$`)"
+
+
 def compose_content(spec: SiteSpec) -> str:
     project = domain_to_project(spec.domain)
     if spec.site_uid is None:
@@ -157,21 +186,26 @@ def compose_content(spec: SiteSpec) -> str:
         "      - wpfy",
         "    labels:",
         '      - "traefik.enable=true"',
-        f'      - "traefik.http.routers.{project}.rule=Host(`{spec.domain}`)"',
+        f'      - "traefik.http.routers.{project}.rule={_router_rule(spec.domain, wildcard=spec.letsencrypt == "wildcard")}"',
         f'      - "traefik.http.routers.{project}.service={project}"',
     ]
     if spec.ssl_enabled:
-        certresolver = "le-http" if spec.proxied else "le"
+        certresolver = "le-dns-cloudflare" if spec.letsencrypt == "wildcard" else "le-http" if spec.proxied else "le"
         lines.extend([
             f'      - "traefik.http.routers.{project}.entrypoints=websecure"',
             f'      - "traefik.http.routers.{project}.tls=true"',
             f'      - "traefik.http.routers.{project}.tls.certresolver={certresolver}"',
-            f'      - "traefik.http.routers.{project}-http.rule=Host(`{spec.domain}`)"',
+            f'      - "traefik.http.routers.{project}-http.rule={_router_rule(spec.domain, wildcard=spec.letsencrypt == "wildcard")}"',
             f'      - "traefik.http.routers.{project}-http.entrypoints=web"',
             f'      - "traefik.http.routers.{project}-http.middlewares={project}-redirect"',
             f'      - "traefik.http.routers.{project}-http.service={project}"',
             f'      - "traefik.http.middlewares.{project}-redirect.redirectscheme.scheme=https"',
         ])
+        if spec.letsencrypt == "wildcard":
+            lines.extend([
+                f'      - "traefik.http.routers.{project}.tls.domains[0].main={spec.domain}"',
+                f'      - "traefik.http.routers.{project}.tls.domains[0].sans=*.{spec.domain}"',
+            ])
     else:
         lines.append(f'      - "traefik.http.routers.{project}.entrypoints=web"')
     lines.extend([
@@ -668,6 +702,8 @@ def backup_site(
     *,
     destination_dir: str | Path | None = None,
     upload_s3: bool = False,
+    s3_profile: str | None = None,
+    keep_local: int | None = None,
     uploader: S3Uploader | None = None,
 ) -> RuntimeResult:
     validate_domain(domain)
@@ -722,7 +758,7 @@ def backup_site(
 
     if upload_s3:
         try:
-            config = load_s3_config()
+            config = load_s3_config(s3_profile)
         except S3ConfigError as exc:
             return RuntimeResult(2, f"{message}; s3 upload skipped: {exc}", ran=True)
         active_uploader = uploader or S3Uploader()
@@ -731,6 +767,12 @@ def backup_site(
         except (OSError, S3ConfigError) as exc:
             return RuntimeResult(4, f"{message}; s3 upload failed: {redact_s3_secrets(str(exc), config)}", ran=True)
         message = f"{message}; uploaded to: {uploaded_to}"
+
+    if keep_local is not None:
+        prune = prune_backup_archives(domain, keep_local)
+        if prune.exit_code != 0:
+            return RuntimeResult(prune.exit_code, f"{message}; retention failed: {prune.message}", ran=True)
+        message = f"{message}; retention: {prune.message}"
 
     return RuntimeResult(0, message, ran=True)
 
