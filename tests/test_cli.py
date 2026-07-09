@@ -24,7 +24,7 @@ def test_build_parser_returns_parser():
     assert parser is not None
 
 
-def test_parser_has_expected_subcommands():
+def test_parser_retains_grouped_and_flat_subcommands():
     parser = build_parser()
     subparsers_actions = [action for action in parser._actions if hasattr(action, 'choices')]
     subcommand_names = []
@@ -79,13 +79,16 @@ def test_help_shows_examples_and_description(capsys):
     assert exc_info.value.code == 0
     assert "Docker-first CLI for WordPress and server administration." in output
     assert "Examples:" in output
-    assert "wpfy site create example.com --wp" in output
+    assert "wpfy run example.com --wp" in output
 
 
-def test_site_subcommand_exists():
+def test_site_namespace_is_intentionally_retained(capsys):
     with pytest.raises(SystemExit) as exc_info:
         run(["site", "--help"])
+    output = capsys.readouterr().out
+
     assert exc_info.value.code == 0
+    assert "Retained grouped namespace" in output
 
 
 def test_site_create_help_shows_examples(capsys):
@@ -99,10 +102,45 @@ def test_site_create_help_shows_examples(capsys):
     assert "Examples:" in output
 
 
-def test_stack_subcommand_exists():
+@pytest.mark.parametrize(
+    ("argv", "command_attr", "expected_command"),
+    [
+        (["site", "ssl", "example.com", "--status"], "site_command", "ssl"),
+        (["site", "list"], "site_command", "list"),
+        (["site", "show", "example.com"], "site_command", "show"),
+        (["site", "status", "example.com"], "site_command", "status"),
+        (["stack", "install", "--nginx"], "stack_command", "install"),
+        (["stack", "status"], "stack_command", "status"),
+    ],
+)
+def test_retained_grouped_commands_parse(argv, command_attr, expected_command):
+    args = build_parser().parse_args(argv)
+
+    assert getattr(args, command_attr) == expected_command
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["run", "example.com", "--wp"],
+        ["backup", "example.com"],
+        ["restore", "example.com", "--latest"],
+        ["wp", "example.com", "plugin", "list"],
+        ["rm", "example.com", "--force"],
+        ["config", "example.com"],
+    ],
+)
+def test_primary_flat_flows_parse(argv):
+    assert build_parser().parse_args(argv).command == argv[0]
+
+
+def test_stack_namespace_is_intentionally_retained(capsys):
     with pytest.raises(SystemExit) as exc_info:
         run(["stack", "--help"])
+    output = capsys.readouterr().out
+
     assert exc_info.value.code == 0
+    assert "Retained grouped namespace" in output
 
 
 @pytest.mark.parametrize(

@@ -216,8 +216,9 @@ def build_parser() -> argparse.ArgumentParser:
         description="Docker-first CLI for WordPress and server administration.",
         epilog=(
             "Examples:\n"
-            "  wpfy site create example.com --wp\n"
-            "  wpfy site create example.com --wp -le\n"
+            "  wpfy run example.com --wp\n"
+            "  wpfy backup example.com --list\n"
+            "  wpfy config example.com\n"
             "  wpfy stack install --nginx --php --mysql\n"
             "  wpfy site status example.com\n"
         ),
@@ -1979,10 +1980,11 @@ def add_site_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentPars
         subparsers,
         "site",
         help="Create, inspect, update, and remove managed sites.",
-        description="Manage per-site scaffolds, runtime state, SSL, backups, and restore flows.",
+        description="Retained grouped namespace for per-site operations, including SSL/status/list/show.",
         epilog=(
             "Examples:\n"
-            "  wpfy site create example.com --wp\n"
+            "  wpfy run example.com --wp\n"
+            "  wpfy backup example.com\n"
             "  wpfy site create example.com --wp -le\n"
             "  wpfy site status example.com\n"
             "  wpfy site ssl example.com --status\n"
@@ -2116,7 +2118,7 @@ def add_stack_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentPar
         subparsers,
         "stack",
         help="Install or inspect shared runtime components.",
-        description="Pull and inspect Traefik, PHP, MariaDB, Redis, and wp-cli images.",
+        description="Retained grouped namespace for shared stack install, lifecycle, and status operations.",
         epilog=(
             "Examples:\n"
             "  wpfy stack install --nginx --php --mysql\n"

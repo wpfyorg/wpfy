@@ -155,6 +155,14 @@ def test_compose_content_with_wildcard_ssl_labels():
     assert "traefik.http.routers.example-com.tls.domains[0].main=example.com" in content
     assert "traefik.http.routers.example-com.tls.domains[0].sans=*.example.com" in content
     assert "HostRegexp(`^.+\\.example\\.com$`)" in content
+    assert (
+        "      - 'traefik.http.routers.example-com.rule=Host(`example.com`) || "
+        "HostRegexp(`^.+\\.example\\.com$`)'"
+    ) in content
+    assert (
+        "      - 'traefik.http.routers.example-com-http.rule=Host(`example.com`) || "
+        "HostRegexp(`^.+\\.example\\.com$`)'"
+    ) in content
 
 
 def test_compose_content_proxied_uses_le_http_resolver():

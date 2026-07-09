@@ -156,6 +156,7 @@ def compose_content(spec: SiteSpec) -> str:
     project = domain_to_project(spec.domain)
     if spec.site_uid is None:
         raise ValueError("compose_content requires spec.site_uid; allocate it via ensure_site_scaffold")
+    router_rule = _router_rule(spec.domain, wildcard=spec.letsencrypt == "wildcard")
     user = f"{spec.site_uid}:{spec.site_uid}"
     web_image = WEB_IMAGE
     db_image = MARIADB_IMAGE
@@ -186,7 +187,7 @@ def compose_content(spec: SiteSpec) -> str:
         "      - wpfy",
         "    labels:",
         '      - "traefik.enable=true"',
-        f'      - "traefik.http.routers.{project}.rule={_router_rule(spec.domain, wildcard=spec.letsencrypt == "wildcard")}"',
+        f"      - 'traefik.http.routers.{project}.rule={router_rule}'",
         f'      - "traefik.http.routers.{project}.service={project}"',
     ]
     if spec.ssl_enabled:
@@ -195,7 +196,7 @@ def compose_content(spec: SiteSpec) -> str:
             f'      - "traefik.http.routers.{project}.entrypoints=websecure"',
             f'      - "traefik.http.routers.{project}.tls=true"',
             f'      - "traefik.http.routers.{project}.tls.certresolver={certresolver}"',
-            f'      - "traefik.http.routers.{project}-http.rule={_router_rule(spec.domain, wildcard=spec.letsencrypt == "wildcard")}"',
+            f"      - 'traefik.http.routers.{project}-http.rule={router_rule}'",
             f'      - "traefik.http.routers.{project}-http.entrypoints=web"',
             f'      - "traefik.http.routers.{project}-http.middlewares={project}-redirect"',
             f'      - "traefik.http.routers.{project}-http.service={project}"',
