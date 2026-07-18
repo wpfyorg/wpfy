@@ -83,6 +83,30 @@ def test_create_site_stops_before_mutation_when_preflight_fails(monkeypatch):
     assert exc.value.preflight is True
 
 
+def test_create_site_stops_after_bootstrap_failure(monkeypatch):
+    import wpfy.site_lifecycle as lifecycle
+
+    calls = []
+    monkeypatch.setattr(lifecycle, "ensure_site_scaffold", lambda spec: ["compose.yaml"])
+    monkeypatch.setattr(
+        lifecycle,
+        "bootstrap_site_files",
+        lambda domain: RuntimeResult(3, "download failed"),
+    )
+    monkeypatch.setattr(lifecycle, "apply_site_ownership", lambda domain: calls.append("ownership"))
+    monkeypatch.setattr(lifecycle, "start_site_runtime", lambda domain: calls.append("runtime"))
+
+    result = lifecycle.create_site(
+        lifecycle.CreateSiteRequest("example.com", "wp"),
+        credentials=lambda: calls.append("credentials"),
+    )
+
+    assert result.exit_code == 3
+    assert result.runtime.skipped is True
+    assert "bootstrap failed" in result.runtime.message
+    assert calls == []
+
+
 def test_update_site_passes_authoritative_definition_to_scaffold(monkeypatch):
     import wpfy.site_lifecycle as lifecycle
 

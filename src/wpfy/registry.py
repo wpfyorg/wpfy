@@ -8,6 +8,8 @@ from typing import Any
 
 from .php_runtime import DEFAULT_PHP_VERSION
 from .settings import PATHS
+from .site_definition import SiteDefinition
+from .site_paths import read_env
 
 
 class Registry:
@@ -34,18 +36,7 @@ class Registry:
         tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
         os.replace(tmp, self._path)
 
-    def _metadata_from_env(self, env: dict[str, str], domain: str) -> dict[str, Any]:
-        return {
-            "domain": env.get("DOMAIN", domain),
-            "flavor": env.get("SITE_FLAVOR", "unknown"),
-            "php_version": env.get("PHP_VERSION", DEFAULT_PHP_VERSION),
-            "created_at": env.get("CREATED_AT", ""),
-            "ssl_enabled": env.get("LETSENCRYPT_MODE", "") not in ("", "disabled"),
-            "cache_type": env.get("CACHE_TYPE", "basic"),
-        }
-
-    def _site_dirs(self) -> list[Path]:
-        root = Path(PATHS.sites_dir)
+    def _site_dirs(self, root: Path) -> list[Path]:
         if not root.exists():
             return []
         dirs = []
@@ -53,17 +44,6 @@ class Registry:
             if child.is_dir() and (child / ".env").exists() and (child / "compose.yaml").exists():
                 dirs.append(child)
         return dirs
-
-    def _read_env(self, path: Path) -> dict[str, str]:
-        values: dict[str, str] = {}
-        if not path.exists():
-            return values
-        for line in path.read_text(encoding="utf-8").splitlines():
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            key, value = line.split("=", 1)
-            values[key] = value
-        return values
 
     def add_site(self, domain: str, metadata: dict[str, Any]) -> None:
         entry = dict(metadata)
@@ -102,17 +82,21 @@ class Registry:
         root = Path(sites_dir) if sites_dir else Path(PATHS.sites_dir)
         fs_domains: set[str] = set()
 
-        for child in self._site_dirs():
+        for child in self._site_dirs(root):
             domain = child.name
             fs_domains.add(domain)
-            env = self._read_env(child / ".env")
-            metadata = self._metadata_from_env(env, domain)
+            definition = SiteDefinition.from_env(domain, read_env(child / ".env"))
+            metadata = definition.registry_metadata()
             existing = self._sites.get(domain)
             if existing:
+                metadata["created_at"] = existing.get("created_at", datetime.now(timezone.utc).isoformat())
+                if "maintenance" in existing:
+                    metadata["maintenance"] = existing["maintenance"]
                 if metadata != existing:
                     self._sites[domain] = metadata
                     updated += 1
             else:
+                metadata["created_at"] = datetime.now(timezone.utc).isoformat()
                 self._sites[domain] = metadata
                 added += 1
 

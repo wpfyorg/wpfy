@@ -27,7 +27,9 @@ python3 - <<'PY'
 from wpfy.site_layout import SiteSpec, ensure_site_scaffold, bootstrap_site_files
 spec = SiteSpec(domain="wp-hardening.example.com", flavor="wp", use_mysql=True, use_redis=False)
 ensure_site_scaffold(spec)
-bootstrap_site_files("wp-hardening.example.com")
+result = bootstrap_site_files("wp-hardening.example.com")
+assert result.exit_code == 0 and result.skipped
+assert "WPFY_SKIP_WORDPRESS_DOWNLOAD=1" in result.message
 PY
 
 site_root="$WPFY_INSTALL_ROOT/sites/wp-hardening.example.com"

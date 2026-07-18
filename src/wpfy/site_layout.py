@@ -1,8 +1,10 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
+import hashlib
+import json
 import re
 import shutil
 import subprocess
@@ -10,7 +12,6 @@ import secrets
 import os
 import tarfile
 import tempfile
-import time
 from urllib.request import urlopen
 
 from .settings import PATHS
@@ -18,6 +19,38 @@ from . import registry
 from .php_runtime import PHP_IMAGE_REPOSITORY as _PHP_IMAGE_REPOSITORY, php_image
 from .s3_backup import S3ConfigError, S3Uploader, load_s3_config, redact_s3_secrets
 from .site_definition import MYSQL_FLAVORS, WORDPRESS_FLAVORS, SiteDefinition, sftp_service_lines
+from .site_paths import (
+    app_dir,
+    backups_dir,
+    compose_path,
+    db_data_dir,
+    domain_to_project,
+    env_path,
+    healthcheck_path,
+    nginx_conf_path,
+    nginx_dir,
+    php_dir,
+    read_env,
+    read_text,
+    redis_data_dir,
+    site_dir,
+    site_exists,
+    validate_domain,
+)
+from .site_runtime import (
+    HealthResult,
+    RuntimeResult,
+    _http_probe_site,
+    _wait_for_service,
+    compose_command,
+    docker_available,
+    runtime_skip_requested,
+    runtime_status,
+    site_health,
+    start_site_runtime,
+    stop_site_runtime,
+    wp_cli_command,
+)
 
 
 PHP_IMAGE_REPOSITORY = _PHP_IMAGE_REPOSITORY
@@ -34,84 +67,47 @@ REDIS_IMAGE = "redis:7.2-alpine"
 # database, or cache. The base sits above host system accounts and typical human
 # operators; userns-remap is not in use, so the container uid maps 1:1 to the host.
 SITE_UID_BASE = 100000
+WORDPRESS_VERSION_URL = "https://api.wordpress.org/core/version-check/1.7/"
+WORDPRESS_VERSION_RE = re.compile(r"[0-9]+\.[0-9]+(?:\.[0-9]+)?")
+WORDPRESS_METADATA_LIMIT = 1024 * 1024
+WORDPRESS_DOWNLOAD_CHUNK_SIZE = 1024 * 1024
 
 
 SiteSpec = SiteDefinition
 
 
-@dataclass(frozen=True)
-class RuntimeResult:
-    exit_code: int
-    message: str
-    ran: bool = False
-    skipped: bool = False
+def _wordpress_release_version() -> str:
+    with urlopen(WORDPRESS_VERSION_URL, timeout=15) as response:
+        payload = response.read(WORDPRESS_METADATA_LIMIT + 1)
+    if len(payload) > WORDPRESS_METADATA_LIMIT:
+        raise ValueError("WordPress release metadata is too large")
+    document = json.loads(payload)
+    offers = document.get("offers") if isinstance(document, dict) else None
+    if not isinstance(offers, list):
+        raise ValueError("WordPress release metadata is missing offers")
+    for offer in offers:
+        if not isinstance(offer, dict):
+            continue
+        version = offer.get("current")
+        if (
+            offer.get("response") == "upgrade"
+            and offer.get("locale") == "en_US"
+            and isinstance(version, str)
+            and WORDPRESS_VERSION_RE.fullmatch(version)
+        ):
+            return version
+    raise ValueError("WordPress stable en_US release is unavailable")
 
 
-@dataclass(frozen=True)
-class HealthResult:
-    domain: str
-    scaffold_ready: bool
-    bootstrap_ready: bool
-    runtime_ready: bool
-    http_ready: bool
-    status: str
-    message: str
-
-
-def site_dir(domain: str) -> Path:
-    return Path(PATHS.site_dir(domain))
-
-
-def compose_path(domain: str) -> Path:
-    return site_dir(domain) / "compose.yaml"
-
-
-def env_path(domain: str) -> Path:
-    return site_dir(domain) / ".env"
-
-
-def nginx_dir(domain: str) -> Path:
-    return site_dir(domain) / "nginx"
-
-
-def php_dir(domain: str) -> Path:
-    return site_dir(domain) / "php"
-
-
-def nginx_conf_path(domain: str) -> Path:
-    return nginx_dir(domain) / "default.conf"
-
-
-def healthcheck_path(domain: str) -> Path:
-    return app_dir(domain) / "healthz.html"
-
-
-def backups_dir(domain: str) -> Path:
-    return Path(PATHS.state_dir) / "backups" / domain
-
-
-def app_dir(domain: str) -> Path:
-    return site_dir(domain) / "app"
-
-
-def db_data_dir(domain: str) -> Path:
-    return site_dir(domain) / "db-data"
-
-
-def redis_data_dir(domain: str) -> Path:
-    return site_dir(domain) / "redis-data"
-
-
-def domain_to_project(domain: str) -> str:
-    return domain.replace(".", "-").replace("_", "-").lower()
-
-
-def validate_domain(domain: str) -> None:
-    if len(domain) > 253:
-        raise ValueError("domain is too long")
-    label = r"[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?"
-    if not re.fullmatch(rf"{label}(?:\.{label})+", domain):
-        raise ValueError(f"invalid domain: {domain}")
+def _wordpress_release_sha1(url: str) -> str:
+    with urlopen(f"{url}.sha1", timeout=15) as response:
+        payload = response.read(WORDPRESS_METADATA_LIMIT + 1)
+    if len(payload) > WORDPRESS_METADATA_LIMIT:
+        raise ValueError("WordPress release digest is too large")
+    digest = payload.decode("ascii").strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{40}", digest):
+        raise ValueError("WordPress release digest is invalid")
+    return digest
 
 
 def list_backup_archives(domain: str) -> list[Path]:
@@ -152,19 +148,15 @@ def _router_rule(domain: str, *, wildcard: bool) -> str:
     return f"Host(`{domain}`) || HostRegexp(`^.+\\.{escaped}$`)"
 
 
-def compose_content(spec: SiteSpec) -> str:
+def web_service_lines(spec: SiteSpec) -> list[str]:
     project = domain_to_project(spec.domain)
     if spec.site_uid is None:
-        raise ValueError("compose_content requires spec.site_uid; allocate it via ensure_site_scaffold")
+        raise ValueError("web_service_lines requires spec.site_uid; allocate it via ensure_site_scaffold")
     router_rule = _router_rule(spec.domain, wildcard=spec.letsencrypt == "wildcard")
     user = f"{spec.site_uid}:{spec.site_uid}"
-    web_image = WEB_IMAGE
-    db_image = MARIADB_IMAGE
     lines = [
-        f"name: {project}",
-        "services:",
         "  web:",
-        f"    image: {web_image}",
+        f"    image: {WEB_IMAGE}",
         f"    container_name: {project}-web",
         "    restart: unless-stopped",
         f'    user: "{user}"',
@@ -222,6 +214,18 @@ def compose_content(spec: SiteSpec) -> str:
         "      timeout: 10s",
         "      retries: 3",
         "",
+    ])
+    return lines
+
+
+def compose_content(spec: SiteSpec) -> str:
+    project = domain_to_project(spec.domain)
+    if spec.site_uid is None:
+        raise ValueError("compose_content requires spec.site_uid; allocate it via ensure_site_scaffold")
+    user = f"{spec.site_uid}:{spec.site_uid}"
+    db_image = MARIADB_IMAGE
+    lines = [f"name: {project}", "services:", *web_service_lines(spec)]
+    lines.extend([
         "  app:",
         f"    image: {php_image(spec.php_version)}",
         f"    container_name: {project}-app",
@@ -399,225 +403,6 @@ def env_content(spec: SiteSpec, existing: dict[str, str] | None = None) -> str:
     return "\n".join(f"{key}={value}" for key, value in values) + "\n"
 
 
-def read_text(path: Path) -> str | None:
-    return path.read_text(encoding="utf-8") if path.exists() else None
-
-
-def read_env(path: Path) -> dict[str, str]:
-    values: dict[str, str] = {}
-    text = read_text(path)
-    if text is None:
-        return values
-    for line in text.splitlines():
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, value = line.split("=", 1)
-        values[key] = value
-    return values
-
-
-def runtime_skip_requested() -> bool:
-    return os.environ.get("WPFY_SKIP_RUNTIME", "0") == "1"
-
-
-def docker_available() -> bool:
-    docker = shutil.which("docker")
-    if not docker:
-        return False
-    proc = subprocess.run([docker, "compose", "version"], check=False, capture_output=True, text=True)
-    return proc.returncode == 0
-
-
-def compose_command(domain: str, *args: str) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        ["docker", "compose", *args],
-        cwd=site_dir(domain),
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-
-
-def wp_cli_command(
-    domain: str,
-    *args: str,
-    input_text: str | None = None,
-) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        ["docker", "compose", "--profile", "cli", "run", "--rm", "-T", "wpcli", *args],
-        cwd=site_dir(domain),
-        check=False,
-        capture_output=True,
-        text=True,
-        input=input_text,
-    )
-
-
-def start_site_runtime(domain: str) -> RuntimeResult:
-    if runtime_skip_requested():
-        return RuntimeResult(0, "runtime skipped by WPFY_SKIP_RUNTIME=1", skipped=True)
-    if not docker_available():
-        return RuntimeResult(0, "runtime skipped because Docker or Compose is unavailable", skipped=True)
-    proc = compose_command(domain, "up", "-d")
-    if proc.returncode != 0:
-        message = proc.stderr.strip() or proc.stdout.strip() or "docker compose up failed"
-        return RuntimeResult(proc.returncode, message)
-    message = proc.stdout.strip() or proc.stderr.strip() or "compose project started"
-    return RuntimeResult(0, message, ran=True)
-
-
-def stop_site_runtime(domain: str, *, remove_volumes: bool = False) -> RuntimeResult:
-    if runtime_skip_requested() or not docker_available():
-        return RuntimeResult(0, "runtime stop skipped", skipped=True)
-    args = ("down", "-v") if remove_volumes else ("down",)
-    proc = compose_command(domain, *args)
-    if proc.returncode != 0:
-        message = proc.stderr.strip() or proc.stdout.strip() or "docker compose down failed"
-        return RuntimeResult(proc.returncode, message)
-    message = proc.stdout.strip() or proc.stderr.strip() or "compose project stopped"
-    return RuntimeResult(0, message, ran=True)
-
-
-def runtime_status(domain: str) -> RuntimeResult:
-    if runtime_skip_requested() or not docker_available():
-        return RuntimeResult(0, "runtime status unavailable (Docker/Compose not available)", skipped=True)
-    proc = compose_command(domain, "ps")
-    if proc.returncode != 0:
-        message = proc.stderr.strip() or proc.stdout.strip() or "docker compose ps failed"
-        return RuntimeResult(proc.returncode, message)
-    message = proc.stdout.strip() or proc.stderr.strip() or "no running containers"
-    return RuntimeResult(0, message, ran=True)
-
-
-def _compose_service_ids(domain: str, service: str) -> list[str]:
-    proc = compose_command(domain, "ps", "-q", service)
-    if proc.returncode != 0:
-        return []
-    return [line.strip() for line in proc.stdout.splitlines() if line.strip()]
-
-
-def _container_health(container_id: str) -> str:
-    docker = shutil.which("docker")
-    if not docker:
-        return "unknown"
-    proc = subprocess.run(
-        [docker, "inspect", "--format", "{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}", container_id],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    if proc.returncode != 0:
-        return "unknown"
-    return proc.stdout.strip().lower() or "unknown"
-
-
-def _compose_service_health(domain: str, service: str) -> list[str]:
-    return [_container_health(container_id) for container_id in _compose_service_ids(domain, service)]
-
-
-def _site_needs_mysql(domain: str) -> bool:
-    try:
-        flavor = site_info(domain).get("flavor", "unknown")
-    except FileNotFoundError:
-        return False
-    return flavor in MYSQL_FLAVORS
-
-
-def _site_needs_redis(domain: str) -> bool:
-    try:
-        flavor = site_info(domain).get("flavor", "unknown")
-    except FileNotFoundError:
-        return False
-    return flavor == "wpredis"
-
-
-def _compose_exec(domain: str, *args: str) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        ["docker", "compose", "exec", "-T", *args],
-        cwd=site_dir(domain),
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-
-
-def _http_probe_site(domain: str) -> RuntimeResult:
-    if runtime_skip_requested() or not docker_available():
-        return RuntimeResult(0, "http probe skipped", skipped=True)
-    proc = _compose_exec(domain, "web", "sh", "-lc", "wget -qO- http://127.0.0.1:8080/healthz.html")
-    if proc.returncode != 0:
-        message = proc.stderr.strip() or proc.stdout.strip() or "http probe failed"
-        return RuntimeResult(proc.returncode, message)
-    body = proc.stdout.strip()
-    if "wpfy-ok" not in body:
-        return RuntimeResult(1, "http probe returned unexpected body")
-    return RuntimeResult(0, "http probe passed", ran=True)
-
-
-def site_health(domain: str) -> HealthResult:
-    validate_domain(domain)
-    scaffold_ready = site_exists(domain)
-    bootstrap_ready = False
-    runtime_ready = False
-    http_ready = False
-
-    if not scaffold_ready:
-        return HealthResult(domain, False, False, False, False, "missing", f"site not found: {domain}")
-
-    flavor = read_env(env_path(domain)).get("SITE_FLAVOR", "site")
-    app_root = app_dir(domain)
-    common_ready = healthcheck_path(domain).exists() and nginx_conf_path(domain).exists()
-    if flavor in WORDPRESS_FLAVORS:
-        bootstrap_ready = (
-            common_ready
-            and (app_root / "index.php").exists()
-            and (app_root / "wp-config.php").exists()
-        )
-    elif flavor == "html":
-        bootstrap_ready = common_ready and (app_root / "index.html").exists()
-    else:
-        bootstrap_ready = common_ready and (app_root / "index.php").exists()
-
-    if runtime_skip_requested() or not docker_available():
-        status = "degraded" if bootstrap_ready else "needs-bootstrap"
-        message = "runtime unavailable (Docker/Compose not available)"
-        return HealthResult(domain, scaffold_ready, bootstrap_ready, False, False, status, message)
-
-    app_ids = _compose_service_ids(domain, "app")
-    db_ids = _compose_service_ids(domain, "db")
-    redis_ids = _compose_service_ids(domain, "redis")
-    app_health = _compose_service_health(domain, "app")
-    web_health = _compose_service_health(domain, "web")
-    db_health = _compose_service_health(domain, "db")
-    redis_health = _compose_service_health(domain, "redis")
-    needs_mysql = _site_needs_mysql(domain)
-    needs_redis = _site_needs_redis(domain)
-    web_ids = _compose_service_ids(domain, "web")
-    web_ok = bool(web_ids) and all(status == "healthy" for status in web_health)
-    app_ok = bool(app_ids) and all(status == "healthy" for status in app_health)
-    db_ok = (not needs_mysql) or (bool(db_ids) and all(status == "healthy" for status in db_health))
-    redis_ok = (not needs_redis) or (bool(redis_ids) and all(status == "healthy" for status in redis_health))
-    http_probe = _http_probe_site(domain)
-    http_ready = http_probe.ran and http_probe.exit_code == 0
-    runtime_ready = web_ok and app_ok and db_ok and redis_ok and http_ready
-
-    if runtime_ready:
-        status = "ready" if bootstrap_ready else "running"
-        message = f"web={len(web_ids)} app={len(app_ids)} db={len(db_ids)} redis={len(redis_ids)} http=ok"
-    elif web_ok and app_ok:
-        status = "partial"
-        message = f"web={len(web_ids)} app={len(app_ids)} db={len(db_ids)} redis={len(redis_ids)} http={'ok' if http_ready else http_probe.message} app_health={','.join(app_health) or 'unknown'} web_health={','.join(web_health) or 'unknown'} db_health={','.join(db_health) or 'unknown'} redis_health={','.join(redis_health) or 'unknown'}"
-    else:
-        status = "down"
-        message = f"no healthy compose services app_health={','.join(app_health) or 'unknown'} web_health={','.join(web_health) or 'unknown'} db_health={','.join(db_health) or 'unknown'} redis_health={','.join(redis_health) or 'unknown'} http={'ok' if http_ready else http_probe.message}"
-
-    if not bootstrap_ready:
-        status = "needs-bootstrap" if status == "down" else f"{status}-bootstrap"
-        message = f"{message}; site app files are not bootstrapped"
-
-    return HealthResult(domain, scaffold_ready, bootstrap_ready, runtime_ready, http_ready, status, message)
-
-
 def bootstrap_site_files(domain: str) -> RuntimeResult:
     validate_domain(domain)
     if os.environ.get("WPFY_SKIP_BOOTSTRAP", "0") == "1":
@@ -661,41 +446,70 @@ def bootstrap_site_files(domain: str) -> RuntimeResult:
     if (root / "index.php").exists() and (root / "wp-config.php").exists():
         return RuntimeResult(0, "wordpress files already bootstrapped", ran=True)
 
+    index_existed = (root / "index.php").exists()
+    config_existed = (root / "wp-config.php").exists()
+    if os.environ.get("WPFY_SKIP_WORDPRESS_DOWNLOAD", "0") == "1":
+        if not index_existed:
+            (root / "index.php").write_text("<?php echo 'wpfy bootstrap placeholder';\n", encoding="utf-8")
+        if not config_existed:
+            (root / "wp-config.php").write_text(
+                _wordpress_config_content(read_env(env_path(domain))), encoding="utf-8"
+            )
+        return RuntimeResult(
+            0,
+            "wordpress download skipped by WPFY_SKIP_WORDPRESS_DOWNLOAD=1; placeholder files created",
+            skipped=True,
+        )
+
     try:
-        if os.environ.get("WPFY_SKIP_WORDPRESS_DOWNLOAD", "0") == "1":
-            raise RuntimeError("wordpress download skipped by WPFY_SKIP_WORDPRESS_DOWNLOAD=1")
         with tempfile.TemporaryDirectory(prefix="wpfy-wordpress-") as temp_dir:
-            archive_path = Path(temp_dir) / "latest.tar.gz"
-            with urlopen("https://wordpress.org/latest.tar.gz", timeout=15) as response:
-                archive_path.write_bytes(response.read())
+            version = _wordpress_release_version()
+            archive_url = f"https://wordpress.org/wordpress-{version}.tar.gz"
+            expected_sha1 = _wordpress_release_sha1(archive_url)
+            archive_path = Path(temp_dir) / f"wordpress-{version}.tar.gz"
+            actual_sha1 = hashlib.sha1()
+            with (
+                urlopen(archive_url, timeout=15) as response,
+                archive_path.open("wb") as archive_file,
+            ):
+                while chunk := response.read(WORDPRESS_DOWNLOAD_CHUNK_SIZE):
+                    archive_file.write(chunk)
+                    actual_sha1.update(chunk)
+            if not secrets.compare_digest(actual_sha1.hexdigest(), expected_sha1):
+                raise ValueError("WordPress release digest mismatch")
             with tarfile.open(archive_path, "r:gz") as archive:
                 _extract_tar_safely(archive, temp_dir)
 
             wordpress_root = Path(temp_dir) / "wordpress"
-            if wordpress_root.exists():
-                for child in wordpress_root.iterdir():
-                    destination = root / child.name
-                    if child.is_dir():
-                        if destination.exists():
-                            shutil.rmtree(destination)
-                        shutil.copytree(child, destination)
-                    else:
-                        shutil.copy2(child, destination)
+            if not wordpress_root.is_dir():
+                raise FileNotFoundError("downloaded archive does not contain a wordpress directory")
+            for child in wordpress_root.iterdir():
+                destination = root / child.name
+                if child.is_dir():
+                    shutil.copytree(child, destination, dirs_exist_ok=True)
+                else:
+                    shutil.copy2(child, destination)
 
             sample = root / "wp-config-sample.php"
             if sample.exists():
-                (root / "wp-config.php").write_text(_wordpress_config_content(read_env(env_path(domain))), encoding="utf-8")
+                (root / "wp-config.php").write_text(
+                    _wordpress_config_content(read_env(env_path(domain))), encoding="utf-8"
+                )
 
             if not (root / "index.php").exists():
                 (root / "index.php").write_text("<?php require __DIR__ . '/wp-blog-header.php';\n", encoding="utf-8")
 
-            return RuntimeResult(0, "wordpress core bootstrapped from wordpress.org", ran=True)
-    except Exception:
-        if not (root / "index.php").exists():
-            (root / "index.php").write_text("<?php echo 'wpfy bootstrap placeholder';\n", encoding="utf-8")
-        if not (root / "wp-config.php").exists():
-            (root / "wp-config.php").write_text(_wordpress_config_content(read_env(env_path(domain))), encoding="utf-8")
-        return RuntimeResult(0, "wordpress bootstrap fallback created placeholder files", skipped=True)
+            return RuntimeResult(
+                0,
+                f"wordpress core {version} verified and bootstrapped from wordpress.org",
+                ran=True,
+            )
+    except (OSError, UnicodeError, tarfile.TarError, TypeError, ValueError) as exc:
+        if not index_existed:
+            (root / "index.php").unlink(missing_ok=True)
+        if not config_existed:
+            (root / "wp-config.php").unlink(missing_ok=True)
+        return RuntimeResult(3, f"wordpress bootstrap failed: {exc}")
 
 
 def backup_site(
@@ -706,6 +520,7 @@ def backup_site(
     s3_profile: str | None = None,
     keep_local: int | None = None,
     uploader: S3Uploader | None = None,
+    require_database: bool = False,
 ) -> RuntimeResult:
     validate_domain(domain)
     if not site_exists(domain):
@@ -716,45 +531,80 @@ def backup_site(
     backups.chmod(0o750)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
     archive_path = backups / f"{domain}-{stamp}.tar.gz"
-    sql_path = backups / f"{domain}-{stamp}.sql"
+    archive_staging = backups / f"{domain}-{stamp}.tar.gz.part"
+    sql_staging = backups / f"{domain}-{stamp}.sql.part"
     suffix = 1
-    while archive_path.exists() or sql_path.exists():
+    while archive_path.exists() or archive_staging.exists() or sql_staging.exists():
         archive_path = backups / f"{domain}-{stamp}-{suffix}.tar.gz"
-        sql_path = backups / f"{domain}-{stamp}-{suffix}.sql"
+        archive_staging = backups / f"{domain}-{stamp}-{suffix}.tar.gz.part"
+        sql_staging = backups / f"{domain}-{stamp}-{suffix}.sql.part"
         suffix += 1
 
-    if docker_available() and not runtime_skip_requested():
-        proc = compose_command(domain, "exec", "-T", "db", "sh", "-lc", 'mariadb-dump --single-transaction -u"$MARIADB_USER" -p"$MARIADB_PASSWORD" "$MARIADB_DATABASE"')
-        if proc.returncode == 0 and proc.stdout.strip():
-            sql_path.write_text(proc.stdout, encoding="utf-8")
-            sql_path.chmod(0o600)
+    flavor = read_env(env_path(domain)).get("SITE_FLAVOR", "site")
+    database_required = flavor in MYSQL_FLAVORS
+    database_included = False
+    try:
+        if database_required and docker_available() and not runtime_skip_requested():
+            with sql_staging.open("w", encoding="utf-8") as sql_file:
+                sql_staging.chmod(0o600)
+                proc = subprocess.run(
+                    [
+                        "docker", "compose", "exec", "-T", "db", "sh", "-lc",
+                        'mariadb-dump --single-transaction -u"$MARIADB_USER" '
+                        '-p"$MARIADB_PASSWORD" "$MARIADB_DATABASE"',
+                    ],
+                    cwd=site_dir(domain),
+                    check=False,
+                    text=True,
+                    stdout=sql_file,
+                    stderr=subprocess.PIPE,
+                )
+            if proc.returncode != 0 or sql_staging.stat().st_size == 0:
+                error = proc.stderr.strip() or "database dump was empty"
+                return RuntimeResult(3, f"database backup failed: {error}")
+            database_included = True
+        elif database_required and require_database:
+            return RuntimeResult(3, "database backup required but Docker runtime was unavailable or skipped")
 
-    with tarfile.open(archive_path, "w:gz") as archive:
-        for entry in (compose_path(domain), env_path(domain), app_dir(domain), nginx_dir(domain), php_dir(domain)):
-            if entry is None or not entry.exists():
-                continue
-            archive.add(entry, arcname=str(Path(domain) / entry.name), recursive=True)
-        if sql_path.exists():
-            archive.add(sql_path, arcname=str(Path(domain) / "backups" / sql_path.name), recursive=False)
-    archive_path.chmod(0o600)
+        with tarfile.open(archive_staging, "w:gz") as archive:
+            for entry in (compose_path(domain), env_path(domain), app_dir(domain), nginx_dir(domain), php_dir(domain)):
+                if entry is None or not entry.exists():
+                    continue
+                archive.add(entry, arcname=str(Path(domain) / entry.name), recursive=True)
+            if database_included:
+                archive.add(
+                    sql_staging,
+                    arcname=str(Path(domain) / "backups" / f"{archive_path.name.removesuffix('.tar.gz')}.sql"),
+                    recursive=False,
+                )
+        archive_staging.chmod(0o600)
 
-    # Verify archive integrity
-    verify = subprocess.run(
-        ["tar", "-tzf", str(archive_path)],
-        check=False, capture_output=True, text=True,
-    )
-    if verify.returncode != 0:
-        err = verify.stderr.strip() or verify.stdout.strip() or "tar verification failed"
-        return RuntimeResult(3, f"backup archive verification failed: {err}")
+        with tarfile.open(archive_staging, "r:gz") as archive:
+            sql_members = [name for name in archive.getnames() if name.endswith(".sql")]
+        if database_included and len(sql_members) != 1:
+            return RuntimeResult(3, "backup archive verification failed: database member missing or duplicated")
+        if require_database and database_required and len(sql_members) != 1:
+            return RuntimeResult(3, "backup archive is incomplete: database member missing")
+        archive_staging.replace(archive_path)
+    except (OSError, tarfile.TarError) as exc:
+        return RuntimeResult(3, f"backup creation failed: {exc}")
+    finally:
+        sql_staging.unlink(missing_ok=True)
+        archive_staging.unlink(missing_ok=True)
 
     message = f"backup created: {archive_path}"
+    if database_required and not database_included:
+        message = f"{message}; database not included"
     if destination_dir is not None:
-        destination = Path(destination_dir)
-        destination.mkdir(parents=True, exist_ok=True)
-        destination.chmod(0o700)
-        copied_archive = destination / archive_path.name
-        shutil.copy2(archive_path, copied_archive)
-        copied_archive.chmod(0o600)
+        try:
+            destination = Path(destination_dir)
+            destination.mkdir(parents=True, exist_ok=True)
+            destination.chmod(0o700)
+            copied_archive = destination / archive_path.name
+            shutil.copy2(archive_path, copied_archive)
+            copied_archive.chmod(0o600)
+        except OSError as exc:
+            return RuntimeResult(3, f"{message}; destination copy failed: {exc}", ran=True)
         message = f"{message}; copied to: {copied_archive}"
 
     if upload_s3:
@@ -776,19 +626,6 @@ def backup_site(
         message = f"{message}; retention: {prune.message}"
 
     return RuntimeResult(0, message, ran=True)
-
-
-def _wait_for_service(domain: str, service: str, timeout_seconds: int = 60) -> RuntimeResult:
-    deadline = time.monotonic() + timeout_seconds
-    last_status = "unknown"
-    while time.monotonic() < deadline:
-        statuses = _compose_service_health(domain, service)
-        if statuses and all(status in {"healthy", "running"} for status in statuses):
-            return RuntimeResult(0, f"{service} ready", ran=True)
-        if statuses:
-            last_status = ",".join(statuses)
-        time.sleep(2)
-    return RuntimeResult(1, f"{service} not ready after {timeout_seconds}s (last status: {last_status})")
 
 
 def _php_single_quoted(value: str) -> str:
@@ -967,13 +804,18 @@ def _extract_tar_safely(archive: tarfile.TarFile, destination: str) -> None:
 
 
 def _restore_archive_to_temp(source: Path, domain: str, temp_dir: str) -> RuntimeResult | None:
-    with tarfile.open(source, "r:gz") as archive:
-        members = archive.getmembers()
-        for member in members:
-            error = _validate_restore_member(member, domain)
-            if error:
-                return RuntimeResult(2, error)
-        archive.extractall(temp_dir, members=members)
+    try:
+        with tarfile.open(source, "r:gz") as archive:
+            members = archive.getmembers()
+            for member in members:
+                error = _validate_restore_member(member, domain)
+                if error:
+                    return RuntimeResult(2, error)
+            archive.extractall(temp_dir, members=members)
+    except tarfile.TarError as exc:
+        return RuntimeResult(2, f"invalid backup archive: {exc}")
+    except OSError as exc:
+        return RuntimeResult(3, f"failed to read or extract backup archive: {exc}")
     return None
 
 
@@ -1071,30 +913,23 @@ def restore_site(domain: str, archive_path: str) -> RuntimeResult:
             if db_ready.exit_code != 0:
                 return db_ready
             latest_sql = sql_files[-1]
-            proc = subprocess.run(
-                ["docker", "compose", "exec", "-T", "db", "sh", "-lc", 'mariadb -u"$MARIADB_USER" -p"$MARIADB_PASSWORD" "$MARIADB_DATABASE"'],
-                cwd=target,
-                check=False,
-                text=True,
-                input=latest_sql.read_text(encoding="utf-8"),
-                capture_output=True,
-            )
+            with latest_sql.open("r", encoding="utf-8") as sql_file:
+                proc = subprocess.run(
+                    [
+                        "docker", "compose", "exec", "-T", "db", "sh", "-lc",
+                        'mariadb -u"$MARIADB_USER" -p"$MARIADB_PASSWORD" "$MARIADB_DATABASE"',
+                    ],
+                    cwd=target,
+                    check=False,
+                    text=True,
+                    stdin=sql_file,
+                    capture_output=True,
+                )
             if proc.returncode != 0:
                 message = proc.stderr.strip() or proc.stdout.strip() or "database restore failed"
                 return RuntimeResult(proc.returncode, message)
 
     return RuntimeResult(0, f"site restored from {archive_path}", ran=True)
-
-
-def site_exists(domain: str) -> bool:
-    # Validate before touching the filesystem so traversal-shaped input
-    # (e.g. "../../etc") can never resolve to a path outside the sites dir,
-    # even from callers that gate only on existence.
-    try:
-        validate_domain(domain)
-    except ValueError:
-        return False
-    return compose_path(domain).exists() and env_path(domain).exists()
 
 
 def list_sites() -> list[dict[str, str]]:

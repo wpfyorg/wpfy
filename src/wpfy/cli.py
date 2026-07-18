@@ -28,6 +28,7 @@ from . import backup_schedule
 from . import cron
 from . import dns
 from . import edge_backup
+from . import panel
 from . import registry
 from . import smtp
 from . import sftp
@@ -53,28 +54,32 @@ from .site_layout import (
     REDIS_IMAGE,
     WORDPRESS_FLAVORS,
     backup_site,
-    compose_command,
-    compose_path,
-    domain_to_project,
-    env_path,
     ensure_site_scaffold,
     generated_secret,
     latest_backup_archive,
     list_backup_archives,
     list_sites,
-    nginx_conf_path,
-    read_env,
     remove_site_scaffold,
     prune_backup_archives,
     restore_site,
+    site_info,
+)
+from .site_paths import (
+    compose_path,
+    domain_to_project,
+    env_path,
+    read_env,
+    site_dir,
+    site_exists,
+    validate_domain,
+)
+from .site_runtime import (
+    RuntimeResult,
+    compose_command,
     runtime_skip_requested,
     site_health,
-    site_info,
-    site_exists,
-    site_dir,
     start_site_runtime,
     stop_site_runtime,
-    validate_domain,
 )
 
 
@@ -254,6 +259,7 @@ def build_parser() -> argparse.ArgumentParser:
     add_refresh_parser(subparsers)
     add_healthcheck_parser(subparsers)
     add_motd_parser(subparsers)
+    add_panel_parser(subparsers)
     add_utility_parser(subparsers)
     add_stack_parser(subparsers)
     add_sftp_parser(subparsers)
@@ -275,9 +281,10 @@ def add_info_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentPars
         help="Show aggregate or per-site configuration details.",
     )
     parser.add_argument("domain", nargs="?")
-    parser.add_argument("--nginx", action="store_true")
-    parser.add_argument("--php", action="store_true")
-    parser.add_argument("--mysql", action="store_true")
+    services = parser.add_mutually_exclusive_group()
+    services.add_argument("--nginx", action="store_true")
+    services.add_argument("--php", action="store_true")
+    services.add_argument("--mysql", action="store_true")
     parser.set_defaults(handler=handle_info)
 
 
@@ -360,75 +367,13 @@ def _resolve_wp_admin_credentials(args: argparse.Namespace, domain: str) -> site
     )
 
 
-def _site_is_running(domain: str) -> bool:
-    proc = compose_command(domain, "ps")
-    return proc.returncode == 0 and any(line.strip() for line in proc.stdout.splitlines()[1:])
-
-
-def _nginx_info(domain: str) -> str:
-    project = domain_to_project(domain)
-    lines = [f"nginx service ({project}-web):"]
-    compose_file = compose_path(domain)
-    if compose_file.exists():
-        compose_text = compose_file.read_text(encoding="utf-8")
-        in_web = False
-        web_block = []
-        for line in compose_text.splitlines():
-            if line.strip().startswith("web:"):
-                in_web = True
-            if in_web:
-                web_block.append(line)
-                stripped = line.strip()
-                if stripped and not stripped.startswith("#") and not stripped.startswith("  ") and not stripped.startswith("\t"):
-                    if not stripped.startswith(" "):
-                        break
-        if web_block:
-            lines.append("  compose.yaml web service:")
-            for l in web_block[:40]:
-                lines.append("    " + l)
-    nginx_conf = nginx_conf_path(domain)
-    if nginx_conf.exists():
-        lines.append(f"\n  mounted nginx conf ({nginx_conf}):")
-        for l in nginx_conf.read_text(encoding="utf-8").splitlines():
-            lines.append("    " + l)
-    else:
-        lines.append("\n  nginx conf: not found")
-    return "\n".join(lines)
-
-
-def _php_info(domain: str) -> str:
-    project = domain_to_project(domain)
-    lines = [f"php service ({project}-app):"]
-    if not _site_is_running(domain):
-        return "\n".join(lines) + "\n  status: stopped (run 'wpfy site create' or start runtime to query live config)"
-    proc = compose_command(domain, "exec", "-T", "app", "php", "-m")
-    if proc.returncode == 0:
-        lines.append("  loaded modules:")
-        for line in proc.stdout.splitlines():
-            lines.append("    " + line)
-    else:
-        err = proc.stderr.strip() or proc.stdout.strip() or "docker compose exec failed"
-        lines.append(f"  query failed: {err}")
-    return "\n".join(lines)
-
-
-def _mysql_info(domain: str) -> str:
-    project = domain_to_project(domain)
-    lines = [f"mysql service ({project}-db):"]
-    if not _site_is_running(domain):
-        return "\n".join(lines) + "\n  status: stopped (run 'wpfy site create' or start runtime to query live config)"
-    proc = compose_command(
-        domain, "exec", "-T", "db", "mariadb",
-        "-e", "SHOW VARIABLES WHERE Variable_name IN ('version','max_connections','innodb_buffer_pool_size','datadir')"
-    )
-    if proc.returncode == 0:
-        lines.append("  config variables:")
-        for line in proc.stdout.splitlines():
-            lines.append("    " + line)
-    else:
-        err = proc.stderr.strip() or proc.stdout.strip() or "docker compose exec failed"
-        lines.append(f"  query failed: {err}")
-    return "\n".join(lines)
+def _render_service_info(info: operational_inspection.ServiceInfo) -> CommandResult:
+    lines = [_section(info.heading)]
+    for check in info.checks:
+        lines.append(f"{check.name}:")
+        lines.extend(f"  {line}" for line in check.message.splitlines())
+    failed = any(check.ok is False for check in info.checks)
+    return CommandResult("\n".join(lines), exit_code=1 if failed else 0)
 
 
 def handle_info(args: argparse.Namespace) -> CommandResult:
@@ -462,17 +407,17 @@ def handle_info(args: argparse.Namespace) -> CommandResult:
     if want_nginx:
         if not site_exists(domain):
             return CommandResult(f"site not found: {domain}", exit_code=2)
-        return CommandResult(_nginx_info(domain))
+        return _render_service_info(operational_inspection.nginx_service_info(domain))
 
     if want_php:
         if not site_exists(domain):
             return CommandResult(f"site not found: {domain}", exit_code=2)
-        return CommandResult(_php_info(domain))
+        return _render_service_info(operational_inspection.php_service_info(domain))
 
     if want_mysql:
         if not site_exists(domain):
             return CommandResult(f"site not found: {domain}", exit_code=2)
-        return CommandResult(_mysql_info(domain))
+        return _render_service_info(operational_inspection.mysql_service_info(domain))
 
     if not domain:
         return CommandResult("site name required", exit_code=2)
@@ -671,9 +616,10 @@ def add_maintenance_parser(subparsers: argparse._SubParsersAction[argparse.Argum
         help="Update system packages.",
     )
     parser.add_argument("domain", nargs="?", help="site domain")
-    parser.add_argument("--enable", action="store_true", help="enable maintenance mode (stop app container)")
-    parser.add_argument("--disable", action="store_true", help="disable maintenance mode (start app container)")
-    parser.add_argument("--status", action="store_true", help="show maintenance status")
+    actions = parser.add_mutually_exclusive_group()
+    actions.add_argument("--enable", action="store_true", help="enable maintenance mode (stop app container)")
+    actions.add_argument("--disable", action="store_true", help="disable maintenance mode (start app container)")
+    actions.add_argument("--status", action="store_true", help="show maintenance status")
     parser.set_defaults(handler=handle_maintenance)
 
 
@@ -698,14 +644,46 @@ def handle_maintenance(args: argparse.Namespace) -> CommandResult:
         return CommandResult(_render_summary("maintenance mode", [f"domain: {domain}", f"state: {maintenance_state}"]))
 
     if enable:
-        compose_command(domain, "stop", "app")
-        registry.update_site(domain, {"maintenance": "enabled"})
-        return CommandResult(_render_summary("maintenance mode", [f"domain: {domain}", "action: enabled (app container stopped)"]))
+        try:
+            proc = compose_command(domain, "stop", "app")
+        except OSError as exc:
+            return CommandResult(f"maintenance enable failed: {exc}", exit_code=1)
+        if proc.returncode != 0:
+            error = (
+                proc.stderr.strip() or proc.stdout.strip() or "docker compose stop failed"
+            ).splitlines()[-1]
+            return CommandResult(f"maintenance enable failed: {error}", exit_code=proc.returncode or 1)
+        try:
+            registry.update_site(domain, {"maintenance": "enabled"})
+        except OSError as exc:
+            return CommandResult(
+                f"maintenance runtime enabled but registry update failed: {exc}", exit_code=1
+            )
+        return CommandResult(_render_summary(
+            "maintenance mode",
+            [f"domain: {domain}", "action: enabled (app container stopped)"],
+        ))
 
     if disable:
-        compose_command(domain, "start", "app")
-        registry.update_site(domain, {"maintenance": "disabled"})
-        return CommandResult(_render_summary("maintenance mode", [f"domain: {domain}", "action: disabled (app container started)"]))
+        try:
+            proc = compose_command(domain, "start", "app")
+        except OSError as exc:
+            return CommandResult(f"maintenance disable failed: {exc}", exit_code=1)
+        if proc.returncode != 0:
+            error = (
+                proc.stderr.strip() or proc.stdout.strip() or "docker compose start failed"
+            ).splitlines()[-1]
+            return CommandResult(f"maintenance disable failed: {error}", exit_code=proc.returncode or 1)
+        try:
+            registry.update_site(domain, {"maintenance": "disabled"})
+        except OSError as exc:
+            return CommandResult(
+                f"maintenance runtime disabled but registry update failed: {exc}", exit_code=1
+            )
+        return CommandResult(_render_summary(
+            "maintenance mode",
+            [f"domain: {domain}", "action: disabled (app container started)"],
+        ))
 
     return CommandResult(_render_summary("maintenance mode", ["no action taken"]))
 
@@ -716,8 +694,9 @@ def add_update_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentPa
         "update",
         help="Check for and install new wpfy releases.",
     )
-    parser.add_argument("--check", action="store_true", help="check for available updates (PyPI)")
-    parser.add_argument("--force", action="store_true", help="force upgrade wpfy via pip")
+    actions = parser.add_mutually_exclusive_group()
+    actions.add_argument("--check", action="store_true", help="check published version metadata (PyPI)")
+    actions.add_argument("--force", action="store_true", help="force upgrade wpfy via pip")
     parser.set_defaults(handler=handle_update)
 
 
@@ -750,19 +729,29 @@ def handle_update(args: argparse.Namespace) -> CommandResult:
         with urlopen(req, timeout=10) as resp:
             pypi_data = json.loads(resp.read().decode())
         latest = pypi_data["info"]["version"]
-    except (URLError, json.JSONDecodeError, KeyError, OSError) as e:
+        if not isinstance(latest, str) or not latest.strip():
+            raise ValueError("PyPI version is missing or invalid")
+    except (URLError, json.JSONDecodeError, KeyError, TypeError, ValueError, OSError) as e:
         if force:
             return CommandResult(_render_summary("wpfy update", [f"version: {current_version}", f"FAIL cannot fetch latest version from PyPI: {e}"]), exit_code=2)
         return CommandResult(_render_summary("wpfy update", [f"version: {current_version}", f"PyPI check unavailable: {e}"]))
 
     if check:
         if current_version == latest:
-            return CommandResult(_render_summary("wpfy update", [f"version: {current_version}", "status: up-to-date"]))
-        return CommandResult(_render_summary("wpfy update", [f"version: {current_version}", f"status: update available: {latest}", "hint: use --force to upgrade"]))
+            return CommandResult(_render_summary("wpfy update", [f"installed: {current_version}", "status: up-to-date"]))
+        return CommandResult(_render_summary(
+            "wpfy update",
+            [
+                f"installed: {current_version}",
+                f"latest published: {latest}",
+                "status: installed and published versions differ",
+                "hint: use --force to run pip upgrade",
+            ],
+        ))
 
     if force:
         if current_version == latest:
-            return CommandResult(_render_summary("wpfy update", [f"version: {current_version}", "status: already latest"]))
+            return CommandResult(_render_summary("wpfy update", [f"installed: {current_version}", "status: already latest"]))
         proc = subprocess.run(
             [sys.executable, "-m", "pip", "install", "--upgrade", "wpfy"],
             check=False, capture_output=True, text=True,
@@ -770,7 +759,14 @@ def handle_update(args: argparse.Namespace) -> CommandResult:
         if proc.returncode != 0:
             err = proc.stderr.strip() or proc.stdout.strip() or "pip install failed"
             return CommandResult(_render_summary("wpfy update", [f"version: {current_version}", f"FAIL upgrade failed: {err}"]), exit_code=proc.returncode)
-        return CommandResult(_render_summary("wpfy update", [f"version: {current_version} -> {latest}", "status: upgraded"]))
+        return CommandResult(_render_summary(
+            "wpfy update",
+            [
+                f"installed before command: {current_version}",
+                f"latest published: {latest}",
+                "status: pip upgrade command completed",
+            ],
+        ))
 
     return CommandResult(_render_summary("wpfy update", [f"version: {current_version}"]))
 
@@ -1869,6 +1865,50 @@ def handle_motd(args: argparse.Namespace) -> CommandResult:
     return CommandResult("\n".join(lines))
 
 
+def add_panel_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+    parser = _add_parser(
+        subparsers,
+        "panel",
+        help="Serve the local browser control panel (loopback only).",
+        epilog=(
+            "The panel binds to a loopback address and requires the printed token.\n"
+            "Remote access: ssh -L 8642:127.0.0.1:8642 <server>, then open the URL locally.\n"
+        ),
+    )
+    parser.add_argument("--host", default="127.0.0.1", help="loopback address to bind")
+    parser.add_argument("--port", type=int, default=panel.DEFAULT_PANEL_PORT, help="port to listen on")
+    parser.add_argument("--token", help="access token (default: generate a fresh one per run)")
+    parser.set_defaults(handler=handle_panel)
+
+
+def handle_panel(args: argparse.Namespace) -> CommandResult:
+    token = args.token or panel.generate_panel_token()
+    config = panel.PanelConfig(host=args.host, port=args.port, token=token)
+    try:
+        server = panel.make_panel_server(config)
+    except ValueError as exc:
+        return CommandResult(str(exc), exit_code=2)
+    except OSError as exc:
+        return CommandResult(f"panel could not bind {args.host}:{args.port}: {exc}", exit_code=2)
+
+    actual_port = server.server_address[1]
+    print(
+        _render_summary("wpfy panel", [
+            f"listening: http://{args.host}:{actual_port}/",
+            f"open: {panel.panel_url(config, actual_port)}",
+            "the URL carries a one-time access token; press Ctrl+C to stop",
+        ]),
+        flush=True,
+    )
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
+    return CommandResult("panel stopped")
+
+
 SAFE_USERNAME_RE: Final = re.compile(r"^[A-Za-z0-9_.@-]+$")
 PASSWORD_SYMBOLS: Final = "!#$%&()*+,-./:;<=>?@[]^_{|}~"
 
@@ -2084,9 +2124,6 @@ def add_site_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentPars
             site_parser.add_argument("domain", nargs="?")
         if name == "delete":
             site_parser.add_argument("--force", action="store_true", help="skip confirmation prompt")
-        if name == "list":
-            site_parser.add_argument("--enabled", action="store_true")
-            site_parser.add_argument("--disabled", action="store_true")
         site_parser.set_defaults(handler=make_site_handler(name))
 
     update = _add_parser(
@@ -2331,10 +2368,17 @@ def handle_log_reset(args: argparse.Namespace) -> CommandResult:
 
 
 def make_site_handler(name: str):
+    if name not in {"delete", "list", "info", "show", "status"}:
+        raise ValueError(f"unsupported site handler: {name}")
+
     def handler(args: argparse.Namespace) -> CommandResult:
         domain = getattr(args, "domain", None)
         if name == "list":
-            sites = list_sites()
+            try:
+                registry.sync_from_filesystem()
+                sites = registry.list_sites()
+            except (OSError, ValueError) as exc:
+                return CommandResult(f"site list reconciliation failed: {exc}", exit_code=1)
             if not sites:
                 return CommandResult(_render_summary("managed sites", ["no managed sites found"]))
             lines = [_section(f"managed sites ({len(sites)})")]
@@ -2419,9 +2463,22 @@ def make_site_handler(name: str):
                 if answer.strip().lower() not in ("y", "yes"):
                     return CommandResult(f"delete aborted")
             try:
-                backup_result = backup_site(domain)
+                backup_result = backup_site(domain, require_database=True)
+                if backup_result.exit_code != 0 or backup_result.skipped:
+                    return CommandResult(
+                        _render_summary(
+                            "site delete",
+                            [
+                                f"domain: {domain}",
+                                _step_line("backup", backup_result),
+                                "runtime: SKIP blocked by backup failure",
+                                "files: kept",
+                            ],
+                        ),
+                        exit_code=backup_result.exit_code or 1,
+                    )
                 stop_result = stop_site_runtime(domain, remove_volumes=True)
-                if stop_result.exit_code != 0 and not force:
+                if stop_result.exit_code != 0 or stop_result.skipped:
                     return CommandResult(
                         _render_summary(
                             "site delete",
@@ -2432,7 +2489,7 @@ def make_site_handler(name: str):
                                 "files: kept",
                             ],
                         ),
-                        exit_code=stop_result.exit_code,
+                        exit_code=stop_result.exit_code or 1,
                     )
                 removed = remove_site_scaffold(domain)
             except (FileNotFoundError, ValueError) as exc:
@@ -2448,9 +2505,7 @@ def make_site_handler(name: str):
                 return CommandResult("\n".join(lines))
             return CommandResult(f"site not found: {domain}", exit_code=2)
 
-        if domain:
-            return CommandResult(_render_summary(name, [f"domain: {domain}", "result: scaffolded"]))
-        return CommandResult(_render_summary(name, ["result: scaffolded"]))
+        raise AssertionError(f"unhandled site handler: {name}")
 
     return handler
 
@@ -3030,15 +3085,23 @@ def handle_backup_remote(args: argparse.Namespace) -> CommandResult:
             return CommandResult("no remote backup archives found", exit_code=2)
         if not _remote_key_allowed(config, args.domain, key):
             return CommandResult("remote key outside managed backup prefix", exit_code=2)
-        try:
-            payload = uploader.download_bytes(config, key)
-        except (OSError, RuntimeError) as exc:
-            return CommandResult(f"download: FAIL {redact_s3_secrets(str(exc), config)}", exit_code=4)
         with tempfile.NamedTemporaryFile(prefix="wpfy-remote-restore-", suffix=".tar.gz", delete=False) as archive:
-            archive.write(payload)
             archive_path = archive.name
         try:
-            result = restore_site(args.domain, archive_path)
+            try:
+                uploader.download_to_path(config, key, Path(archive_path))
+            except (OSError, RuntimeError, ValueError) as exc:
+                return CommandResult(
+                    f"download: FAIL {redact_s3_secrets(str(exc), config)}",
+                    exit_code=4,
+                )
+            try:
+                result = restore_site(args.domain, archive_path)
+            except (OSError, RuntimeError, ValueError) as exc:
+                return CommandResult(
+                    f"restore: FAIL {redact_s3_secrets(str(exc), config)}",
+                    exit_code=4,
+                )
         finally:
             Path(archive_path).unlink(missing_ok=True)
         return CommandResult(_render_summary("backup remote restore", [_step_line("restore", result)]), result.exit_code)

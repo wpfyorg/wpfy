@@ -1,0 +1,160 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>wpfy panel</title>
+<link rel="stylesheet" href="/panel.css">
+</head>
+<body>
+<div id="gate" class="gate hidden">
+  <form id="gate-form" class="gate-card">
+    <div class="wordmark">wpfy <span class="mono-label">control panel</span></div>
+    <p>Paste the access token printed by <code>wpfy panel</code>.</p>
+    <input id="gate-token" type="password" placeholder="access token" autocomplete="off" required>
+    <button type="submit" class="btn btn-primary">Unlock</button>
+    <p id="gate-error" class="error hidden">That token was rejected.</p>
+  </form>
+</div>
+
+<div id="app" class="app hidden">
+  <header class="topbar">
+    <div class="wordmark">wpfy <span class="mono-label">control panel</span></div>
+    <div class="chips">
+      <span class="chip" id="chip-version">–</span>
+      <span class="chip" id="chip-docker">docker: –</span>
+      <span class="chip" id="chip-traefik">traefik: –</span>
+      <span class="chip" id="chip-warnings">warnings: –</span>
+      <button class="btn btn-ghost" id="btn-refresh">Refresh</button>
+      <button class="btn btn-ghost" id="btn-lock">Lock</button>
+    </div>
+  </header>
+
+  <main>
+    <section class="stats" id="stats"></section>
+
+    <section class="panel">
+      <div class="panel-head">
+        <h2>Sites</h2>
+        <span class="mono-label" id="sites-count"></span>
+      </div>
+      <div class="table-wrap">
+        <table id="sites-table">
+          <thead>
+            <tr><th>Domain</th><th>Type</th><th>PHP</th><th>SSL</th><th>Cache</th><th></th></tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <p id="sites-empty" class="empty hidden">No managed sites yet. Create one with <code>wpfy run example.com --wp</code>.</p>
+    </section>
+
+    <section class="panel hidden" id="detail">
+      <div class="panel-head">
+        <h2 id="detail-domain"></h2>
+        <div>
+          <button class="btn btn-ghost" data-runtime="start">Start</button>
+          <button class="btn btn-ghost" data-runtime="restart">Restart</button>
+          <button class="btn btn-danger-ghost" data-runtime="stop">Stop</button>
+          <button class="btn btn-ghost" id="detail-close">Close</button>
+        </div>
+      </div>
+      <nav class="tabs" id="tabs">
+        <button class="tab active" data-tab="overview">Overview</button>
+        <button class="tab" data-tab="logs">Logs</button>
+        <button class="tab" data-tab="backups">Backups</button>
+        <button class="tab" data-tab="sftp">SFTP</button>
+        <button class="tab" data-tab="wp">WP-CLI</button>
+        <button class="tab" data-tab="config">Config</button>
+      </nav>
+
+      <div class="tab-body" id="tab-overview">
+        <dl class="kv" id="site-kv"></dl>
+        <div class="row">
+          <button class="btn" id="btn-health">Check health</button>
+          <button class="btn" id="btn-diagnostics">Run diagnostics</button>
+        </div>
+        <div id="health-result"></div>
+        <ul class="checks" id="diag-result"></ul>
+      </div>
+
+      <div class="tab-body hidden" id="tab-logs">
+        <div class="row">
+          <label>Service
+            <select id="log-service">
+              <option value="">all</option>
+              <option value="web">web (nginx)</option>
+              <option value="app">app (php)</option>
+              <option value="db">db (mariadb)</option>
+              <option value="redis">redis</option>
+              <option value="sftp">sftp</option>
+            </select>
+          </label>
+          <label>Lines <input id="log-lines" type="number" value="200" min="1" max="2000"></label>
+          <button class="btn" id="btn-logs">Fetch logs</button>
+        </div>
+        <pre class="output" id="log-output">No logs fetched yet.</pre>
+      </div>
+
+      <div class="tab-body hidden" id="tab-backups">
+        <div class="row">
+          <button class="btn btn-primary" id="btn-backup">Create backup</button>
+          <span class="mono-label" id="backup-status"></span>
+        </div>
+        <div class="table-wrap">
+          <table id="backups-table">
+            <thead><tr><th>Archive</th><th>Size</th><th>Created</th><th></th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+        <p id="backups-empty" class="empty hidden">No backups yet.</p>
+      </div>
+
+      <div class="tab-body hidden" id="tab-sftp">
+        <div class="row">
+          <button class="btn" id="btn-sftp-enable">Enable SFTP</button>
+          <button class="btn btn-danger-ghost" id="btn-sftp-disable">Disable SFTP</button>
+        </div>
+        <pre class="output" id="sftp-output">Loading…</pre>
+      </div>
+
+      <div class="tab-body hidden" id="tab-wp">
+        <p class="hint">Runs inside the site's isolated wp-cli container, e.g. <code>plugin list</code> or <code>option get siteurl</code>.</p>
+        <div class="row">
+          <input id="wp-input" type="text" placeholder="wp arguments, e.g. plugin list" spellcheck="false">
+          <button class="btn btn-primary" id="btn-wp">Run</button>
+        </div>
+        <pre class="output" id="wp-output">No command run yet.</pre>
+      </div>
+
+      <div class="tab-body hidden" id="tab-config">
+        <div class="row">
+          <label>PHP version
+            <select id="config-php">
+              <option>7.4</option><option>8.0</option><option>8.1</option>
+              <option>8.2</option><option>8.3</option><option>8.4</option>
+            </select>
+          </label>
+          <button class="btn" id="btn-config">Apply</button>
+        </div>
+        <pre class="output" id="config-output">Changing the PHP version regenerates the site scaffold and restarts its containers.</pre>
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-head">
+        <h2>System diagnostics</h2>
+        <button class="btn" id="btn-sysdiag">Run</button>
+      </div>
+      <ul class="checks" id="sysdiag-result"></ul>
+    </section>
+  </main>
+
+  <footer class="foot mono-label">wpfy panel · loopback only · token protected</footer>
+</div>
+
+<div id="toast" class="toast hidden"></div>
+<script src="/panel.js"></script>
+</body>
+</html>

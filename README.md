@@ -312,6 +312,24 @@ wpfy sftp example.com --disable
 
 Enabling SFTP adds an isolated `atmoz/sftp` container to the site's stack, chrooted to the site's docroot, with a unique host port allocated from 2222 upward. The username is `sftpuser`; the generated password is shown once at enable time. Disabling removes the container and its compose service. SFTP is per-site and off by default.
 
+## Browser control panel
+
+```bash
+wpfy panel                    # serve on 127.0.0.1:8642 with a fresh token
+wpfy panel --port 9000        # different port
+wpfy panel --token <token>    # bring your own token (e.g. for scripted tunnels)
+```
+
+`wpfy panel` serves a local dashboard over the same operation layer the CLI uses — site table, health and diagnostics, container logs, backups and restore, runtime start/stop, SFTP toggle, a WP-CLI runner, and PHP version changes. It is **loopback-only by design**: the server refuses to bind non-loopback addresses, and every API request requires the bearer token printed at startup (the URL carries it in the fragment, which never reaches server logs).
+
+To use it from your workstation against a VPS, tunnel the port over SSH and open the printed URL locally:
+
+```bash
+ssh -L 8642:127.0.0.1:8642 user@your-server
+```
+
+The panel never returns `.env` or state secrets, destructive actions (stop, restore, SFTP disable) require confirmation in the UI, and nothing is exposed publicly — there is no public web admin surface.
+
 ## Example workflows
 
 **Launch a site behind Cloudflare:**

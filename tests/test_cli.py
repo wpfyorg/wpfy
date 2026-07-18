@@ -214,6 +214,42 @@ def test_maintenance_command_exists():
     assert exc_info.value.code == 0
 
 
+def test_maintenance_parser_rejects_multiple_actions():
+    with pytest.raises(SystemExit) as exc_info:
+        run(["maintenance", "example.com", "--enable", "--disable"])
+    assert exc_info.value.code == 2
+
+
+def test_maintenance_failure_does_not_update_registry(monkeypatch, capsys):
+    import wpfy.cli as cli
+
+    updates = []
+    monkeypatch.setattr(cli, "site_exists", lambda domain: True)
+    monkeypatch.setattr(cli, "compose_command", lambda *args: FakeProc(7, stderr="compose failed"))
+    monkeypatch.setattr(cli.registry, "update_site", lambda *args: updates.append(args))
+
+    result = run(["maintenance", "example.com", "--enable"])
+
+    assert result == 7
+    assert updates == []
+    assert "compose failed" in capsys.readouterr().out
+
+
+def test_maintenance_updates_registry_after_compose_success(monkeypatch):
+    import wpfy.cli as cli
+
+    calls = []
+    monkeypatch.setattr(cli, "site_exists", lambda domain: True)
+    monkeypatch.setattr(cli, "compose_command", lambda *args: calls.append(("compose", args)) or FakeProc())
+    monkeypatch.setattr(cli.registry, "update_site", lambda *args: calls.append(("registry", args)))
+
+    assert run(["maintenance", "example.com", "--disable"]) == 0
+    assert calls == [
+        ("compose", ("example.com", "start", "app")),
+        ("registry", ("example.com", {"maintenance": "disabled"})),
+    ]
+
+
 def test_update_command_exists():
     with pytest.raises(SystemExit) as exc_info:
         run(["update", "--help"])
@@ -704,6 +740,128 @@ def test_backup_remote_delete_requires_force(tmp_wpfy_home, monkeypatch, capsys)
 
     assert result == 2
     assert "backup remote delete aborted: --force required" in output
+
+
+def test_backup_remote_restore_uses_private_temp_file_and_cleans_up(monkeypatch, capsys):
+    import wpfy.cli as cli
+    from wpfy.s3_backup import S3Config
+
+    config = S3Config(
+        endpoint="https://storage.example.test",
+        bucket="site-backups",
+        region="auto",
+        prefix="daily",
+        access_key="access-key",
+        secret_key="secret-key",
+    )
+    key = "daily/example.com/example.com-20260701000000.tar.gz"
+    observed = {}
+
+    class FakeUploader:
+        def list_keys(self, config_arg, prefix):
+            return [key]
+
+        def download_to_path(self, config_arg, key_arg, destination):
+            destination.write_bytes(b"completed remote archive")
+            observed["path"] = destination
+            return destination
+
+    uploader = FakeUploader()
+    monkeypatch.setattr(cli, "_load_remote", lambda profile: (config, uploader, None))
+
+    def restore_site(domain, archive_path):
+        path = Path(archive_path)
+        observed["mode"] = stat.S_IMODE(path.stat().st_mode)
+        observed["payload"] = path.read_bytes()
+        return cli.RuntimeResult(0, "restored", ran=True)
+
+    monkeypatch.setattr(cli, "restore_site", restore_site)
+
+    result = cli.run(["backup", "remote", "restore", "example.com", "--latest"])
+    output = capsys.readouterr().out
+
+    assert result == 0
+    assert observed["mode"] == 0o600
+    assert observed["payload"] == b"completed remote archive"
+    assert not observed["path"].exists()
+    assert "restore: OK restored" in output
+
+
+def test_backup_remote_restore_cleans_interrupted_download(monkeypatch, capsys):
+    import wpfy.cli as cli
+    from wpfy.s3_backup import S3Config
+
+    config = S3Config(
+        endpoint="https://storage.example.test",
+        bucket="site-backups",
+        region="auto",
+        prefix="daily",
+        access_key="access-key",
+        secret_key="secret-key",
+    )
+    key = "daily/example.com/example.com-20260701000000.tar.gz"
+    observed = {}
+
+    class FakeUploader:
+        def list_keys(self, config_arg, prefix):
+            return [key]
+
+        def download_to_path(self, config_arg, key_arg, destination):
+            destination.write_bytes(b"partial")
+            observed["path"] = destination
+            raise OSError(f"interrupted for {config_arg.secret_key}")
+
+    uploader = FakeUploader()
+    monkeypatch.setattr(cli, "_load_remote", lambda profile: (config, uploader, None))
+    monkeypatch.setattr(cli, "restore_site", lambda *args: pytest.fail("restore called"))
+
+    result = cli.run(["backup", "remote", "restore", "example.com", "--latest"])
+    output = capsys.readouterr().out
+
+    assert result == 4
+    assert not observed["path"].exists()
+    assert "download: FAIL interrupted" in output
+    assert "secret-key" not in output
+
+
+def test_backup_remote_restore_cleans_unexpected_restore_error(monkeypatch, capsys):
+    import wpfy.cli as cli
+    from wpfy.s3_backup import S3Config
+
+    config = S3Config(
+        endpoint="https://storage.example.test",
+        bucket="site-backups",
+        region="auto",
+        prefix="daily",
+        access_key="access-key",
+        secret_key="secret-key",
+    )
+    key = "daily/example.com/example.com-20260701000000.tar.gz"
+    observed = {}
+
+    class FakeUploader:
+        def list_keys(self, config_arg, prefix):
+            return [key]
+
+        def download_to_path(self, config_arg, key_arg, destination):
+            destination.write_bytes(b"complete")
+            observed["path"] = destination
+            return destination
+
+    uploader = FakeUploader()
+    monkeypatch.setattr(cli, "_load_remote", lambda profile: (config, uploader, None))
+    monkeypatch.setattr(
+        cli,
+        "restore_site",
+        lambda *args: (_ for _ in ()).throw(RuntimeError("restore exploded")),
+    )
+
+    result = cli.run(["backup", "remote", "restore", "example.com", "--latest"])
+    output = capsys.readouterr().out
+
+    assert result == 4
+    assert not observed["path"].exists()
+    assert "restore: FAIL restore exploded" in output
 
 
 def test_dns_cloudflare_set_status_redacts_token(tmp_wpfy_home, monkeypatch, capsys):
@@ -1451,7 +1609,8 @@ def test_rm_alias_force_uses_existing_delete_flow(monkeypatch, capsys):
     monkeypatch.setattr(
         cli,
         "backup_site",
-        lambda domain: calls.append(("backup", domain)) or RuntimeResult(0, "backup created", ran=True),
+        lambda domain, **kwargs: calls.append(("backup", domain, kwargs))
+        or RuntimeResult(0, "backup created", ran=True),
     )
     monkeypatch.setattr(
         cli,
@@ -1467,7 +1626,7 @@ def test_rm_alias_force_uses_existing_delete_flow(monkeypatch, capsys):
 
     assert result == 0
     assert calls == [
-        ("backup", "example.com"),
+        ("backup", "example.com", {"require_database": True}),
         ("stop", "example.com", True),
         ("remove", "example.com"),
     ]
@@ -1482,7 +1641,7 @@ def test_site_delete_keeps_scaffold_when_runtime_stop_fails(monkeypatch, capsys)
 
     removed = []
     monkeypatch.setattr(cli, "site_exists", lambda domain: True)
-    monkeypatch.setattr(cli, "backup_site", lambda domain: RuntimeResult(0, "backup created", ran=True))
+    monkeypatch.setattr(cli, "backup_site", lambda domain, **kwargs: RuntimeResult(0, "backup created", ran=True))
     monkeypatch.setattr(
         cli,
         "stop_site_runtime",
@@ -1499,6 +1658,54 @@ def test_site_delete_keeps_scaffold_when_runtime_stop_fails(monkeypatch, capsys)
     assert removed == []
     assert "runtime: FAIL compose down failed" in output
     assert "files: kept" in output
+
+
+@pytest.mark.parametrize("force", [False, True])
+def test_site_delete_backup_failure_blocks_stop_and_remove(monkeypatch, capsys, force):
+    import wpfy.cli as cli
+    from wpfy.site_layout import RuntimeResult
+
+    calls = []
+    monkeypatch.setattr(cli, "site_exists", lambda domain: True)
+    monkeypatch.setattr(
+        cli,
+        "backup_site",
+        lambda domain, **kwargs: RuntimeResult(3, "database backup failed", ran=True),
+    )
+    monkeypatch.setattr(cli, "stop_site_runtime", lambda *args, **kwargs: calls.append("stop"))
+    monkeypatch.setattr(cli, "remove_site_scaffold", lambda *args: calls.append("remove"))
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr("builtins.input", lambda prompt: "yes")
+
+    argv = ["site", "delete", "example.com"] + (["--force"] if force else [])
+    result = run(argv)
+
+    assert result == 3
+    assert calls == []
+    output = capsys.readouterr().out
+    assert "backup: FAIL database backup failed" in output
+    assert "files: kept" in output
+
+
+def test_site_delete_skipped_runtime_blocks_remove_even_with_force(monkeypatch, capsys):
+    import wpfy.cli as cli
+    from wpfy.site_layout import RuntimeResult
+
+    removed = []
+    monkeypatch.setattr(cli, "site_exists", lambda domain: True)
+    monkeypatch.setattr(cli, "backup_site", lambda domain, **kwargs: RuntimeResult(0, "complete", ran=True))
+    monkeypatch.setattr(
+        cli,
+        "stop_site_runtime",
+        lambda *args, **kwargs: RuntimeResult(0, "runtime skipped", skipped=True),
+    )
+    monkeypatch.setattr(cli, "remove_site_scaffold", lambda domain: removed.append(domain))
+
+    result = run(["site", "delete", "example.com", "--force"])
+
+    assert result == 1
+    assert removed == []
+    assert "files: kept" in capsys.readouterr().out
 
 
 def test_wp_alias_uses_existing_wp_cli_path(monkeypatch):
@@ -2397,8 +2604,9 @@ def test_secure_warns_on_sftp_host_port_without_secret_output(tmp_wpfy_home, mon
             self.stderr = stderr
 
     def fake_run(cmd, *args, **kwargs):
-        if cmd[:2] == ["docker", "inspect"] and cmd[-1] == f"{project}-sftp":
-            return Proc(0, json.dumps([{
+        if cmd[:2] == ["docker", "inspect"]:
+            return Proc(1, json.dumps([{
+                "Name": f"/{project}-sftp",
                 "HostConfig": {
                     "Privileged": False,
                     "PortBindings": {"22/tcp": [{"HostIp": "127.0.0.1", "HostPort": "2222"}]},
@@ -2437,8 +2645,9 @@ def test_secure_reports_container_hardening_baseline(tmp_wpfy_home, monkeypatch,
             self.stderr = stderr
 
     def fake_run(cmd, *args, **kwargs):
-        if cmd[:2] == ["docker", "inspect"] and cmd[-1] == f"{project}-web":
-            return Proc(0, json.dumps([{
+        if cmd[:2] == ["docker", "inspect"]:
+            return Proc(1, json.dumps([{
+                "Name": f"/{project}-web",
                 "HostConfig": {
                     "Privileged": False,
                     "SecurityOpt": ["no-new-privileges:true"],
@@ -2782,3 +2991,120 @@ def test_utility_htpasswd_generated_and_stdin(monkeypatch, capsys):
     assert "stdin-secret" not in output
 
     assert run(["utility", "htpasswd", "--username", "bad:name"]) == 2
+
+
+def test_info_and_update_actions_are_mutually_exclusive():
+    parser = build_parser()
+    with pytest.raises(SystemExit) as info_exit:
+        parser.parse_args(["info", "example.com", "--nginx", "--php"])
+    with pytest.raises(SystemExit) as update_exit:
+        parser.parse_args(["update", "--check", "--force"])
+    assert info_exit.value.code == update_exit.value.code == 2
+
+
+def test_info_service_flag_requires_domain(capsys):
+    assert run(["info", "--nginx"]) == 2
+    assert "requires a domain" in capsys.readouterr().out
+
+
+def test_site_list_reconciles_before_rendering(monkeypatch, capsys):
+    import wpfy.cli as cli
+
+    calls = []
+    monkeypatch.setattr(cli.registry, "sync_from_filesystem", lambda: calls.append("sync"))
+    monkeypatch.setattr(
+        cli.registry,
+        "list_sites",
+        lambda: calls.append("list") or [
+            {"domain": "example.com", "flavor": "wpredis", "ssl_enabled": True, "cache_type": "redis"}
+        ],
+    )
+
+    assert run(["site", "list"]) == 0
+    assert calls == ["sync", "list"]
+    assert "example.com\twpredis\tssl=enabled\tcache=redis" in capsys.readouterr().out
+
+
+def test_site_list_reports_reconciliation_failure(monkeypatch, capsys):
+    import wpfy.cli as cli
+
+    monkeypatch.setattr(cli.registry, "sync_from_filesystem", lambda: (_ for _ in ()).throw(OSError("read failed")))
+    monkeypatch.setattr(cli.registry, "list_sites", lambda: pytest.fail("stale registry must not render"))
+
+    assert run(["site", "list"]) == 1
+    assert "reconciliation failed: read failed" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("flag", ["--enabled", "--disabled"])
+def test_site_list_rejects_removed_flags(flag):
+    with pytest.raises(SystemExit) as exc_info:
+        build_parser().parse_args(["site", "list", flag])
+    assert exc_info.value.code == 2
+
+
+@pytest.mark.parametrize("installed", ["9.0.dev1", "3.0", "malformed-local"])
+def test_update_check_reports_version_mismatch_neutrally(installed, monkeypatch, capsys):
+    import wpfy.cli as cli
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self):
+            return b'{"info":{"version":"2.0"}}'
+
+    monkeypatch.setattr(cli.importlib.metadata, "version", lambda name: installed)
+    monkeypatch.setattr(cli, "urlopen", lambda *args, **kwargs: Response())
+
+    assert run(["update", "--check"]) == 0
+    output = capsys.readouterr().out
+    assert f"installed: {installed}" in output
+    assert "latest published: 2.0" in output
+    assert "versions differ" in output
+    assert "update available" not in output
+
+
+def test_update_force_reports_command_completion_without_unproven_transition(monkeypatch, capsys):
+    import wpfy.cli as cli
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self):
+            return b'{"info":{"version":"2.0"}}'
+
+    monkeypatch.setattr(cli.importlib.metadata, "version", lambda name: "1.0")
+    monkeypatch.setattr(cli, "urlopen", lambda *args, **kwargs: Response())
+    monkeypatch.setattr(cli.subprocess, "run", lambda *args, **kwargs: FakeProc())
+
+    assert run(["update", "--force"]) == 0
+    output = capsys.readouterr().out
+    assert "pip upgrade command completed" in output
+    assert "1.0 -> 2.0" not in output
+
+
+def test_runtime_and_certificate_annotations_are_truthful():
+    from typing import get_type_hints
+
+    import wpfy.certificate_lifecycle as certificates
+    import wpfy.cli as cli
+    from wpfy.site_runtime import RuntimeResult
+
+    assert get_type_hints(cli._step_status)["result"] is RuntimeResult
+    assert get_type_hints(cli._step_line)["result"] is RuntimeResult
+    assert get_type_hints(cli._format_site_create_result)["bootstrap"] is RuntimeResult
+    assert get_type_hints(certificates.get_cert_info)["return"] is dict
+
+
+def test_make_site_handler_rejects_unknown_name():
+    import wpfy.cli as cli
+
+    with pytest.raises(ValueError, match="unsupported site handler"):
+        cli.make_site_handler("scaffold")

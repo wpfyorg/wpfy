@@ -13,7 +13,7 @@ from urllib.request import urlopen
 
 from .cloudflare_ranges import ips_are_cloudflare
 from .settings import PATHS
-from .site_layout import RuntimeResult, docker_available, runtime_skip_requested
+from .site_runtime import RuntimeResult, docker_available, runtime_skip_requested
 from .traefik import TRAEFIK_CONTAINER
 
 
@@ -310,7 +310,7 @@ def _parse_not_after(value: str) -> datetime.datetime | None:
         return None
 
 
-def get_cert_info(domain: str) -> dict | None:
+def get_cert_info(domain: str) -> dict:
     certs = _read_acme_file()
     expected_domain = domain.rstrip(".").lower()
     if certs is None:
@@ -401,18 +401,30 @@ def force_renew_cert(domain: str) -> RuntimeResult:
         capture_output=True,
         text=True,
     )
+    if proc.returncode != 0:
+        message = proc.stderr.strip() or proc.stdout.strip() or "backup directory creation failed"
+        return RuntimeResult(proc.returncode or 1, f"could not prepare ACME backup: {message}")
     proc = subprocess.run(
         ["docker", "exec", TRAEFIK_CONTAINER, "cp", "/letsencrypt/acme.json", "/tmp/acme-backup/acme.json"],
         check=False,
         capture_output=True,
         text=True,
     )
+    if proc.returncode != 0:
+        message = proc.stderr.strip() or proc.stdout.strip() or "backup copy failed"
+        return RuntimeResult(proc.returncode or 1, f"could not back up acme.json: {message}")
     read_proc = subprocess.run(
         ["docker", "exec", TRAEFIK_CONTAINER, "cat", "/letsencrypt/acme.json"],
         check=False,
         capture_output=True,
         text=True,
     )
+    if read_proc.returncode != 0:
+        message = read_proc.stderr.strip() or read_proc.stdout.strip() or "read failed"
+        return RuntimeResult(
+            read_proc.returncode or 1,
+            f"could not read acme.json: {message}; backup preserved but renewal cannot proceed",
+        )
     try:
         full_data = json.loads(read_proc.stdout)
     except json.JSONDecodeError:
@@ -452,7 +464,7 @@ def force_renew_cert(domain: str) -> RuntimeResult:
     )
     if proc.returncode != 0:
         message = proc.stderr.strip() or "unknown error"
-        return RuntimeResult(1, f"failed to update acme.json: {message}")
+        return RuntimeResult(1, f"failed to update acme.json: {message}; ACME was not replaced; backup preserved")
 
     proc = subprocess.run(
         ["docker", "kill", "-s", "HUP", TRAEFIK_CONTAINER],
@@ -462,7 +474,11 @@ def force_renew_cert(domain: str) -> RuntimeResult:
     )
     if proc.returncode != 0:
         message = proc.stderr.strip() or proc.stdout.strip() or "traefik reload failed"
-        return RuntimeResult(proc.returncode, message)
+        return RuntimeResult(
+            proc.returncode,
+            f"acme.json updated but Traefik reload failed: {message}; backup preserved",
+            ran=True,
+        )
     return RuntimeResult(
         0,
         f"certificate for {domain} removed from acme.json; Traefik will re-issue on next request",

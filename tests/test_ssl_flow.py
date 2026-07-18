@@ -188,3 +188,55 @@ def test_force_renew_removes_matching_certificate_from_all_resolvers(monkeypatch
     assert result.exit_code == 0
     assert writes[0]["le"]["Certificates"] == []
     assert writes[0]["le-http"]["Certificates"][0]["domain"]["main"] == "other.com"
+
+
+@pytest.mark.parametrize(
+    ("failed_step", "expected_calls", "message"),
+    [
+        ("mkdir", ["mkdir"], "prepare ACME backup"),
+        ("cp", ["mkdir", "cp"], "back up acme.json"),
+        ("cat", ["mkdir", "cp", "cat"], "backup preserved"),
+        ("write", ["mkdir", "cp", "cat", "write"], "ACME was not replaced"),
+        ("hup", ["mkdir", "cp", "cat", "write", "hup"], "reload failed"),
+    ],
+)
+def test_force_renew_stops_after_failed_prerequisite(monkeypatch, failed_step, expected_calls, message):
+    import json
+    import wpfy.certificate_lifecycle as lifecycle
+
+    monkeypatch.setattr(lifecycle, "docker_available", lambda: True)
+    monkeypatch.setattr(lifecycle, "get_cert_info", lambda domain: {"status": "issued"})
+    calls = []
+
+    class Proc:
+        def __init__(self, returncode=0, stdout="", stderr=""):
+            self.returncode = returncode
+            self.stdout = stdout
+            self.stderr = stderr
+
+    def fake_run(command, **kwargs):
+        if "mkdir" in command:
+            step = "mkdir"
+        elif "cp" in command:
+            step = "cp"
+        elif command[-2:] == ["cat", "/letsencrypt/acme.json"]:
+            step = "cat"
+        elif kwargs.get("input"):
+            step = "write"
+        else:
+            step = "hup"
+        calls.append(step)
+        assert lifecycle.TRAEFIK_CONTAINER in command
+        if step == failed_step:
+            return Proc(9, stderr=f"{step} failed")
+        if step == "cat":
+            return Proc(stdout=json.dumps({"le": {"Certificates": [{"domain": {"main": "example.com"}}]}}))
+        return Proc()
+
+    monkeypatch.setattr(lifecycle.subprocess, "run", fake_run)
+
+    result = lifecycle.force_renew_cert("example.com")
+
+    assert result.exit_code != 0
+    assert calls == expected_calls
+    assert message in result.message

@@ -10,7 +10,7 @@ from pathlib import Path
 import re
 from types import TracebackType
 import xml.etree.ElementTree as ET
-from typing import Final, Protocol
+from typing import BinaryIO, Final, Protocol
 from urllib.error import URLError
 from urllib.parse import quote, urlparse, urlunparse
 from urllib.request import Request, urlopen
@@ -20,6 +20,7 @@ from .settings import PATHS
 
 SERVICE: Final = "s3"
 ALGORITHM: Final = "AWS4-HMAC-SHA256"
+TRANSFER_CHUNK_SIZE: Final = 1024 * 1024
 CONFIG_FILENAME: Final = "backup-storage.env"
 PROFILE_DIRNAME: Final = "backup-storage.d"
 PROFILE_RE: Final = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,62}")
@@ -49,7 +50,7 @@ class S3ConfigError(RuntimeError):
 class Response(Protocol):
     status: int
 
-    def read(self) -> bytes:
+    def read(self, size: int = -1) -> bytes:
         pass
 
     def __enter__(self) -> Response:
@@ -74,12 +75,26 @@ class S3Uploader:
         self._opener = opener
 
     def upload_archive(self, config: S3Config, archive_path: Path, domain: str) -> str:
-        payload = archive_path.read_bytes()
         key = s3_object_key(config.prefix, domain, archive_path.name)
-        return self.upload_bytes(config, key, payload)
+        with archive_path.open("rb") as payload:
+            payload_hash = _stream_digest(payload, "sha256")
+            content_length = os.fstat(payload.fileno()).st_size
+            payload.seek(0)
+            request = _signed_request(
+                config,
+                "PUT",
+                key,
+                payload_hash,
+                data=payload,
+                content_length=content_length,
+            )
+            return self._upload(config, key, request)
 
     def upload_bytes(self, config: S3Config, key: str, payload: bytes) -> str:
         request = signed_request(config, "PUT", key, payload)
+        return self._upload(config, key, request)
+
+    def _upload(self, config: S3Config, key: str, request: Request) -> str:
         try:
             with self._opener(request, timeout=60) as response:
                 status = getattr(response, "status", 200)
@@ -107,17 +122,29 @@ class S3Uploader:
             if element.text
         ]
 
-    def download_bytes(self, config: S3Config, key: str) -> bytes:
+    def download_to_path(self, config: S3Config, key: str, destination: Path) -> Path:
         request = signed_request(config, "GET", key)
         try:
             with self._opener(request, timeout=60) as response:
                 status = getattr(response, "status", 200)
-                payload = response.read()
+                if status >= 400:
+                    raise OSError(f"status {status}")
+                headers = getattr(response, "headers", {})
+                content_length = headers.get("Content-Length")
+                expected_length = int(content_length) if content_length is not None else None
+                downloaded = 0
+                with destination.open("wb") as output:
+                    destination.chmod(0o600)
+                    while chunk := response.read(TRANSFER_CHUNK_SIZE):
+                        output.write(chunk)
+                        downloaded += len(chunk)
+                if expected_length is not None and downloaded != expected_length:
+                    raise OSError(
+                        f"incomplete download: expected {expected_length} bytes, got {downloaded}"
+                    )
         except URLError as exc:
             raise OSError(str(exc.reason)) from exc
-        if status >= 400:
-            raise OSError(f"status {status}")
-        return payload
+        return destination
 
     def delete_key(self, config: S3Config, key: str) -> str:
         request = signed_request(config, "DELETE", key)
@@ -253,6 +280,26 @@ def signed_put_request(config: S3Config, key: str, payload: bytes) -> Request:
 
 
 def signed_request(config: S3Config, method: str, key: str = "", payload: bytes = b"", *, query: str = "") -> Request:
+    return _signed_request(
+        config,
+        method,
+        key,
+        hashlib.sha256(payload).hexdigest(),
+        data=payload if method in {"PUT", "POST"} else None,
+        query=query,
+    )
+
+
+def _signed_request(
+    config: S3Config,
+    method: str,
+    key: str,
+    payload_hash: str,
+    *,
+    data: bytes | BinaryIO | None = None,
+    content_length: int | None = None,
+    query: str = "",
+) -> Request:
     parsed = urlparse(config.endpoint)
     if not parsed.scheme or not parsed.netloc:
         raise S3ConfigError("invalid WPFY_BACKUP_S3_ENDPOINT")
@@ -264,13 +311,14 @@ def signed_request(config: S3Config, method: str, key: str = "", payload: bytes 
     canonical_uri = f"{parsed.path.rstrip('/')}/{encoded_bucket}"
     if encoded_key:
         canonical_uri = f"{canonical_uri}/{encoded_key}"
-    payload_hash = hashlib.sha256(payload).hexdigest()
     host = parsed.netloc
     headers = {
         "Host": host,
         "x-amz-content-sha256": payload_hash,
         "x-amz-date": amz_date,
     }
+    if content_length is not None:
+        headers["Content-Length"] = str(content_length)
     signed_headers = "host;x-amz-content-sha256;x-amz-date"
     canonical_headers = "\n".join(f"{name.lower()}:{headers[name]}" for name in sorted(headers)) + "\n"
     canonical_request = "\n".join([
@@ -298,8 +346,14 @@ def signed_request(config: S3Config, method: str, key: str = "", payload: bytes 
         f"SignedHeaders={signed_headers}, Signature={signature}"
     )
     url = urlunparse((parsed.scheme, parsed.netloc, canonical_uri, "", query, ""))
-    data = payload if method in {"PUT", "POST"} else None
     return Request(url, data=data, headers=headers, method=method)
+
+
+def _stream_digest(source: BinaryIO, algorithm: str) -> str:
+    digest = hashlib.new(algorithm)
+    while chunk := source.read(TRANSFER_CHUNK_SIZE):
+        digest.update(chunk)
+    return digest.hexdigest()
 
 
 def signing_key(secret_key: str, date_stamp: str, region: str) -> bytes:

@@ -7,14 +7,10 @@ from pathlib import Path
 from . import registry, traefik
 from .certificate_lifecycle import cert_expiry_days, get_cert_info
 from .settings import PATHS
-from .site_definition import MYSQL_FLAVORS
-from .site_layout import (
-    _http_probe_site,
-    domain_to_project,
-    list_sites,
-    site_dir,
-    site_info,
-)
+from .site_definition import MYSQL_FLAVORS, SiteDefinition
+from .site_layout import list_sites, site_info, web_service_lines
+from .site_paths import domain_to_project, env_path, nginx_conf_path, read_env, site_dir
+from .site_runtime import _http_probe_site, compose_command, docker_available, runtime_skip_requested
 
 
 @dataclass(frozen=True, slots=True)
@@ -29,6 +25,101 @@ class AggregateInfo:
     sites: tuple[dict, ...]
     traefik_message: str
     docker_version: str
+
+
+@dataclass(frozen=True, slots=True)
+class ServiceInfo:
+    heading: str
+    checks: tuple[InspectionCheck, ...]
+
+
+def nginx_service_info(domain: str) -> ServiceInfo:
+    project = domain_to_project(domain)
+    try:
+        definition = SiteDefinition.from_env(domain, read_env(env_path(domain)))
+        generated = "\n".join(web_service_lines(definition)).rstrip()
+    except (OSError, ValueError) as exc:
+        checks = [InspectionCheck("generated service", False, f"unavailable: {exc}")]
+    else:
+        checks = [InspectionCheck("generated service", True, generated)]
+    config_path = nginx_conf_path(domain)
+    try:
+        config = config_path.read_text(encoding="utf-8").rstrip()
+    except FileNotFoundError:
+        checks.append(InspectionCheck("mounted nginx config", False, f"not found: {config_path}"))
+    except OSError as exc:
+        checks.append(InspectionCheck("mounted nginx config", False, f"unavailable: {exc}"))
+    else:
+        checks.append(InspectionCheck("mounted nginx config", True, f"{config_path}\n{config}"))
+    return ServiceInfo(f"nginx service ({project}-web)", tuple(checks))
+
+
+def _service_state(domain: str, service: str) -> InspectionCheck:
+    if runtime_skip_requested() or not docker_available():
+        return InspectionCheck("status", None, "runtime unavailable")
+    try:
+        proc = compose_command(domain, "ps", "-q", service)
+    except OSError as exc:
+        return InspectionCheck("status", None, f"runtime unavailable: {exc}")
+    if proc.returncode != 0:
+        message = proc.stderr.strip() or proc.stdout.strip() or "docker compose ps failed"
+        return InspectionCheck("status", None, f"runtime unavailable: {message}")
+    if not proc.stdout.strip():
+        return InspectionCheck("status", None, "stopped")
+    return InspectionCheck("status", True, "running")
+
+
+def php_service_info(domain: str) -> ServiceInfo:
+    project = domain_to_project(domain)
+    state = _service_state(domain, "app")
+    if state.ok is not True:
+        return ServiceInfo(f"php service ({project}-app)", (state,))
+    try:
+        proc = compose_command(domain, "exec", "-T", "app", "php", "-m")
+    except OSError as exc:
+        check = InspectionCheck("loaded modules", False, f"query failed: {exc}")
+    else:
+        if proc.returncode == 0:
+            check = InspectionCheck("loaded modules", True, proc.stdout.rstrip())
+        else:
+            message = proc.stderr.strip() or proc.stdout.strip() or "docker compose exec failed"
+            check = InspectionCheck("loaded modules", False, f"query failed: {message}")
+    return ServiceInfo(f"php service ({project}-app)", (state, check))
+
+
+def mysql_service_info(domain: str) -> ServiceInfo:
+    project = domain_to_project(domain)
+    try:
+        definition = SiteDefinition.from_env(domain, read_env(env_path(domain)))
+    except (OSError, ValueError) as exc:
+        check = InspectionCheck("status", False, f"site definition unavailable: {exc}")
+        return ServiceInfo(f"mysql service ({project}-db)", (check,))
+    if not definition.use_mysql:
+        check = InspectionCheck("status", None, "not applicable (site has no mysql service)")
+        return ServiceInfo(f"mysql service ({project}-db)", (check,))
+    state = _service_state(domain, "db")
+    if state.ok is not True:
+        return ServiceInfo(f"mysql service ({project}-db)", (state,))
+    try:
+        proc = compose_command(
+            domain,
+            "exec",
+            "-T",
+            "db",
+            "mariadb",
+            "-e",
+            "SHOW VARIABLES WHERE Variable_name IN "
+            "('version','max_connections','innodb_buffer_pool_size','datadir')",
+        )
+    except OSError as exc:
+        check = InspectionCheck("config variables", False, f"query failed: {exc}")
+    else:
+        if proc.returncode == 0:
+            check = InspectionCheck("config variables", True, proc.stdout.rstrip())
+        else:
+            message = proc.stderr.strip() or proc.stdout.strip() or "docker compose exec failed"
+            check = InspectionCheck("config variables", False, f"query failed: {message}")
+    return ServiceInfo(f"mysql service ({project}-db)", (state, check))
 
 
 def aggregate_info() -> AggregateInfo:
@@ -188,25 +279,25 @@ def site_diagnostics(domain: str) -> tuple[InspectionCheck, ...]:
 def security_checks(domain: str) -> tuple[InspectionCheck, ...]:
     checks = []
     project = domain_to_project(domain)
-    for service in ("web", "app", "db", "redis", "sftp"):
-        container = f"{project}-{service}"
-        proc = subprocess.run(
-            ["docker", "inspect", container],
-            check=False,
-            capture_output=True,
-            text=True,
-        )
-        if proc.returncode != 0:
-            checks.append(InspectionCheck(f"container {container}", None, "not running (skip)"))
-            continue
-        try:
-            data = json.loads(proc.stdout)
-            info = data[0]
-            host = info.get("HostConfig", {})
-        except (json.JSONDecodeError, IndexError, KeyError) as exc:
-            checks.append(InspectionCheck(container, None, f"inspect parse error: {exc}"))
-            continue
-        checks.extend(_container_security_checks(container, info, host))
+    containers = tuple(f"{project}-{service}" for service in ("web", "app", "db", "redis", "sftp"))
+    proc = subprocess.run(
+        ["docker", "inspect", *containers],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    try:
+        data = json.loads(proc.stdout) if proc.stdout.strip() else []
+        inspected = {info.get("Name", "").lstrip("/"): info for info in data}
+    except (AttributeError, json.JSONDecodeError, TypeError) as exc:
+        checks.extend(InspectionCheck(container, None, f"inspect parse error: {exc}") for container in containers)
+    else:
+        for container in containers:
+            info = inspected.get(container)
+            if info is None:
+                checks.append(InspectionCheck(f"container {container}", None, "not running (skip)"))
+                continue
+            checks.extend(_container_security_checks(container, info, info.get("HostConfig", {})))
 
     for path, label, expected in (
         (site_dir(domain) / ".env", ".env", 0o600),

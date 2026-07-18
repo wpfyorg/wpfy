@@ -11,7 +11,8 @@ from typing import Final
 
 from .settings import PATHS
 from .site_definition import WORDPRESS_FLAVORS
-from .site_layout import RuntimeResult, list_sites, runtime_skip_requested, site_health, wp_cli_command
+from .site_layout import list_sites
+from .site_runtime import RuntimeResult, runtime_skip_requested, site_health, wp_cli_command
 
 
 INTERVALS: Final = ("minute", "five-minute", "hourly", "six-hour", "daily", "weekly")

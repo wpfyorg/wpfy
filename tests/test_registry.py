@@ -197,3 +197,67 @@ def test_registry_get_nonexistent_site(clean_registry):
 def test_registry_remove_nonexistent_is_noop(clean_registry):
     clean_registry.remove_site("nonexistent.com")
     assert clean_registry.list_sites() == []
+
+
+def test_sync_from_filesystem_uses_only_supplied_root(tmp_wpfy_home, tmp_path):
+    from wpfy.registry import Registry
+
+    alternate = tmp_path / "alternate-sites"
+    site = alternate / "alternate.com"
+    site.mkdir(parents=True)
+    (site / ".env").write_text("DOMAIN=alternate.com\nSITE_FLAVOR=html\n", encoding="utf-8")
+    (site / "compose.yaml").write_text("services: {}\n", encoding="utf-8")
+    default = Path(tmp_wpfy_home.sites_dir) / "default.com"
+    default.mkdir(parents=True)
+    (default / ".env").write_text("DOMAIN=default.com\nSITE_FLAVOR=html\n", encoding="utf-8")
+    (default / "compose.yaml").write_text("services: {}\n", encoding="utf-8")
+    reg = Registry(path=Path(tmp_wpfy_home.state_dir) / "sites.json")
+
+    reg.sync_from_filesystem(str(alternate))
+
+    assert {site["domain"] for site in reg.list_sites()} == {"alternate.com"}
+
+
+def test_sync_preserves_registry_fields_and_rebuilds_canonical_metadata(tmp_wpfy_home):
+    from wpfy.registry import Registry
+
+    reg = Registry(path=Path(tmp_wpfy_home.state_dir) / "sites.json")
+    reg.add_site("example.com", {"created_at": "kept", "maintenance": "enabled", "stale": "drop"})
+    site = Path(tmp_wpfy_home.sites_dir) / "example.com"
+    site.mkdir(parents=True)
+    (site / ".env").write_text(
+        "DOMAIN=example.com\nSITE_FLAVOR=wpredis\nPHP_VERSION=8.3\nLETSENCRYPT_MODE=default\n"
+        "REDIS_ENABLED=1\nSITE_UID=100123\nSFTP_PASSWORD=secret\nSFTP_PORT=2223\n",
+        encoding="utf-8",
+    )
+    (site / "compose.yaml").write_text("services: {}\n", encoding="utf-8")
+
+    reg.sync_from_filesystem()
+
+    assert reg.get_site("example.com") == {
+        "domain": "example.com",
+        "flavor": "wpredis",
+        "php_version": "8.3",
+        "ssl_enabled": True,
+        "cache_type": "redis",
+        "site_uid": 100123,
+        "sftp_enabled": True,
+        "created_at": "kept",
+        "maintenance": "enabled",
+    }
+
+
+def test_sync_noop_preserves_registry_bytes_and_mtime(tmp_wpfy_home):
+    from wpfy.registry import Registry
+
+    path = Path(tmp_wpfy_home.state_dir) / "sites.json"
+    reg = Registry(path=path)
+    site = Path(tmp_wpfy_home.sites_dir) / "same.com"
+    site.mkdir(parents=True)
+    (site / ".env").write_text("DOMAIN=same.com\nSITE_FLAVOR=wp\nPHP_VERSION=8.4\n", encoding="utf-8")
+    (site / "compose.yaml").write_text("services: {}\n", encoding="utf-8")
+    reg.sync_from_filesystem()
+    before = (path.read_bytes(), path.stat().st_mtime_ns)
+
+    assert reg.sync_from_filesystem() == {"added": 0, "removed": 0, "updated": 0}
+    assert (path.read_bytes(), path.stat().st_mtime_ns) == before

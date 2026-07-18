@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import hashlib
 import importlib
 import os
 import stat
@@ -562,6 +563,135 @@ def test_backup_site_copies_verified_archive_to_destination(tmp_wpfy_home, monke
     assert f"copied to: {copied}" in result.message
 
 
+def test_wordpress_download_failure_is_nonzero_and_retryable(tmp_wpfy_home, monkeypatch):
+    import wpfy.site_layout
+
+    importlib.reload(wpfy.site_layout)
+    domain = "bootstrap-failure.example.com"
+    spec = wpfy.site_layout.SiteSpec(domain=domain, flavor="wp", use_mysql=True, use_redis=False)
+    wpfy.site_layout.ensure_site_scaffold(spec)
+    monkeypatch.setattr(wpfy.site_layout, "urlopen", lambda *args, **kwargs: (_ for _ in ()).throw(OSError("offline")))
+
+    result = wpfy.site_layout.bootstrap_site_files(domain)
+
+    assert result.exit_code != 0
+    assert "offline" in result.message
+    assert not (
+        wpfy.site_layout.app_dir(domain).joinpath("index.php").exists()
+        and wpfy.site_layout.app_dir(domain).joinpath("wp-config.php").exists()
+    )
+
+
+def test_wordpress_bootstrap_verifies_versioned_archive_before_open(tmp_wpfy_home, monkeypatch):
+    import wpfy.site_layout as layout
+
+    importlib.reload(layout)
+    domain = "verified-bootstrap.example.com"
+    layout.ensure_site_scaffold(
+        layout.SiteSpec(domain=domain, flavor="wp", use_mysql=True, use_redis=False)
+    )
+    payload = io.BytesIO()
+    with tarfile.open(fileobj=payload, mode="w:gz") as archive:
+        member = tarfile.TarInfo("wordpress/index.php")
+        content = b"<?php\n"
+        member.size = len(content)
+        archive.addfile(member, io.BytesIO(content))
+    archive_bytes = payload.getvalue()
+    events = []
+
+    class Response(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            self.close()
+
+    responses = {
+        layout.WORDPRESS_VERSION_URL: Response(
+            b'{"offers":[{"response":"upgrade","locale":"en_US","current":"7.0.1"}]}'
+        ),
+        "https://wordpress.org/wordpress-7.0.1.tar.gz.sha1": Response(
+            hashlib.sha1(archive_bytes).hexdigest().encode("ascii")
+        ),
+        "https://wordpress.org/wordpress-7.0.1.tar.gz": Response(archive_bytes),
+    }
+    original_tar_open = layout.tarfile.open
+
+    def urlopen(url, **kwargs):
+        events.append(url)
+        return responses[url]
+
+    def tar_open(*args, **kwargs):
+        events.append("tar-open")
+        return original_tar_open(*args, **kwargs)
+
+    monkeypatch.setattr(layout, "urlopen", urlopen)
+    monkeypatch.setattr(layout.tarfile, "open", tar_open)
+
+    result = layout.bootstrap_site_files(domain)
+
+    assert result.exit_code == 0
+    assert "7.0.1 verified" in result.message
+    assert events == [
+        layout.WORDPRESS_VERSION_URL,
+        "https://wordpress.org/wordpress-7.0.1.tar.gz.sha1",
+        "https://wordpress.org/wordpress-7.0.1.tar.gz",
+        "tar-open",
+    ]
+
+
+def test_wordpress_digest_mismatch_never_opens_archive(tmp_wpfy_home, monkeypatch):
+    import wpfy.site_layout as layout
+
+    importlib.reload(layout)
+    domain = "digest-mismatch.example.com"
+    layout.ensure_site_scaffold(
+        layout.SiteSpec(domain=domain, flavor="wp", use_mysql=True, use_redis=False)
+    )
+
+    class Response(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            self.close()
+
+    responses = iter([
+        Response(b'{"offers":[{"response":"upgrade","locale":"en_US","current":"7.0.1"}]}'),
+        Response(b"0" * 40),
+        Response(b"not the expected archive"),
+    ])
+    monkeypatch.setattr(layout, "urlopen", lambda *args, **kwargs: next(responses))
+    monkeypatch.setattr(
+        layout.tarfile,
+        "open",
+        lambda *args, **kwargs: pytest.fail("archive opened before digest verification"),
+    )
+
+    result = layout.bootstrap_site_files(domain)
+
+    assert result.exit_code != 0
+    assert "digest mismatch" in result.message
+    assert not layout.app_dir(domain).joinpath("index.php").exists()
+
+
+@pytest.mark.parametrize("payload", [b"{}", b"not-json", b'{"offers":[]}'])
+def test_wordpress_release_metadata_fails_closed(monkeypatch, payload):
+    import wpfy.site_layout as layout
+
+    class Response(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            self.close()
+
+    monkeypatch.setattr(layout, "urlopen", lambda *args, **kwargs: Response(payload))
+
+    with pytest.raises(ValueError):
+        layout._wordpress_release_version()
+
+
 def test_backup_site_does_not_overwrite_same_second_archive(tmp_wpfy_home, monkeypatch):
     import wpfy.site_layout
 
@@ -599,17 +729,39 @@ def test_backup_site_does_not_copy_when_archive_verification_fails(tmp_wpfy_home
     spec = wpfy.site_layout.SiteSpec(domain=domain, flavor="site", use_mysql=False, use_redis=False)
     wpfy.site_layout.ensure_site_scaffold(spec)
 
-    class Proc:
-        returncode = 1
-        stdout = ""
-        stderr = "bad archive"
+    original_open = wpfy.site_layout.tarfile.open
 
-    monkeypatch.setattr(wpfy.site_layout.subprocess, "run", lambda *args, **kwargs: Proc())
+    def fail_verification(name, mode="r", *args, **kwargs):
+        if mode == "r:gz":
+            raise tarfile.ReadError("bad archive")
+        return original_open(name, mode, *args, **kwargs)
+
+    monkeypatch.setattr(wpfy.site_layout.tarfile, "open", fail_verification)
 
     result = wpfy.site_layout.backup_site(domain, destination_dir=tmp_path / "exports")
 
     assert result.exit_code == 3
     assert not (tmp_path / "exports").exists()
+    assert not list(wpfy.site_layout.backups_dir(domain).glob("*"))
+
+
+def test_restore_rejects_non_tar_before_runtime_stop(tmp_wpfy_home, monkeypatch, tmp_path):
+    import wpfy.site_layout as layout
+
+    importlib.reload(layout)
+    domain = "invalid-restore.example.com"
+    archive_path = tmp_path / "invalid.tar.gz"
+    archive_path.write_bytes(b"not a gzip archive")
+    monkeypatch.setattr(
+        layout,
+        "stop_site_runtime",
+        lambda *args, **kwargs: pytest.fail("runtime stopped before archive validation"),
+    )
+
+    result = layout.restore_site(domain, str(archive_path))
+
+    assert result.exit_code == 2
+    assert "invalid backup archive" in result.message
 
 
 def test_backup_site_uploads_verified_archive_to_s3(tmp_wpfy_home, monkeypatch):
@@ -653,17 +805,19 @@ def test_backup_site_skips_s3_upload_until_archive_verifies(tmp_wpfy_home, monke
     wpfy.site_layout.ensure_site_scaffold(spec)
     calls = []
 
-    class Proc:
-        returncode = 1
-        stdout = ""
-        stderr = "bad archive"
-
     class FakeUploader:
         def upload_archive(self, config, archive_path, domain_arg):
             calls.append((config, archive_path, domain_arg))
             return "s3://never"
 
-    monkeypatch.setattr(wpfy.site_layout.subprocess, "run", lambda *args, **kwargs: Proc())
+    original_open = wpfy.site_layout.tarfile.open
+
+    def fail_verification(name, mode="r", *args, **kwargs):
+        if mode == "r:gz":
+            raise tarfile.ReadError("bad archive")
+        return original_open(name, mode, *args, **kwargs)
+
+    monkeypatch.setattr(wpfy.site_layout.tarfile, "open", fail_verification)
 
     result = wpfy.site_layout.backup_site(domain, upload_s3=True, uploader=FakeUploader())
 
@@ -1208,10 +1362,12 @@ def test_site_exists_rejects_traversal_input(tmp_wpfy_home, monkeypatch):
 
 def test_stop_site_runtime_omits_volume_removal_by_default(tmp_wpfy_home, monkeypatch):
     import wpfy.site_layout
+    import wpfy.site_runtime
 
     importlib.reload(wpfy.site_layout)
+    importlib.reload(wpfy.site_runtime)
     monkeypatch.delenv("WPFY_SKIP_RUNTIME", raising=False)
-    monkeypatch.setattr(wpfy.site_layout, "docker_available", lambda: True)
+    monkeypatch.setattr(wpfy.site_runtime, "docker_available", lambda: True)
     calls = []
 
     class Proc:
@@ -1219,7 +1375,7 @@ def test_stop_site_runtime_omits_volume_removal_by_default(tmp_wpfy_home, monkey
         stdout = "stopped"
         stderr = ""
 
-    monkeypatch.setattr(wpfy.site_layout, "compose_command", lambda domain, *args: calls.append(args) or Proc())
+    monkeypatch.setattr(wpfy.site_runtime, "compose_command", lambda domain, *args: calls.append(args) or Proc())
 
     wpfy.site_layout.stop_site_runtime("stop.example.com")
     wpfy.site_layout.stop_site_runtime("stop.example.com", remove_volumes=True)
@@ -1253,7 +1409,7 @@ def test_restore_preserves_live_db_credentials_when_db_initialized(tmp_wpfy_home
 
     backup = wpfy.site_layout.backup_site(domain)
     assert backup.exit_code == 0
-    archive_path = backup.message.removeprefix("backup created: ")
+    archive_path = backup.message.removeprefix("backup created: ").split(";", 1)[0]
 
     # Rotate credentials after the backup and mark the DB volume as initialized:
     # the archive now carries stale credentials the volume no longer accepts.
@@ -1285,7 +1441,7 @@ def test_restore_keeps_archive_credentials_for_uninitialized_db(tmp_wpfy_home, m
 
     backup = wpfy.site_layout.backup_site(domain)
     assert backup.exit_code == 0
-    archive_path = backup.message.removeprefix("backup created: ")
+    archive_path = backup.message.removeprefix("backup created: ").split(";", 1)[0]
 
     env_file = wpfy.site_layout.env_path(domain)
     archived = wpfy.site_layout.read_env(env_file)

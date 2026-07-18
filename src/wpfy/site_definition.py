@@ -38,7 +38,8 @@ class SiteDefinition:
     @classmethod
     def from_env(cls, domain: str, values: dict[str, str]) -> SiteDefinition:
         flavor = values.get("SITE_FLAVOR", "site")
-        letsencrypt = values.get("LETSENCRYPT_MODE") or None
+        letsencrypt_value = values.get("LETSENCRYPT_MODE", "")
+        letsencrypt = None if letsencrypt_value in ("", "disabled") else letsencrypt_value
         return cls(
             domain=values.get("DOMAIN", domain),
             flavor=flavor,

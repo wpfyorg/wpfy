@@ -5,20 +5,16 @@ from dataclasses import dataclass
 
 from .php_runtime import DEFAULT_PHP_VERSION
 from .site_layout import (
-    RuntimeResult,
     SiteSpec,
     apply_site_ownership,
     bootstrap_site_files,
-    compose_command,
     ensure_site_scaffold,
-    env_path,
     provision_wordpress_site,
-    read_env,
     site_info,
-    start_site_runtime,
     wordpress_install_state,
-    wp_cli_command,
 )
+from .site_paths import env_path, read_env
+from .site_runtime import RuntimeResult, compose_command, start_site_runtime, wp_cli_command
 from .certificate_lifecycle import preflight_ssl
 from .dns import DNSConfigError, load_cloudflare_config
 from .site_definition import MYSQL_FLAVORS, WORDPRESS_FLAVORS
@@ -198,6 +194,19 @@ def create_site(
 
     report("bootstrap")
     bootstrap = bootstrap_site_files(request.domain)
+    if bootstrap.exit_code != 0:
+        return CreateSiteResult(
+            spec=spec,
+            touched=touched,
+            bootstrap=bootstrap,
+            runtime=RuntimeResult(
+                bootstrap.exit_code,
+                "runtime skipped because bootstrap failed",
+                skipped=True,
+            ),
+            preflight_message=preflight_message,
+            exit_code=bootstrap.exit_code,
+        )
     # Re-own files written during bootstrap (e.g. downloaded WordPress core) with
     # the per-site uid before containers start.
     apply_site_ownership(request.domain)
