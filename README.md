@@ -1,81 +1,108 @@
-# wpfy
+<p align="center">
+  <strong>wpfy</strong><br>
+  Docker-first WordPress VPS installer and server-management CLI
+</p>
 
-**Docker-first WordPress VPS installer and server management CLI.**
+<p align="center">
+  Build and operate WordPress sites as separate Docker Compose stacks on an Ubuntu VPS. wpfy keeps the edge proxy shared, while each managed site has its own runtime, files, database state, credentials, network boundary, and Unix identity.
+</p>
 
-wpfy turns a fresh Ubuntu VPS into a managed WordPress host. Every site runs in its own isolated Docker Compose stack — Nginx, PHP-FPM, MariaDB, and optional Redis — behind a shared Traefik edge proxy that handles routing and Let's Encrypt TLS. One CLI manages the full lifecycle: create, secure, back up, restore, diagnose, and remove sites.
+<p align="center">
+  <a href="https://github.com/wpfyorg/wpfy/releases/tag/v1.0.0-rc2"><img src="https://img.shields.io/github/v/release/wpfyorg/wpfy?include_prereleases&display_name=tag&sort=semver" alt="Current release: v1.0.0-rc2"></a>
+  <a href="https://github.com/wpfyorg/wpfy/actions/workflows/tests.yml"><img src="https://github.com/wpfyorg/wpfy/actions/workflows/tests.yml/badge.svg?branch=main" alt="Tests workflow status"></a>
+  <a href="https://github.com/wpfyorg/wpfy/blob/main/pyproject.toml"><img src="https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white" alt="Python 3.10 or later"></a>
+  <a href="https://github.com/wpfyorg/wpfy/blob/main/LICENSE"><img src="https://img.shields.io/github/license/wpfyorg/wpfy" alt="AGPL-3.0-only license"></a>
+  <a href="https://docs.docker.com/compose/"><img src="https://img.shields.io/badge/Docker-Compose-2496ED?logo=docker&logoColor=white" alt="Uses Docker Compose"></a>
+</p>
 
-> ## ⚠️ Beta status
->
-> wpfy is **beta / early-access software**. The core feature set is implemented and covered by an extensive automated test suite, but it has not yet been hardened by broad real-world use.
->
-> - **Test on a fresh or disposable VPS first.** Do not point wpfy at a server hosting anything you can't afford to lose.
-> - **Review before production use.** Read the [Safety model](#safety-model--isolation) and [Known limitations](#known-limitations) sections before hosting real traffic.
-> - Expect rough edges, and please [report them](#contributing) — beta feedback directly shapes the roadmap.
+<p align="center">
+  <a href="#quick-start">Quick start</a> ·
+  <a href="#how-it-works">Architecture</a> ·
+  <a href="#safety-and-isolation">Safety model</a> ·
+  <a href="ROADMAP.md">Roadmap</a> ·
+  <a href="SECURITY.md">Security</a> ·
+  <a href="CONTRIBUTING.md">Contributing</a>
+</p>
 
-## What wpfy does
+![wpfy control panel showing a sanitized local demonstration site](.github/assets/wpfy-panel-overview.jpg)
 
-- Installs and manages a complete WordPress hosting environment on an Ubuntu VPS using Docker and Docker Compose — no host-level Nginx, PHP, or MariaDB packages.
-- Gives **each site its own Compose project**: dedicated containers, network, volumes, database, credentials, and Unix UID. Sites cannot read each other's files or databases.
-- Runs a shared **Traefik edge proxy** that routes traffic per domain and obtains Let's Encrypt certificates automatically.
-- Performs **DNS/IP preflight checks** before requesting certificates, with automatic Cloudflare detection.
-- Provides **backups, restore, diagnostics, log access, security auditing, and per-site SFTP** from a single CLI.
-- Provides WordPress cron interval runners, optional systemd timers, and SMTP config/test helpers without automatic backup or update side effects.
+> [!WARNING]
+> **`v1.0.0-rc2` is a release candidate, not a production-readiness claim.** It passed local tests and public CI, but RC2 still lacks disposable-VPS, provider-S3, real-systemd, anonymous-image-pull, and external-scanner validation. Start on a fresh or disposable VPS, read the [safety model](#safety-and-isolation), and [report problems](https://github.com/wpfyorg/wpfy/issues/new/choose). See the [release notes](https://github.com/wpfyorg/wpfy/releases/tag/v1.0.0-rc2) and [roadmap](ROADMAP.md) for open release work.
 
-### Why Docker-first?
+## Why wpfy?
 
-Traditional WordPress stack managers install Nginx, PHP, and MySQL directly on the host, so every site shares one PHP version, one database server, and one blast radius. wpfy instead composes each site from containers:
+Traditional WordPress managers commonly install shared Nginx, PHP, and database services directly on the host. That makes version changes, cleanup, and failure boundaries host-wide concerns.
 
-- **Isolation** — a compromised or misbehaving site is confined to its own containers, network, and unprivileged UID.
-- **Per-site PHP versions** — run PHP 7.4 on a legacy site and 8.4 on a new one, side by side.
-- **Clean removal** — deleting a site removes its containers, volumes, and files without leaving host packages behind.
-- **Reproducibility** — a site is fully described by its `compose.yaml` and `.env`, which is also what makes backup and restore reliable.
+wpfy takes a Docker-first path. Each site runs in its own Docker Compose project, so its Nginx, PHP-FPM, MariaDB, optional Redis, files, credentials, and private network are managed together. A shared Traefik edge routes domains and manages TLS, while one CLI handles creation, SSL, backups, restores, diagnostics, SFTP, WordPress commands, and runtime control.
 
-## Current capabilities
+Built for developers and WordPress server administrators who operate their own Ubuntu VPS. It is not yet a fit for hosting mutually untrusted tenants.
 
-| Area | Status |
+## What you can do
+
+| Area | What wpfy provides |
 |---|---|
-| Ubuntu installer (`install.sh`) | ✅ Implemented |
-| Per-site Docker Compose WordPress stacks | ✅ Implemented |
-| Traefik edge proxy with Let's Encrypt | ✅ Implemented |
-| SSL DNS/IP preflight + Cloudflare detection | ✅ Implemented |
-| WordPress provisioning via wp-cli | ✅ Implemented |
-| Backups and restore (files + database) | ✅ Implemented |
-| WordPress cron runners and systemd timers | ✅ Implemented |
-| SMTP config and explicit test sends | ✅ Implemented |
-| Diagnostics (`wpfy debug`) | ✅ Implemented |
-| Per-site SFTP lifecycle | ✅ Implemented |
-| Security audit (`wpfy secure`) | ✅ Implemented |
-| Wildcard SSL certificates | ✅ Implemented for Cloudflare DNS |
-| phpMyAdmin / Adminer / Composer helpers | ✅ Pull-only helper images |
-| MySQLTuner helper | ⏳ Skipped until a vetted pinned image exists |
-| Migration from host-level stacks (`stack migrate`) | ❌ Not implemented in v1 |
-| Backup retention/remote ops/edge backup | ✅ Implemented |
+| Site lifecycle | Create WordPress or static sites, inspect them, update controlled settings, and remove them with confirmation. |
+| Docker-first runtime | One Compose project per site, per-site PHP `7.4` through `8.4`, optional Redis, and targeted Compose controls. |
+| TLS and DNS | Let’s Encrypt through Traefik, DNS/IP preflight before issuance, Cloudflare detection, and Cloudflare-DNS wildcard certificates. |
+| Backups and recovery | Verified local archives, explicit restore, local retention/pruning, S3-compatible remote operations, edge backups, and a systemd backup schedule. |
+| WordPress operations | WP-CLI, controlled PHP/config changes, cache clearing, cron runners, and SMTP configuration with explicit test sends. |
+| Access and diagnostics | Per-site SFTP lifecycle, logs, security audits, health checks, diagnostics, and a loopback-only browser panel. |
 
-## Installation
+## Quick start
 
-On a fresh Ubuntu VPS, as a user with sudo access. RC2 is published as
-`v1.0.0-rc2`; use its immutable tag and published archive checksum:
+### Requirements
+
+- A fresh Ubuntu VPS with sudo access. Ubuntu is the v1 target; other distributions are untested.
+- Docker Engine and the Docker Compose plugin. The installer installs or verifies them.
+- Python 3.10 or later.
+- A domain whose DNS can point at the VPS before you enable TLS.
+- Outbound access to GitHub, image registries, Let’s Encrypt, and public-IP services.
+
+### Install the current release candidate
+
+Review the installer, pin the immutable release tag, and let the installer verify the downloaded source archive with the checksum published for RC2:
 
 ```bash
 curl -fsSLO https://raw.githubusercontent.com/wpfyorg/wpfy/v1.0.0-rc2/install.sh
 less install.sh
-sudo WPFY_REF=v1.0.0-rc2 WPFY_SOURCE_SHA256=<published-rc2-archive-sha256> bash install.sh
+
+sudo WPFY_REF=v1.0.0-rc2 \
+  WPFY_SOURCE_SHA256=398c7bbeb93d0e5a7fffea2940df200740db8481052ae92ec62c6148a6b2831e \
+  bash install.sh
 ```
 
-The installer detects your system, downloads the wpfy source archive from GitHub, and runs a step-by-step guided install. It logs to `/var/log/wpfy/install.log` and supports `--dry-run`, `--verbose`, and `--no-color`.
+The checksum is the official source-archive SHA-256 in the [RC2 release](https://github.com/wpfyorg/wpfy/releases/tag/v1.0.0-rc2). The installer logs to `/var/log/wpfy/install.log`; `--dry-run`, `--verbose`, and `--no-color` are available when needed.
 
-> **Note:** copy the checksum from the RC2 release notes. `main` remains useful
-> for development, not for a reproducible production install:
->
-> ```bash
-> curl -fsSLO https://raw.githubusercontent.com/wpfyorg/wpfy/v1.0.0-rc2/install.sh
-> less install.sh   # review before running
-> sudo WPFY_REF=v1.0.0-rc2 WPFY_SOURCE_SHA256=<published-rc2-archive-sha256> bash install.sh
-> ```
->
-> Supported environment overrides: `WPFY_REF` (branch/tag/commit, default `main`), `WPFY_SOURCE_SHA256` (verify the downloaded archive), `WPFY_SOURCE_ARCHIVE`, `WPFY_REPO_OWNER`, `WPFY_REPO_NAME`.
+### Create, secure, and verify a site
 
-### Running from source (development)
+```bash
+# Pull required images and start the shared Traefik edge.
+wpfy stack install --nginx --php --mysql
+
+# Create and provision WordPress. `run` is the flat operator command.
+wpfy run example.com --wp
+
+# Request TLS only after DNS is ready. wpfy runs DNS/IP preflight first.
+wpfy site ssl example.com --letsencrypt
+
+# Confirm readiness and inspect the host.
+wpfy site status example.com
+wpfy debug
+```
+
+For a new site whose DNS is already correct, combine creation and TLS with `wpfy run example.com --wp -le`.
+
+### Open the browser panel
+
+The panel listens only on loopback and requires a fresh token. On the VPS, run `wpfy panel`; from your workstation, tunnel the port and open the token-bearing URL printed by the command:
+
+```bash
+ssh -L 8642:127.0.0.1:8642 user@your-server
+```
+
+The screenshot above is the real current panel against a sanitized local demo state. It shows an overview; the panel also exposes site details, health, diagnostics, logs, backups/restores, runtime actions, SFTP, WP-CLI, and PHP changes.
+
+### Develop from source
 
 ```bash
 git clone https://github.com/wpfyorg/wpfy.git
@@ -83,322 +110,185 @@ cd wpfy
 PYTHONPATH=src python3 -m wpfy --help
 ```
 
-## Repository split
+## How it works
 
-This repository is the application and installer repository. The marketing
-website and documentation are maintained separately from this public runtime
-surface.
+```mermaid
+flowchart LR
+    Internet[Internet] --> Edge["Shared Traefik edge\nRouting and ACME TLS"]
+    Edge --> WebA["site-a web: Nginx"]
+    Edge --> WebB["site-b web: Nginx"]
 
-## Prerequisites
+    subgraph SiteA["Site A: one Compose project · private network · unique UID"]
+        WebA --> AppA["PHP-FPM"]
+        AppA --> DBA["MariaDB"]
+        AppA --> RedisA["Redis (optional)"]
+        SFTPA["SFTP (optional)"]
+    end
 
-- **Ubuntu VPS** (Ubuntu-first for v1; other Linux distributions are untested).
-- **Docker Engine with the Docker Compose plugin** (`docker compose`).
-- **Python 3.10+**.
-- **Root/sudo access** for installation and site management.
-- **A domain with an A/AAAA record pointing at the server's public IP** before enabling SSL (or a Cloudflare-proxied DNS record — wpfy detects this automatically).
-- Outbound internet access (GitHub, Docker Hub / ghcr.io, Let's Encrypt, and public-IP detection services).
+    subgraph SiteB["Site B: separate Compose project · private network · unique UID"]
+        WebB --> AppB["PHP-FPM"]
+        AppB --> DBB["MariaDB"]
+        AppB --> RedisB["Redis (optional)"]
+        SFTPB["SFTP (optional)"]
+    end
+```
 
-## Quick start
+Traefik is the shared edge and routing network. The web container for each site joins that routing network; its database and optional Redis remain on that site’s private network. The persisted site definition renders the site’s Compose file and environment, making lifecycle changes reproducible and scoped to that project.
+
+## Common workflows
+
+### Inspect TLS before or after issuance
 
 ```bash
-# 1. Install the shared stack (pull images, start the Traefik edge proxy)
-wpfy stack install --nginx --php --mysql
-
-# 2. Create a WordPress site
-wpfy site create example.com --wp
-
-# 3. Add SSL once DNS points at this server
-wpfy site ssl example.com --letsencrypt
-
-# 4. Check that everything is healthy
-wpfy site status example.com
-wpfy debug
+wpfy site ssl example.com --preflight-only
+wpfy site ssl example.com --status
+wpfy site ssl example.com --renew
 ```
 
-Or create the site with SSL in one step:
+The preflight checks DNS before a certificate request. For Cloudflare DNS wildcard certificates, use the documented Cloudflare DNS flow rather than treating wildcard support as a general TLS feature.
+
+### Back up and explicitly restore
 
 ```bash
-wpfy site create example.com --wp -le
-```
-
-## Common commands
-
-Flat commands are the canonical VM/operator target surface. During migration, grouped `wpfy site ...` and `wpfy stack ...` commands remain temporary compatibility surfaces; the current flat commands reuse the proven grouped implementations until the cleanup page removes grouped parsers.
-
-| Command | Description |
-|---|---|
-| `wpfy site create <domain> --wp` | Create a WordPress site (add `-le` for SSL, `--php 8.3` to pick a PHP version) |
-| `wpfy run <domain> --wp` | Create a WordPress site through the flat CLI (currently delegates to `wpfy site create`) |
-| `wpfy site create <domain> --html` | Create a static HTML site |
-| `wpfy site list` | List managed sites |
-| `wpfy site info <domain>` | Show site metadata and file paths |
-| `wpfy site status <domain>` | Show site readiness and runtime health |
-| `wpfy site ssl <domain> --letsencrypt` | Enable Let's Encrypt SSL (runs DNS preflight first) |
-| `wpfy site ssl <domain> --status` | Show certificate status and expiry |
-| `wpfy site ssl <domain> --renew` | Force certificate renewal |
-| `wpfy site wp <domain> <wp-cli args>` | Run wp-cli inside the site's container (e.g. `wpfy site wp example.com plugin list`) |
-| `wpfy site update <domain> --php 8.4` | Change a site's PHP version |
-| `wpfy config <domain>` | Show sanitized config status without printing raw `.env` contents |
-| `wpfy config <domain> --php 8.4` | Apply controlled config mutations through the site lifecycle path |
-| `wpfy edit <domain> [--print-path]` | Print or safely open the authoritative `.env` path with a backup |
-| `wpfy refresh <domain\|all> [--restart]` | Regenerate scaffold files from authoritative state; restart only when requested |
-| `wpfy up <domain>` | Start a site's Compose runtime |
-| `wpfy down <domain> [--volumes]` | Stop a site's Compose runtime without removing volumes unless requested |
-| `wpfy compose <domain> -- <args>` | Run Docker Compose for one managed site |
-| `wpfy exec <domain> [service] -- <command>` | Run a command in a site service (`app`, `web`, `db`, `redis`, `wpcli`, or `sftp`) |
-| `wpfy cp <domain> <source> <destination>` | Copy one file into or out of a site service |
-| `wpfy pull <domain> [--all\|--service <service>]` | Pull images for one managed site |
-| `wpfy healthcheck [all\|system\|disk\|load\|app]` | Run script-safe operator health checks |
-| `wpfy motd [--compact]` | Print a safe login-style operator summary |
-| `wpfy utility password\|username\|uid\|token\|htpasswd` | Generate offline utility values without Docker |
-| `wpfy cron minute\|five-minute\|hourly\|six-hour\|daily\|weekly` | Run due WordPress cron events and small safe interval tasks |
-| `wpfy cron install\|status\|disable` | Manage systemd timers for the cron intervals |
-| `wpfy smtp set\|status\|test\|clear` | Store redacted SMTP settings and run explicit dry-run/test sends |
-| `wpfy dns cloudflare set\|status\|test\|clear` | Store redacted Cloudflare token for wildcard SSL |
-| `wpfy site backup <domain>` | Create a backup archive (files + database) |
-| `wpfy backup <domain>` | Create a backup through the flat CLI |
-| `wpfy backup prune <domain\|all> --keep N` | Prune local backup archives |
-| `wpfy backup remote list\|restore\|delete\|prune <domain>` | Manage S3-compatible remote archives |
-| `wpfy backup edge` | Back up Traefik config and ACME state |
-| `wpfy backup storage set\|status\|test\|clear` | Manage default or named S3-compatible storage profiles |
-| `wpfy backup schedule daily\|weekly\|status\|disable` | Manage one recurring all-site backup timer |
-| `wpfy site restore <domain> <backup\|--latest>` | Restore a site from an explicit backup archive |
-| `wpfy restore <domain> <backup\|--latest>` | Restore through the flat CLI |
-| `wpfy site delete <domain>` | Remove a site and its resources (asks for confirmation) |
-| `wpfy rm <domain>` | Delete through the flat CLI with the same confirmation rules as `wpfy site delete` |
-| `wpfy wp <domain> <wp-cli args>` | Run wp-cli through the flat CLI (currently delegates to `wpfy site wp`) |
-| `wpfy sftp <domain> --enable` | Enable SFTP access for a site |
-| `wpfy stack status` | Show shared stack component status |
-| `wpfy log show <domain> --nginx -f` | Follow a site's Nginx logs |
-| `wpfy clean <domain> --all` | Clear site caches (Nginx, Redis, OPcache) |
-| `wpfy secure <domain>` | Audit site/container hardening |
-| `wpfy debug [domain]` | Run diagnostics across Docker, Traefik, and sites |
-| `wpfy update --check` | Check for new wpfy releases |
-| `wpfy version` | Print the installed wpfy version |
-
-Run `wpfy <command> --help` for full flags on any command.
-
-## Release validation
-
-Page 8 validation now treats the flat CLI as the VM/operator surface under test. The disposable-VPS runner exercises flat site creation, runtime commands, config/refresh, backup/restore/listing, cron, SMTP dry-run/status, operator utilities, log cron, and flat deletion. Grouped `wpfy stack install|status` remains in validation because there is no flat stack replacement yet, and grouped site status/SSL probes remain where the flat CLI has no exact replacement.
-
-Local release checks:
-
-```bash
-PYTHONPATH=src pytest -q
-python3 -m py_compile src/wpfy/*.py
-bash -n wpfy install.sh scripts/vps-release-validation.sh scripts/vps-release-validation-remote.sh
-graphify update .
-```
-
-VM evidence is required before this release is considered VM-ready; parser tests alone are not enough. Evidence review must confirm `validation-failures.txt` is absent or empty and must also scan must-pass outputs for unexpected `[exit N]`, `result: FAIL`, and command-specific failure lines. If the disposable VPS cannot be reached, record the SSH/DNS blocker and keep grouped-parser cleanup blocked.
-
-## Architecture overview
-
-```text
-                    Internet
-                       │
-              ┌────────▼────────┐
-              │     Traefik      │  shared edge proxy
-              │  :80 / :443 +    │  Let's Encrypt ACME
-              │  ACME resolver   │
-              └───┬─────────┬───┘
-        wpfy network (shared, routing only)
-          ┌───────┘         └────────┐
-┌─────────▼─────────┐      ┌─────────▼─────────┐
-│  site: a.com      │      │  site: b.com      │
-│  ┌─────────────┐  │      │  ┌─────────────┐  │
-│  │ nginx (web) │  │      │  │ nginx (web) │  │
-│  │ php-fpm     │  │      │  │ php-fpm     │  │
-│  │ mariadb     │  │      │  │ mariadb     │  │
-│  │ redis (opt) │  │      │  │ redis (opt) │  │
-│  │ sftp (opt)  │  │      │  │ sftp (opt)  │  │
-│  └─────────────┘  │      │  └─────────────┘  │
-│  private network  │      │  private network  │
-│  unique UID       │      │  unique UID       │
-└───────────────────┘      └───────────────────┘
-```
-
-Each site lives at `/opt/wpfy/sites/<domain>/`:
-
-```text
-/opt/wpfy/sites/example.com/
-├── compose.yaml      # the site's Docker Compose definition
-├── .env              # site configuration and credentials (root-only)
-├── app/              # WordPress docroot (owned by the site's UID)
-├── nginx/            # per-site Nginx configuration
-├── php/              # per-site PHP configuration
-├── db-data/          # MariaDB data
-└── redis-data/       # Redis data (if enabled)
-```
-
-Container images used per site: `nginxinc/nginx-unprivileged` (web), `ghcr.io/wpfyorg/php-fpm` (PHP 7.4–8.4), `mariadb:11.4` (database), `redis:7.2-alpine` (optional object cache), `atmoz/sftp` (optional SFTP).
-
-## Safety model / isolation
-
-- **One Compose project per site** — separate containers, volumes, and database per domain.
-- **Unique Unix UID per site** (allocated from 100000 upward). Site files are owned by that UID and the site's containers run as it, so site A's processes cannot read site B's files even if a container is compromised.
-- **Private per-site networks** — a site's database and Redis are only reachable from that site's containers. Only the web container joins the shared Traefik network.
-- **Unprivileged web server** — Nginx runs as a non-root container (`nginx-unprivileged`).
-- **Credential hygiene** — per-site secrets live in the site's `.env` with restrictive permissions; backup archives are written with `0600` permissions.
-
-This is an isolation *model*, not a guarantee. As beta software, it has not yet had an independent security review — treat multi-tenant hosting of untrusted parties as out of scope for now.
-
-## SSL and DNS behavior
-
-SSL is **opt-in** via `-le` / `--letsencrypt` at create time, or later with `wpfy site ssl <domain> --letsencrypt`.
-
-Before any certificate is requested, wpfy runs a **preflight check**:
-
-1. Resolves the domain's A/AAAA records.
-2. Detects the server's public IP (via api.ipify.org, ifconfig.me, or checkip.amazonaws.com).
-3. Passes if the records match the server's IP, **or** if the domain resolves to Cloudflare's IP ranges (proxied mode).
-4. Fails with a clear message otherwise — no certificate request is attempted against misconfigured DNS, which protects you from Let's Encrypt rate limits.
-
-Certificates are obtained and renewed by **Traefik's ACME resolver**. For Cloudflare-proxied domains, wpfy automatically switches to HTTP-01 challenge mode (force with `--proxied` / `--no-proxied`). Check status anytime with `wpfy site ssl <domain> --status`; run only the preflight with `--preflight-only`.
-
-**Wildcard certificates are supported with Cloudflare DNS only.**
-
-## Backups and restore
-
-```bash
+wpfy backup example.com
 wpfy backup example.com --list
-wpfy backup example.com --path /root/wpfy-backups
-wpfy backup example.com --s3 --profile weekly --keep-local 7
-wpfy backup prune example.com --keep 7 --dry-run
-wpfy backup remote list example.com --profile weekly
-wpfy backup remote restore example.com --latest --profile weekly
-wpfy backup edge --path /root/wpfy-edge-backups
-wpfy backup all --path /root/wpfy-backups
-printf '%s\n' '<secret-key>' | wpfy backup storage set --profile weekly --endpoint https://s3.example.com --bucket site-backups --region auto --access-key ... --secret-key-stdin
-wpfy backup schedule daily --time 02:30 --s3
-wpfy restore example.com --list
 wpfy restore example.com --latest
-wpfy site backup example.com
-wpfy site restore example.com /var/lib/wpfy/backups/example.com/example.com-20260611120000.tar.gz
 ```
 
-- Backups are written to `/var/lib/wpfy/backups/<domain>/<domain>-<timestamp>.tar.gz` with `0600` permissions.
-- `wpfy backup <domain> --list` and `wpfy restore <domain> --list` print local archive candidates without reading archive contents.
-- `wpfy backup <domain> --path <directory>` keeps the canonical local archive and copies the verified archive to the destination directory with `0600` permissions.
-- `wpfy backup all [--path <directory>] [--s3]` processes every managed site in sorted order and reports per-site failures without stopping the whole run.
-- `wpfy backup <domain> --s3` uploads the verified local archive to S3-compatible storage using `WPFY_BACKUP_S3_ENDPOINT`, `WPFY_BACKUP_S3_BUCKET`, `WPFY_BACKUP_S3_REGION`, `WPFY_BACKUP_S3_ACCESS_KEY`, `WPFY_BACKUP_S3_SECRET_KEY`, and optional `WPFY_BACKUP_S3_PREFIX`.
-- `wpfy backup <domain> --keep-local N` prunes older local archives only after the new archive verifies.
-- `wpfy backup prune <domain|all> --keep N [--dry-run]` prunes local archives explicitly.
-- `wpfy restore <domain> --latest` restores the newest local archive only when explicitly requested; restore never chooses latest by default.
-- `wpfy backup storage set/status/test/clear [--profile NAME]` stores the default target in `/etc/wpfy/backup-storage.env` or named targets in `/etc/wpfy/backup-storage.d/<profile>.env`, mode `0600`. Environment variables override only the default profile.
-- `wpfy backup remote list|restore|delete|prune <domain> [--profile NAME]` operates only under the managed `<prefix>/<domain>/` key prefix. Delete/prune require `--force`; remote restore downloads to a temp file and validates before live mutation.
-- `wpfy backup edge [--path DIR] [--s3 --profile NAME]` captures Traefik compose/static config and `acme.json` when available; `wpfy restore edge <archive> --force` validates members before writing and restarting Traefik.
-- `wpfy backup schedule daily|weekly` installs one `systemd` timer that runs `wpfy backup all`; `status` shows whether it is configured, and `disable` stops the timer without deleting backup storage config.
-- An archive contains the site's `compose.yaml`, `.env`, `app/` (WordPress files), `nginx/`, `php/`, and a SQL dump taken with `mariadb-dump --single-transaction` when the database is running.
-- Every archive is verified after creation.
-- Restore validates the archive and checks free disk space **before** touching the live site, stops the runtime, restores files and ownership, preserves the live database credentials, restarts the stack, and imports the SQL dump. An invalid archive aborts the restore with no changes made.
+Archives are verified after creation. Restore validates the archive and available disk space before stopping the runtime; `--latest` is deliberately explicit.
 
-Remote lifecycle policy is wpfy-managed prune, not a provider bucket lifecycle API.
-
-## Diagnostics
+### Change PHP and run WP-CLI
 
 ```bash
-wpfy debug              # whole-server diagnostics
-wpfy debug example.com  # one site
+wpfy config example.com --php 8.3
+wpfy site status example.com
+wpfy wp example.com plugin list
 ```
 
-Checks include: Docker daemon availability, Traefik status, Docker disk usage, registry/filesystem consistency, per-site scaffold and WordPress bootstrap completeness, container health (web/app/db/redis), an HTTP probe against the site's health endpoint, and SSL certificate status/expiry. Results are reported as `[PASS]`, `[WARN]`, or `[FAIL]` lines — useful output to attach to bug reports (redact your domains if you prefer).
-
-## SFTP lifecycle
+### Give and remove per-site SFTP access
 
 ```bash
-wpfy sftp example.com --enable                 # auto-generates a password
-wpfy sftp example.com --enable --password ...  # or bring your own
+wpfy sftp example.com --enable
 wpfy sftp example.com --status
 wpfy sftp example.com --disable
 ```
 
-Enabling SFTP adds an isolated `atmoz/sftp` container to the site's stack, chrooted to the site's docroot, with a unique host port allocated from 2222 upward. The username is `sftpuser`; the generated password is shown once at enable time. Disabling removes the container and its compose service. SFTP is per-site and off by default.
+SFTP is disabled by default. Enabling it adds a site-scoped container and allocates a loopback-bound host port; generated credentials are shown once.
 
-## Browser control panel
-
-```bash
-wpfy panel                    # serve on 127.0.0.1:8642 with a fresh token
-wpfy panel --port 9000        # different port
-wpfy panel --token <token>    # bring your own token (e.g. for scripted tunnels)
-```
-
-`wpfy panel` serves a local dashboard over the same operation layer the CLI uses — site table, health and diagnostics, container logs, backups and restore, runtime start/stop, SFTP toggle, a WP-CLI runner, and PHP version changes. It is **loopback-only by design**: the server refuses to bind non-loopback addresses, and every API request requires the bearer token printed at startup (the URL carries it in the fragment, which never reaches server logs).
-
-To use it from your workstation against a VPS, tunnel the port over SSH and open the printed URL locally:
+### Diagnose a problem
 
 ```bash
-ssh -L 8642:127.0.0.1:8642 user@your-server
+wpfy debug example.com
+wpfy log show example.com --nginx -f
+wpfy secure example.com
 ```
 
-The panel never returns `.env` or state secrets, destructive actions (stop, restore, SFTP disable) require confirmation in the UI, and nothing is exposed publicly — there is no public web admin surface.
+## Command reference
 
-## Example workflows
+Flat commands are the primary operator surface where an exact equivalent exists. Grouped `site` and `stack` commands remain for operations that do not yet have a flat counterpart.
 
-**Launch a site behind Cloudflare:**
+| Need | Command |
+|---|---|
+| Create a site | `wpfy run <domain> --wp` |
+| Check a site | `wpfy site status <domain>` |
+| Manage TLS | `wpfy site ssl <domain> --letsencrypt` |
+| Back up or restore | `wpfy backup <domain>` · `wpfy restore <domain> --latest` |
+| Run WordPress CLI | `wpfy wp <domain> <wp-cli args>` |
+| Control runtime | `wpfy up|down|pull <domain>` |
+| Inspect or edit config | `wpfy config <domain>` · `wpfy edit <domain>` |
+| Diagnose or audit | `wpfy debug [domain]` · `wpfy secure <domain>` |
+| Start panel | `wpfy panel` |
 
-```bash
-wpfy site create example.com --wp -le   # Cloudflare proxying is auto-detected
-wpfy site ssl example.com --status
-```
+Run `wpfy <command> --help` for arguments and examples.
 
-**Move a site to PHP 8.4 with a safety net:**
+<details>
+<summary>More operator surfaces</summary>
 
-```bash
-wpfy site backup example.com
-wpfy site update example.com --php 8.4
-wpfy site status example.com
-wpfy site wp example.com core verify-checksums
-```
+| Group | Commands |
+|---|---|
+| Site and runtime | `wpfy site list|info|show|update|delete`, `wpfy compose`, `wpfy exec`, `wpfy cp`, `wpfy refresh`, `wpfy healthcheck`, `wpfy motd` |
+| Backups | `wpfy backup prune`, `wpfy backup storage`, `wpfy backup remote`, `wpfy backup edge`, `wpfy restore edge`, `wpfy backup schedule` |
+| Operations | `wpfy sftp`, `wpfy clean`, `wpfy log`, `wpfy cron`, `wpfy smtp`, `wpfy dns cloudflare`, `wpfy utility`, `wpfy update`, `wpfy version` |
+| Shared stack | `wpfy stack install|status|upgrade|remove|purge` |
 
-**Give a developer file access without SSH:**
+Use `wpfy --help` to see the complete command tree. Commands that can delete sites, remove volumes, purge the shared stack, or remove remote backups require care and, where implemented, explicit confirmation or `--force`.
 
-```bash
-wpfy sftp example.com --enable
-# share the printed host, port, and one-time credentials
-wpfy sftp example.com --disable   # when they're done
-```
+</details>
 
-**Decommission a site:**
+## Safety and isolation
 
-```bash
-wpfy site backup example.com      # keep a final archive
-wpfy site delete example.com      # prompts: Delete example.com? [y/N]
-```
+wpfy’s model is designed to reduce accidental cross-site coupling, not to make security guarantees.
+
+- **Per-site Compose projects:** each site has distinct containers, data, files, and database state.
+- **Network boundaries:** database and optional Redis are private to the site; only the web container joins the shared Traefik routing network.
+- **Unix identity:** wpfy allocates a unique site UID and applies it to site files.
+- **Nginx hardening:** the web service uses `nginxinc/nginx-unprivileged` and generated Nginx configuration denies common sensitive paths.
+- **Secret and backup handling:** site `.env` files are restricted, and local backup archives are written with mode `0600`.
+- **Panel exposure:** the panel refuses non-loopback binds, uses a bearer token, and is intended for SSH-tunnel access.
+
+Important limits:
+
+- Docker-daemon access and Traefik’s Docker socket access are host-level trust boundaries. A Docker or host compromise defeats per-site isolation.
+- wpfy has **not** had an independent security audit or penetration test.
+- RC2’s release validation is incomplete; do not infer production readiness from local tests or CI alone.
+- Hosting mutually untrusted tenants on a shared host is out of scope during beta.
+
+Read [SECURITY.md](SECURITY.md) before production use or security testing.
+
+## Backups and disaster recovery
+
+wpfy creates a local archive containing the managed site configuration, application files, generated web/PHP configuration, and a database dump when the database is running. Creation verifies the archive before publishing it; restore validates archive members and disk space before live mutation, preserves the live database credentials, then restarts and imports the database.
+
+Supported recovery operations include:
+
+- Local archive listing, explicit `--latest` restore, and retention/pruning.
+- Verified copies to a destination directory.
+- S3-compatible upload, named storage profiles, remote list/restore/delete/prune, and one systemd backup timer.
+- Traefik/ACME edge backup and forced edge restore.
+
+Remote deletion and pruning are explicit operations. wpfy manages its own object keys; it does not configure your storage provider’s bucket lifecycle policy.
+
+## Compatibility and requirements
+
+| Item | Current position |
+|---|---|
+| Host OS | Ubuntu-first in v1. Other Linux distributions are untested. |
+| Python | Python `>=3.10`; public CI currently exercises 3.10 and 3.12. |
+| Container runtime | Docker Engine with the Docker Compose plugin is required. |
+| Host architecture | No end-to-end host compatibility matrix is published. The PHP-image workflow builds `linux/amd64` and `linux/arm64` images. |
+| Permissions | Installation and site management need root or sudo access. |
+| TLS DNS | Public A/AAAA records must point at the VPS, or a Cloudflare-proxied record must be detected. |
+| Wildcard TLS | Supported only through the Cloudflare DNS flow. |
 
 ## Known limitations
 
-- **Beta software** — interfaces and behavior may change between releases.
-- **Ubuntu-first** — other distributions are untested for v1.
-- **Wildcard SSL is Cloudflare-only** — use `wpfy dns cloudflare set --token-stdin` and `--letsencrypt wildcard --dns cloudflare`.
-- **Remote lifecycle is explicit** — wpfy prunes managed keys; it does not configure provider bucket lifecycle policies.
-- **`wpfy stack migrate` is not implemented** — there is no automated migration from host-level (non-Docker) stacks yet.
-- **Helper tools are opt-in prep only** — `--phpmyadmin`, `--adminer`, and `--composer` pull pinned-major helper images but do not expose a public dashboard. `--mysqltuner` skips until a vetted pinned image exists. Host-level options from classic stack managers (`--fail2ban`, `--ufw`, `--netdata`, etc.) are intentionally not managed by wpfy's Docker-first design — configure them on the host yourself.
-- **Destructive commands:**
-  - `wpfy site delete` asks for confirmation interactively, but proceeds without a prompt when run non-interactively (e.g., in scripts) — treat it as immediate in automation. `--force` skips the prompt explicitly.
-  - `wpfy stack purge` removes the edge proxy Compose project only with explicit `--force`; without it, the command exits nonzero before mutation.
-- **No independent security audit yet** — see [Safety model](#safety-model--isolation).
+- This is beta software. Interfaces and behavior may change before a final v1.0.0 release.
+- RC2 is missing several real-world validation gates listed in its [release notes](https://github.com/wpfyorg/wpfy/releases/tag/v1.0.0-rc2).
+- `wpfy stack migrate` does not migrate host-installed WordPress stacks in v1.
+- The MySQLTuner helper is skipped until a vetted pinned image exists.
+- phpMyAdmin, Adminer, and Composer helpers are pull-only; they do not create a public dashboard.
+- wpfy intentionally does not manage host-level firewall, SSH, fail2ban, Netdata, or similar host services.
 
-## Roadmap
+See [ROADMAP.md](ROADMAP.md) for planned hardening and future work. Planned items are not current features.
 
-See [ROADMAP.md](ROADMAP.md). Headlines: beta hardening on real-world VPS providers, installer hardening (signed/checksummed release artifacts, pinned-version installs), expanded documentation, and deferred host-stack migration.
+## Documentation and support
 
-## Release validation policy
-
-Public source tags retain Python tests and run them on GitHub Actions. Tests are
-excluded from wheels, sdists, and `/opt/wpfy/app`; production hosts receive only
-runtime material. RC2 is locally validated only until disposable-VPS and provider
-evidence is published; see [ROADMAP.md](ROADMAP.md) for remaining gates.
-
-## Security
-
-Please report vulnerabilities privately — see [SECURITY.md](SECURITY.md). Do not open public issues for security problems.
+- [Release notes](https://github.com/wpfyorg/wpfy/releases/tag/v1.0.0-rc2) for RC2 provenance, validation, and known deferred checks.
+- [Roadmap](ROADMAP.md) for beta hardening and v2 candidates.
+- [Security policy](SECURITY.md) for private vulnerability reporting and threat-model boundaries.
+- [Bug report](https://github.com/wpfyorg/wpfy/issues/new?template=bug_report.md) for reproducible problems. Redact domains, IPs, tokens, passwords, and `.env` contents.
+- [Feature request](https://github.com/wpfyorg/wpfy/issues/new?template=feature_request.md) for ideas not already covered by the roadmap.
 
 ## Contributing
 
-Bug reports, feedback from real VPS deployments, and pull requests are welcome — this is exactly what the beta period is for. See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup, test instructions, and PR expectations.
+Contributions and deployment feedback are welcome during beta. Read [CONTRIBUTING.md](CONTRIBUTING.md), keep changes focused, and run the relevant tests before opening a pull request:
 
-## License
+```bash
+pytest -q
+```
 
-wpfy is licensed under the **GNU Affero General Public License v3.0** (AGPL-3.0-only). You can use, modify, and self-host wpfy freely; if you offer a modified wpfy as a network service, the AGPL requires you to make your modified source available to its users. See [LICENSE](LICENSE).
+Please use [private security reporting](SECURITY.md) instead of public issues for vulnerabilities.
+
+## Security and license
+
+Report vulnerabilities through [GitHub Security Advisories](https://github.com/wpfyorg/wpfy/security/advisories/new), not a public issue. wpfy is licensed under the [GNU Affero General Public License v3.0 only](LICENSE).
