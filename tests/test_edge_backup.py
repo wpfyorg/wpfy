@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import tarfile
 from pathlib import Path
 
@@ -28,6 +29,79 @@ def test_backup_edge_archives_config_and_acme(tmp_path, monkeypatch):
     archive_path = Path(result.message.removeprefix("edge backup created: "))
     with tarfile.open(archive_path, "r:gz") as archive:
         assert set(archive.getnames()) >= {"edge/compose.yaml", "edge/traefik.yml", "edge/letsencrypt/acme.json"}
+
+
+def test_backup_edge_uploads_with_shared_file_signer(tmp_path, monkeypatch):
+    import wpfy.edge_backup
+    from wpfy.s3_backup import S3Uploader
+
+    monkeypatch.setenv("WPFY_SKIP_RUNTIME", "1")
+    monkeypatch.setenv("WPFY_BACKUP_S3_ENDPOINT", "https://storage.example.test")
+    monkeypatch.setenv("WPFY_BACKUP_S3_BUCKET", "site-backups")
+    monkeypatch.setenv("WPFY_BACKUP_S3_REGION", "auto")
+    monkeypatch.setenv("WPFY_BACKUP_S3_ACCESS_KEY", "access-key")
+    monkeypatch.setenv("WPFY_BACKUP_S3_SECRET_KEY", "secret-key")
+    root = tmp_path / "traefik"
+    _patch_traefik_paths(monkeypatch, wpfy.edge_backup, root)
+    root.mkdir()
+    (root / "compose.yaml").write_text("services: {}\n", encoding="utf-8")
+    observed = {}
+
+    class Response(io.BytesIO):
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            self.close()
+
+    def opener(request, *, timeout):
+        observed["authorization"] = request.headers["Authorization"]
+        observed["file_body"] = not isinstance(request.data, bytes)
+        return Response()
+
+    result = wpfy.edge_backup.backup_edge(
+        destination_dir=tmp_path / "backups",
+        upload_s3=True,
+        uploader=S3Uploader(opener),
+    )
+
+    assert result.exit_code == 0
+    assert observed["file_body"] is True
+    assert "SignedHeaders=content-length;host;x-amz-content-sha256;x-amz-date" in observed["authorization"]
+    assert Path(result.message.split(";", 1)[0].removeprefix("edge backup created: ")).exists()
+
+
+def test_backup_edge_upload_failure_preserves_archive_and_redacts_secret(tmp_path, monkeypatch):
+    import wpfy.edge_backup
+    from wpfy.s3_backup import S3Uploader
+
+    monkeypatch.setenv("WPFY_SKIP_RUNTIME", "1")
+    monkeypatch.setenv("WPFY_BACKUP_S3_ENDPOINT", "https://storage.example.test")
+    monkeypatch.setenv("WPFY_BACKUP_S3_BUCKET", "site-backups")
+    monkeypatch.setenv("WPFY_BACKUP_S3_REGION", "auto")
+    monkeypatch.setenv("WPFY_BACKUP_S3_ACCESS_KEY", "access-key")
+    monkeypatch.setenv("WPFY_BACKUP_S3_SECRET_KEY", "secret-key")
+    root = tmp_path / "traefik"
+    _patch_traefik_paths(monkeypatch, wpfy.edge_backup, root)
+    root.mkdir()
+    (root / "compose.yaml").write_text("services: {}\n", encoding="utf-8")
+
+    def fail_upload(request, *, timeout):
+        raise OSError("upload denied for secret-key")
+
+    result = wpfy.edge_backup.backup_edge(
+        destination_dir=tmp_path / "backups",
+        upload_s3=True,
+        uploader=S3Uploader(fail_upload),
+    )
+
+    local_path = Path(result.message.split(";", 1)[0].removeprefix("edge backup created: "))
+    assert result.exit_code != 0
+    assert local_path.exists()
+    assert "secret-key" not in result.message
+    assert "***REDACTED***" in result.message
 
 
 def test_restore_edge_validates_then_restarts_without_regenerating(tmp_path, monkeypatch):

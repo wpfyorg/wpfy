@@ -55,13 +55,19 @@ def test_site_health_queries_each_required_service_once(tmp_wpfy_home, monkeypat
         "_compose_service_ids",
         lambda domain_arg, service: calls.append(service) or [f"{service}-id"],
     )
-    monkeypatch.setattr(runtime, "_container_health", lambda container_id: "healthy")
+    inspect_calls = []
+    monkeypatch.setattr(
+        runtime,
+        "_container_healths",
+        lambda container_ids: inspect_calls.append(container_ids) or ["healthy"] * len(container_ids),
+    )
     monkeypatch.setattr(runtime, "_compose_exec", lambda *args: Proc(stdout=f"wpfy-ok {domain}"))
 
     result = runtime.site_health(domain)
 
     assert result.runtime_ready is True
     assert Counter(calls) == Counter({"web": 1, "app": 1, "db": 1, "redis": 1})
+    assert inspect_calls == [["web-id", "app-id", "db-id", "redis-id"]]
 
 
 def test_site_health_skips_services_not_used_by_flavor(tmp_wpfy_home, monkeypatch):
@@ -80,13 +86,19 @@ def test_site_health_skips_services_not_used_by_flavor(tmp_wpfy_home, monkeypatc
         "_compose_service_ids",
         lambda domain_arg, service: calls.append(service) or [f"{service}-id"],
     )
-    monkeypatch.setattr(runtime, "_container_health", lambda container_id: "healthy")
+    inspect_calls = []
+    monkeypatch.setattr(
+        runtime,
+        "_container_healths",
+        lambda container_ids: inspect_calls.append(container_ids) or ["healthy"] * len(container_ids),
+    )
     monkeypatch.setattr(runtime, "_compose_exec", lambda *args: Proc(stdout=f"wpfy-ok {domain}"))
 
     result = runtime.site_health(domain)
 
     assert result.runtime_ready is True
     assert Counter(calls) == Counter({"web": 1, "app": 1})
+    assert inspect_calls == [["web-id", "app-id"]]
 
 
 def test_backup_streams_database_dump_to_archive(tmp_wpfy_home, monkeypatch):
@@ -189,7 +201,7 @@ def test_restore_streams_database_file_to_stdin(tmp_wpfy_home, tmp_path, monkeyp
     monkeypatch.setattr(layout, "runtime_skip_requested", lambda: False)
     monkeypatch.setattr(layout, "compose_command", lambda *args: Proc())
     monkeypatch.setattr(layout, "start_site_runtime", lambda domain_arg: layout.RuntimeResult(0, "started", ran=True))
-    monkeypatch.setattr(layout, "_wait_for_service", lambda *args: layout.RuntimeResult(0, "ready", ran=True))
+    monkeypatch.setattr(layout, "wait_for_service", lambda *args: layout.RuntimeResult(0, "ready", ran=True))
     monkeypatch.setattr(layout.subprocess, "run", fake_run)
 
     result = layout.restore_site(domain, str(archive_path))
@@ -201,6 +213,7 @@ def test_wordpress_download_copies_bounded_chunks(tmp_wpfy_home, monkeypatch):
     import wpfy.site_layout as layout
 
     importlib.reload(layout)
+    monkeypatch.setenv("WPFY_SKIP_RUNTIME", "1")
     domain = "stream-wordpress.example.com"
     spec = layout.SiteSpec(domain=domain, flavor="wp", use_mysql=True, use_redis=False)
     layout.ensure_site_scaffold(spec)

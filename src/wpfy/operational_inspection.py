@@ -10,7 +10,7 @@ from .settings import PATHS
 from .site_definition import MYSQL_FLAVORS, SiteDefinition
 from .site_layout import list_sites, site_info, web_service_lines
 from .site_paths import domain_to_project, env_path, nginx_conf_path, read_env, site_dir
-from .site_runtime import _http_probe_site, compose_command, docker_available, runtime_skip_requested
+from .site_runtime import compose_command, docker_available, http_probe_site, runtime_skip_requested
 
 
 @dataclass(frozen=True, slots=True)
@@ -232,7 +232,7 @@ def site_diagnostics(domain: str) -> tuple[InspectionCheck, ...]:
         "valid" if proc.returncode == 0 else proc.stderr.strip()[:120] or "config invalid",
     ))
     try:
-        probe = _http_probe_site(domain)
+        probe = http_probe_site(domain)
         checks.append(InspectionCheck("http probe", probe.ran and probe.exit_code == 0, probe.message))
     except (OSError, subprocess.SubprocessError, ValueError) as exc:
         checks.append(InspectionCheck("http probe", False, str(exc)))

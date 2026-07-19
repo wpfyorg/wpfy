@@ -3,7 +3,45 @@ from __future__ import annotations
 import pytest
 import datetime
 
-from wpfy.certificate_lifecycle import preflight_ssl, get_cert_info, cert_expiry_days
+from wpfy.certificate_lifecycle import cert_expiry_days, detect_public_ips, get_cert_info, preflight_ssl
+
+
+def test_detect_public_ips_stops_after_first_ipv4(monkeypatch):
+    import wpfy.certificate_lifecycle as lifecycle
+
+    calls = []
+    values = iter(("2001:db8::1", "192.0.2.10", "198.51.100.20"))
+    monkeypatch.setattr(lifecycle, "public_ip_via_url", lambda url: calls.append(url) or next(values))
+
+    assert detect_public_ips() == (("192.0.2.10",), ("2001:db8::1",))
+    assert len(calls) == 2
+
+
+def test_detect_public_ips_falls_through_failures(monkeypatch):
+    import wpfy.certificate_lifecycle as lifecycle
+
+    calls = []
+    values = iter((None, None, "192.0.2.10"))
+    monkeypatch.setattr(lifecycle, "public_ip_via_url", lambda url: calls.append(url) or next(values))
+
+    assert detect_public_ips() == (("192.0.2.10",), ())
+    assert len(calls) == 3
+
+
+def test_detect_public_ips_all_fail_is_unknown(monkeypatch):
+    import wpfy.certificate_lifecycle as lifecycle
+
+    calls = []
+    monkeypatch.setattr(lifecycle, "public_ip_via_url", lambda url: calls.append(url))
+
+    assert detect_public_ips() == ((), ())
+    assert len(calls) == 3
+
+
+def test_detect_public_ips_override_keeps_ipv4_and_ipv6(monkeypatch):
+    monkeypatch.setenv("WPFY_TEST_PUBLIC_IPS", "2001:db8::1,192.0.2.10,2001:db8::1")
+
+    assert detect_public_ips() == (("192.0.2.10",), ("2001:db8::1",))
 
 
 def test_preflight_ssl_passes_with_test_overrides(monkeypatch):

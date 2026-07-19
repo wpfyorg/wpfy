@@ -20,6 +20,31 @@ def _spec(**kwargs) -> SiteSpec:
     return SiteSpec(**kwargs)
 
 
+def _mock_wordpress_download(monkeypatch, layout, members):
+    monkeypatch.setenv("WPFY_SKIP_RUNTIME", "1")
+    payload = io.BytesIO()
+    with tarfile.open(fileobj=payload, mode="w:gz") as archive:
+        for name, content in members.items():
+            member = tarfile.TarInfo(f"wordpress/{name}")
+            member.size = len(content)
+            archive.addfile(member, io.BytesIO(content))
+    archive_bytes = payload.getvalue()
+
+    class Response(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            self.close()
+
+    responses = iter([
+        Response(b'{"offers":[{"response":"upgrade","locale":"en_US","current":"7.0.1"}]}'),
+        Response(hashlib.sha1(archive_bytes).hexdigest().encode("ascii")),
+        Response(archive_bytes),
+    ])
+    monkeypatch.setattr(layout, "urlopen", lambda *args, **kwargs: next(responses))
+
+
 def test_validate_domain_valid():
     validate_domain("example.com")
     validate_domain("sub.example.com")
@@ -374,6 +399,90 @@ def test_ensure_site_scaffold_writes_private_env(tmp_wpfy_home, monkeypatch):
     assert mode == 0o600
 
 
+def test_ensure_site_scaffold_rejects_env_symlink_before_writing_files(
+    tmp_wpfy_home, monkeypatch, tmp_path
+):
+    import wpfy.site_layout
+
+    importlib.reload(wpfy.site_layout)
+    domain = "env-scaffold-symlink.example.com"
+    site_root = wpfy.site_layout.site_dir(domain)
+    site_root.mkdir(parents=True)
+    external = tmp_path / "external-env"
+    external.write_bytes(b"sentinel")
+    wpfy.site_layout.env_path(domain).symlink_to(external)
+    spec = wpfy.site_layout.SiteSpec(domain=domain, flavor="wp", use_mysql=True, use_redis=False)
+
+    with pytest.raises(ValueError, match="unsafe scaffold destination symlink"):
+        wpfy.site_layout.ensure_site_scaffold(spec)
+
+    assert external.read_bytes() == b"sentinel"
+    assert not wpfy.site_layout.compose_path(domain).exists()
+
+
+def test_ensure_site_scaffold_propagates_ownership_failure(tmp_wpfy_home, monkeypatch):
+    import wpfy.site_layout
+
+    importlib.reload(wpfy.site_layout)
+    domain = "ownership-scaffold-failure.example.com"
+    monkeypatch.setattr(
+        wpfy.site_layout,
+        "_apply_site_ownership",
+        lambda *args: wpfy.site_layout.RuntimeResult(3, "ownership failed safely"),
+    )
+    spec = wpfy.site_layout.SiteSpec(domain=domain, flavor="wp", use_mysql=True, use_redis=False)
+
+    with pytest.raises(ValueError, match="ownership failed safely"):
+        wpfy.site_layout.ensure_site_scaffold(spec)
+
+
+def test_ensure_site_scaffold_rejects_env_symlink_inserted_after_validation(
+    tmp_wpfy_home, monkeypatch, tmp_path
+):
+    import wpfy.site_layout
+
+    importlib.reload(wpfy.site_layout)
+    domain = "env-scaffold-race.example.com"
+    external = tmp_path / "external-env-race"
+    external.write_bytes(b"sentinel")
+
+    original_read = wpfy.site_layout._read_text_safely
+
+    def read_and_swap(root, name):
+        content = original_read(root, name)
+        if name == "compose.yaml" and not wpfy.site_layout.env_path(domain).exists():
+            wpfy.site_layout.env_path(domain).symlink_to(external)
+        return content
+
+    monkeypatch.setattr(wpfy.site_layout, "_read_text_safely", read_and_swap)
+    spec = wpfy.site_layout.SiteSpec(domain=domain, flavor="wp", use_mysql=True, use_redis=False)
+
+    with pytest.raises(ValueError, match="unsafe scaffold destination"):
+        wpfy.site_layout.ensure_site_scaffold(spec)
+
+    assert external.read_bytes() == b"sentinel"
+
+
+def test_apply_site_ownership_rejects_environment_symlink(
+    tmp_wpfy_home, monkeypatch, tmp_path
+):
+    import wpfy.site_layout
+
+    importlib.reload(wpfy.site_layout)
+    domain = "ownership-env-symlink.example.com"
+    site_root = wpfy.site_layout.site_dir(domain)
+    site_root.mkdir(parents=True)
+    external = tmp_path / "external-ownership-env"
+    external.write_text("SITE_UID=100042\n", encoding="utf-8")
+    wpfy.site_layout.env_path(domain).symlink_to(external)
+
+    result = wpfy.site_layout.apply_site_ownership(domain)
+
+    assert result.exit_code != 0
+    assert "unsafe site environment" in result.message
+    assert external.read_text(encoding="utf-8") == "SITE_UID=100042\n"
+
+
 def test_ensure_site_scaffold_persists_site_uid(tmp_wpfy_home, monkeypatch):
     import wpfy.site_layout
 
@@ -399,6 +508,47 @@ def test_ensure_site_scaffold_reuses_existing_site_uid(tmp_wpfy_home, monkeypatc
     wpfy.site_layout.ensure_site_scaffold(spec)
     second = wpfy.site_layout.read_env(wpfy.site_layout.env_path("reuse.example.com"))["SITE_UID"]
     assert first == second
+
+
+def test_ensure_site_scaffold_noop_preserves_registry_bytes_and_mtime(tmp_wpfy_home, monkeypatch):
+    import wpfy.site_layout
+
+    importlib.reload(wpfy.site_layout)
+    spec = wpfy.site_layout.SiteSpec(domain="registry-noop.example.com", flavor="wp", use_mysql=True, use_redis=False)
+    wpfy.site_layout.ensure_site_scaffold(spec)
+    registry_path = Path(tmp_wpfy_home.state_dir) / "sites.json"
+    before = registry_path.read_bytes(), registry_path.stat().st_mtime_ns
+    calls = []
+    real_add = wpfy.site_layout.registry.add_site
+    monkeypatch.setattr(
+        wpfy.site_layout.registry,
+        "add_site",
+        lambda *args, **kwargs: calls.append(args) or real_add(*args, **kwargs),
+    )
+
+    assert wpfy.site_layout.ensure_site_scaffold(spec) == []
+    assert calls == []
+    assert (registry_path.read_bytes(), registry_path.stat().st_mtime_ns) == before
+
+
+def test_ensure_site_scaffold_changed_metadata_preserves_registry_state(tmp_wpfy_home):
+    import wpfy.site_layout
+
+    importlib.reload(wpfy.site_layout)
+    domain = "registry-change.example.com"
+    initial = wpfy.site_layout.SiteSpec(domain=domain, flavor="wp", use_mysql=True, use_redis=False)
+    wpfy.site_layout.ensure_site_scaffold(initial)
+    wpfy.site_layout.registry.update_site(domain, {"created_at": "kept", "maintenance": "enabled"})
+
+    changed = wpfy.site_layout.SiteSpec(domain=domain, flavor="wpredis", use_mysql=True, use_redis=True)
+    wpfy.site_layout.ensure_site_scaffold(changed)
+
+    metadata = wpfy.site_layout.registry.get_site(domain)
+    assert metadata is not None
+    assert metadata["created_at"] == "kept"
+    assert metadata["maintenance"] == "enabled"
+    assert metadata["flavor"] == "wpredis"
+    assert metadata["cache_type"] == "redis"
 
 
 def test_site_uids_are_unique_across_sites(tmp_wpfy_home, monkeypatch):
@@ -437,17 +587,73 @@ def test_apply_site_ownership_chowns_when_root(tmp_wpfy_home, monkeypatch):
     (wpfy.site_layout.app_dir("root.example.com") / "index.php").write_text("<?php\n", encoding="utf-8")
 
     chowned: list[tuple] = []
+    descriptor_chowns: list[tuple[int, int]] = []
     monkeypatch.setattr(wpfy.site_layout.os, "geteuid", lambda: 0, raising=False)
-    monkeypatch.setattr(wpfy.site_layout.os, "chown", lambda path, uid, gid: chowned.append((str(path), uid, gid)))
+    monkeypatch.setattr(
+        wpfy.site_layout.os,
+        "chown",
+        lambda path, uid, gid, **kwargs: chowned.append((str(path), uid, gid)),
+    )
+    monkeypatch.setattr(
+        wpfy.site_layout.os,
+        "fchown",
+        lambda fd, uid, gid: descriptor_chowns.append((uid, gid)),
+    )
+    monkeypatch.setattr(wpfy.site_layout.os, "fchmod", lambda fd, mode: None)
     result = wpfy.site_layout._apply_site_ownership("root.example.com", 100042)
 
     assert result.ran is True
-    owned = {path for path, uid, gid in chowned}
     assert all(uid == 100042 and gid == 100042 for _, uid, gid in chowned)
-    assert str(wpfy.site_layout.app_dir("root.example.com")) in owned
-    assert str(wpfy.site_layout.app_dir("root.example.com") / "index.php") in owned
-    assert str(wpfy.site_layout.db_data_dir("root.example.com")) in owned
-    assert str(wpfy.site_layout.redis_data_dir("root.example.com")) in owned
+    assert all(uid == 100042 and gid == 100042 for uid, gid in descriptor_chowns)
+    assert "index.php" in {path for path, _, _ in chowned}
+    assert len(descriptor_chowns) >= 3
+
+
+def test_apply_site_ownership_rejects_symlink_without_following_target(tmp_wpfy_home, monkeypatch, tmp_path):
+    import wpfy.site_layout
+
+    importlib.reload(wpfy.site_layout)
+    domain = "ownership-symlink.example.com"
+    spec = wpfy.site_layout.SiteSpec(domain=domain, flavor="wp", use_mysql=True, use_redis=False)
+    wpfy.site_layout.ensure_site_scaffold(spec)
+    external = tmp_path / "external-owned-file"
+    external.write_bytes(b"sentinel")
+    (wpfy.site_layout.app_dir(domain) / "unsafe-link").symlink_to(external)
+    monkeypatch.setattr(wpfy.site_layout.os, "geteuid", lambda: 0, raising=False)
+    monkeypatch.setattr(wpfy.site_layout.os, "fchown", lambda fd, uid, gid: None)
+    monkeypatch.setattr(wpfy.site_layout.os, "fchmod", lambda fd, mode: None)
+    chowned = []
+    monkeypatch.setattr(
+        wpfy.site_layout.os,
+        "chown",
+        lambda name, uid, gid, **kwargs: chowned.append(name),
+    )
+
+    result = wpfy.site_layout._apply_site_ownership(domain, 100042)
+
+    assert result.exit_code != 0
+    assert "unsafe site ownership symlink" in result.message
+    assert "unsafe-link" not in chowned
+    assert external.read_bytes() == b"sentinel"
+
+
+def test_apply_site_ownership_rejects_broken_root_symlink(tmp_wpfy_home, monkeypatch, tmp_path):
+    import wpfy.site_layout
+
+    importlib.reload(wpfy.site_layout)
+    domain = "ownership-root-symlink.example.com"
+    spec = wpfy.site_layout.SiteSpec(domain=domain, flavor="wp", use_mysql=True, use_redis=False)
+    wpfy.site_layout.ensure_site_scaffold(spec)
+    root = wpfy.site_layout.app_dir(domain)
+    wpfy.site_layout.healthcheck_path(domain).unlink()
+    root.rmdir()
+    root.symlink_to(tmp_path / "missing-app", target_is_directory=True)
+    monkeypatch.setattr(wpfy.site_layout.os, "geteuid", lambda: 0, raising=False)
+
+    result = wpfy.site_layout._apply_site_ownership(domain, 100042)
+
+    assert result.exit_code != 0
+    assert "unsafe site ownership symlink" in result.message
 
 
 def test_ensure_site_scaffold_writes_hardened_nginx(tmp_wpfy_home, monkeypatch):
@@ -467,6 +673,26 @@ def test_ensure_site_scaffold_writes_hardened_nginx(tmp_wpfy_home, monkeypatch):
     assert "xmlrpc\\.php" in content
     assert "\\.(?:bak|backup|old|orig|save|sql|sqlite|zip|tar|tgz|gz|log)$" in content
     assert "/\\.(?!well-known" in content
+
+
+def test_ensure_site_scaffold_rejects_healthcheck_symlink_without_writing_external(
+    tmp_wpfy_home, monkeypatch, tmp_path
+):
+    import wpfy.site_layout
+
+    importlib.reload(wpfy.site_layout)
+    domain = "health-symlink.example.com"
+    app_root = wpfy.site_layout.app_dir(domain)
+    app_root.mkdir(parents=True)
+    external = tmp_path / "external-health"
+    external.write_bytes(b"sentinel")
+    wpfy.site_layout.healthcheck_path(domain).symlink_to(external)
+    spec = wpfy.site_layout.SiteSpec(domain=domain, flavor="wp", use_mysql=True, use_redis=False)
+
+    with pytest.raises(ValueError, match="unsafe scaffold destination symlink"):
+        wpfy.site_layout.ensure_site_scaffold(spec)
+
+    assert external.read_bytes() == b"sentinel"
 
 
 def test_backup_archive_is_not_world_readable(tmp_wpfy_home, monkeypatch):
@@ -567,6 +793,7 @@ def test_wordpress_download_failure_is_nonzero_and_retryable(tmp_wpfy_home, monk
     import wpfy.site_layout
 
     importlib.reload(wpfy.site_layout)
+    monkeypatch.setenv("WPFY_SKIP_RUNTIME", "1")
     domain = "bootstrap-failure.example.com"
     spec = wpfy.site_layout.SiteSpec(domain=domain, flavor="wp", use_mysql=True, use_redis=False)
     wpfy.site_layout.ensure_site_scaffold(spec)
@@ -586,6 +813,7 @@ def test_wordpress_bootstrap_verifies_versioned_archive_before_open(tmp_wpfy_hom
     import wpfy.site_layout as layout
 
     importlib.reload(layout)
+    monkeypatch.setenv("WPFY_SKIP_RUNTIME", "1")
     domain = "verified-bootstrap.example.com"
     layout.ensure_site_scaffold(
         layout.SiteSpec(domain=domain, flavor="wp", use_mysql=True, use_redis=False)
@@ -644,6 +872,7 @@ def test_wordpress_digest_mismatch_never_opens_archive(tmp_wpfy_home, monkeypatc
     import wpfy.site_layout as layout
 
     importlib.reload(layout)
+    monkeypatch.setenv("WPFY_SKIP_RUNTIME", "1")
     domain = "digest-mismatch.example.com"
     layout.ensure_site_scaffold(
         layout.SiteSpec(domain=domain, flavor="wp", use_mysql=True, use_redis=False)
@@ -673,6 +902,431 @@ def test_wordpress_digest_mismatch_never_opens_archive(tmp_wpfy_home, monkeypatc
     assert result.exit_code != 0
     assert "digest mismatch" in result.message
     assert not layout.app_dir(domain).joinpath("index.php").exists()
+
+
+@pytest.mark.parametrize("archive_kind", ["malformed", "unsafe-member"])
+def test_wordpress_bootstrap_rejects_checksum_valid_invalid_archives(
+    tmp_wpfy_home, monkeypatch, tmp_path, archive_kind
+):
+    import wpfy.site_layout as layout
+
+    importlib.reload(layout)
+    monkeypatch.setenv("WPFY_SKIP_RUNTIME", "1")
+    domain = f"{archive_kind}.example.com"
+    layout.ensure_site_scaffold(
+        layout.SiteSpec(domain=domain, flavor="wp", use_mysql=True, use_redis=False)
+    )
+    if archive_kind == "malformed":
+        payload = b"not a tar archive"
+    else:
+        stream = io.BytesIO()
+        with tarfile.open(fileobj=stream, mode="w:gz") as archive:
+            member = tarfile.TarInfo("../escape.php")
+            member.size = 6
+            archive.addfile(member, io.BytesIO(b"escape"))
+        payload = stream.getvalue()
+
+    class Response(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            self.close()
+
+    responses = iter([
+        Response(b'{"offers":[{"response":"upgrade","locale":"en_US","current":"7.0.1"}]}'),
+        Response(hashlib.sha1(payload).hexdigest().encode()),
+        Response(payload),
+    ])
+    monkeypatch.setattr(layout, "urlopen", lambda *args, **kwargs: next(responses))
+
+    result = layout.bootstrap_site_files(domain)
+
+    assert result.exit_code != 0
+    assert "wordpress bootstrap failed:" in result.message
+    assert "digest mismatch" not in result.message
+    if archive_kind == "unsafe-member":
+        assert "unsafe archive member: unsafe path" in result.message
+        assert not (tmp_path / "escape.php").exists()
+
+
+@pytest.mark.parametrize(
+    ("link_path", "archive_member"),
+    [
+        ("wp-settings.php", "wp-settings.php"),
+        ("wp-includes", "wp-includes/version.php"),
+        ("wp-includes/assets", "wp-includes/assets/script.js"),
+    ],
+    ids=["file", "directory", "nested-directory"],
+)
+def test_wordpress_bootstrap_rejects_destination_symlinks(
+    tmp_wpfy_home, monkeypatch, tmp_path, link_path, archive_member
+):
+    import wpfy.site_layout as layout
+
+    importlib.reload(layout)
+    domain = "symlink-bootstrap.example.com"
+    layout.ensure_site_scaffold(
+        layout.SiteSpec(domain=domain, flavor="wp", use_mysql=True, use_redis=False)
+    )
+    root = layout.app_dir(domain)
+    destination = root / link_path
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if link_path.endswith(".php"):
+        external = tmp_path / "external.php"
+        external.write_bytes(b"sentinel")
+        destination.symlink_to(external)
+    else:
+        external = tmp_path / "external"
+        external.mkdir()
+        (external / "sentinel").write_bytes(b"sentinel")
+        destination.symlink_to(external, target_is_directory=True)
+    _mock_wordpress_download(monkeypatch, layout, {archive_member: b"core data"})
+
+    result = layout.bootstrap_site_files(domain)
+
+    assert result.exit_code != 0
+    assert "unsafe WordPress destination symlink" in result.message
+    if external.is_dir():
+        assert [path.name for path in external.iterdir()] == ["sentinel"]
+    else:
+        assert external.read_bytes() == b"sentinel"
+
+
+@pytest.mark.parametrize("link_name", ["index.php", "wp-config.php"])
+def test_wordpress_bootstrap_rejects_bootstrapped_marker_symlinks(
+    tmp_wpfy_home, monkeypatch, tmp_path, link_name
+):
+    import wpfy.site_layout as layout
+
+    importlib.reload(layout)
+    domain = "symlink-marker.example.com"
+    layout.ensure_site_scaffold(
+        layout.SiteSpec(domain=domain, flavor="wp", use_mysql=True, use_redis=False)
+    )
+    root = layout.app_dir(domain)
+    external = tmp_path / link_name
+    external.write_bytes(b"sentinel")
+    (root / link_name).symlink_to(external)
+    other_name = "wp-config.php" if link_name == "index.php" else "index.php"
+    (root / other_name).write_bytes(b"regular")
+
+    result = layout.bootstrap_site_files(domain)
+
+    assert result.exit_code != 0
+    assert "unsafe WordPress destination symlink" in result.message
+    assert external.read_bytes() == b"sentinel"
+
+
+@pytest.mark.parametrize("destination_name", ["app", "healthcheck", "wp-content", "uploads"])
+def test_wordpress_bootstrap_rejects_managed_tree_symlinks(
+    tmp_wpfy_home, monkeypatch, tmp_path, destination_name
+):
+    import wpfy.site_layout as layout
+
+    importlib.reload(layout)
+    domain = "managed-tree-symlink.example.com"
+    layout.ensure_site_scaffold(
+        layout.SiteSpec(domain=domain, flavor="wp", use_mysql=True, use_redis=False)
+    )
+    root = layout.app_dir(domain)
+    if destination_name == "app":
+        layout.healthcheck_path(domain).unlink()
+        root.rmdir()
+        destination = root
+    elif destination_name == "healthcheck":
+        destination = layout.healthcheck_path(domain)
+        destination.unlink()
+    else:
+        destination = root / "wp-content"
+        if destination_name == "uploads":
+            destination.mkdir()
+            destination /= "uploads"
+        (root / "index.php").write_bytes(b"regular")
+        (root / "wp-config.php").write_bytes(b"regular")
+
+    if destination_name == "healthcheck":
+        external = tmp_path / "external-healthcheck"
+        external.write_bytes(b"sentinel")
+        destination.symlink_to(external)
+    else:
+        external = tmp_path / f"external-{destination_name}"
+        external.mkdir()
+        (external / "sentinel").write_bytes(b"sentinel")
+        destination.symlink_to(external, target_is_directory=True)
+    monkeypatch.setattr(
+        layout,
+        "urlopen",
+        lambda *args, **kwargs: pytest.fail("download started after unsafe destination"),
+    )
+
+    result = layout.bootstrap_site_files(domain)
+
+    assert result.exit_code != 0
+    assert "unsafe WordPress destination symlink" in result.message
+    if external.is_dir():
+        assert [path.name for path in external.iterdir()] == ["sentinel"]
+    else:
+        assert external.read_bytes() == b"sentinel"
+
+
+def test_wordpress_bootstrap_rejects_nested_symlink_in_completed_tree(
+    tmp_wpfy_home, monkeypatch, tmp_path
+):
+    import wpfy.site_layout as layout
+
+    importlib.reload(layout)
+    domain = "completed-tree-symlink.example.com"
+    layout.ensure_site_scaffold(
+        layout.SiteSpec(domain=domain, flavor="wp", use_mysql=True, use_redis=False)
+    )
+    root = layout.app_dir(domain)
+    (root / "index.php").write_bytes(b"regular")
+    (root / "wp-config.php").write_bytes(b"regular")
+    destination = root / "wp-includes" / "assets"
+    destination.parent.mkdir()
+    external = tmp_path / "external-assets"
+    external.mkdir()
+    (external / "sentinel").write_bytes(b"sentinel")
+    destination.symlink_to(external, target_is_directory=True)
+
+    result = layout.bootstrap_site_files(domain)
+
+    assert result.exit_code != 0
+    assert "unsafe WordPress destination symlink" in result.message
+    assert [path.name for path in external.iterdir()] == ["sentinel"]
+
+
+def test_wordpress_bootstrap_rejects_destination_swapped_after_validation(
+    tmp_wpfy_home, monkeypatch, tmp_path
+):
+    import wpfy.site_layout as layout
+
+    importlib.reload(layout)
+    domain = "destination-race.example.com"
+    layout.ensure_site_scaffold(
+        layout.SiteSpec(domain=domain, flavor="wp", use_mysql=True, use_redis=False)
+    )
+    root = layout.app_dir(domain)
+    destination = root / "wp-includes"
+    destination.mkdir()
+    external = tmp_path / "external-race"
+    external.mkdir()
+    (external / "sentinel").write_bytes(b"sentinel")
+    _mock_wordpress_download(
+        monkeypatch,
+        layout,
+        {"wp-includes/version.php": b"<?php $wp_version = '7.0.1';\n"},
+    )
+    original_destination_symlink = layout._destination_symlink
+
+    def swap_after_validation(root_arg, destinations):
+        unsafe = original_destination_symlink(root_arg, destinations)
+        if unsafe is None and not isinstance(destinations, tuple):
+            destination.rmdir()
+            destination.symlink_to(external, target_is_directory=True)
+        return unsafe
+
+    monkeypatch.setattr(layout, "_destination_symlink", swap_after_validation)
+
+    result = layout.bootstrap_site_files(domain)
+
+    assert result.exit_code != 0
+    assert (external / "sentinel").read_bytes() == b"sentinel"
+    assert not (external / "version.php").exists()
+
+
+def test_wordpress_bootstrap_rejects_healthcheck_swapped_before_write(
+    tmp_wpfy_home, monkeypatch, tmp_path
+):
+    import wpfy.site_layout as layout
+
+    importlib.reload(layout)
+    domain = "healthcheck-race.example.com"
+    layout.ensure_site_scaffold(
+        layout.SiteSpec(domain=domain, flavor="wp", use_mysql=True, use_redis=False)
+    )
+    health_file = layout.healthcheck_path(domain)
+    health_file.unlink()
+    external = tmp_path / "external-healthcheck-race"
+    external.write_bytes(b"sentinel")
+    original_destination_symlink = layout._destination_symlink
+
+    def swap_after_validation(root_arg, destinations):
+        unsafe = original_destination_symlink(root_arg, destinations)
+        if unsafe is None and destinations == (health_file,):
+            health_file.symlink_to(external)
+        return unsafe
+
+    monkeypatch.setattr(layout, "_destination_symlink", swap_after_validation)
+
+    result = layout.bootstrap_site_files(domain)
+
+    assert result.exit_code != 0
+    assert external.read_bytes() == b"sentinel"
+
+
+def test_wordpress_bootstrap_rejects_content_directory_swapped_before_creation(
+    tmp_wpfy_home, monkeypatch, tmp_path
+):
+    import wpfy.site_layout as layout
+
+    importlib.reload(layout)
+    domain = "content-race.example.com"
+    layout.ensure_site_scaffold(
+        layout.SiteSpec(domain=domain, flavor="wp", use_mysql=True, use_redis=False)
+    )
+    root = layout.app_dir(domain)
+    external = tmp_path / "external-content-race"
+    external.mkdir()
+    (external / "sentinel").write_bytes(b"sentinel")
+    original_destination_symlink = layout._destination_symlink
+
+    def swap_after_validation(root_arg, destinations):
+        unsafe = original_destination_symlink(root_arg, destinations)
+        if unsafe is None and len(destinations) == 2 and destinations[-1].name == "uploads":
+            (root / "wp-content").symlink_to(external, target_is_directory=True)
+        return unsafe
+
+    monkeypatch.setattr(layout, "_destination_symlink", swap_after_validation)
+
+    result = layout.bootstrap_site_files(domain)
+
+    assert result.exit_code != 0
+    assert [path.name for path in external.iterdir()] == ["sentinel"]
+
+
+def test_wordpress_offline_bootstrap_rejects_concurrent_unrelated_symlink(
+    tmp_wpfy_home, monkeypatch, tmp_path
+):
+    import wpfy.site_layout as layout
+
+    importlib.reload(layout)
+    monkeypatch.setenv("WPFY_SKIP_RUNTIME", "1")
+    domain = "offline-race.example.com"
+    layout.ensure_site_scaffold(
+        layout.SiteSpec(domain=domain, flavor="wp", use_mysql=True, use_redis=False)
+    )
+    monkeypatch.setenv("WPFY_SKIP_WORDPRESS_DOWNLOAD", "1")
+    root = layout.app_dir(domain)
+    external = tmp_path / "external-offline-race"
+    external.mkdir()
+    (external / "sentinel").write_bytes(b"sentinel")
+    original_write = layout._write_text_safely
+
+    def write_and_swap(root_arg, name, content):
+        original_write(root_arg, name, content)
+        if name == "wp-config.php":
+            (root / "wp-includes").symlink_to(external, target_is_directory=True)
+
+    monkeypatch.setattr(layout, "_write_text_safely", write_and_swap)
+
+    result = layout.bootstrap_site_files(domain)
+
+    assert result.exit_code != 0
+    assert "unsafe WordPress destination symlink" in result.message
+    assert [path.name for path in external.iterdir()] == ["sentinel"]
+
+
+@pytest.mark.parametrize(("flavor", "index_name"), [("html", "index.html"), ("site", "index.php")])
+def test_non_wordpress_bootstrap_returns_failure_for_index_symlink(
+    tmp_wpfy_home, monkeypatch, tmp_path, flavor, index_name
+):
+    import wpfy.site_layout as layout
+
+    importlib.reload(layout)
+    domain = f"{flavor}-symlink.example.com"
+    layout.ensure_site_scaffold(
+        layout.SiteSpec(domain=domain, flavor=flavor, use_mysql=False, use_redis=False)
+    )
+    external = tmp_path / f"external-{index_name}"
+    external.write_bytes(b"sentinel")
+    (layout.app_dir(domain) / index_name).symlink_to(external)
+
+    result = layout.bootstrap_site_files(domain)
+
+    assert result.exit_code != 0
+    assert external.read_bytes() == b"sentinel"
+
+
+def test_ensure_wordpress_config_rejects_symlink(tmp_wpfy_home, tmp_path):
+    import wpfy.site_layout as layout
+
+    importlib.reload(layout)
+    domain = "config-symlink.example.com"
+    layout.ensure_site_scaffold(
+        layout.SiteSpec(domain=domain, flavor="wp", use_mysql=True, use_redis=False)
+    )
+    external = tmp_path / "external-config.php"
+    external.write_bytes(b"sentinel")
+    (layout.app_dir(domain) / "wp-config.php").symlink_to(external)
+
+    result = layout._ensure_wordpress_config(domain)
+
+    assert result.exit_code != 0
+    assert "unsafe WordPress destination symlink" in result.message
+    assert external.read_bytes() == b"sentinel"
+
+
+def test_wordpress_bootstrap_preserves_safe_existing_content(tmp_wpfy_home, monkeypatch):
+    import wpfy.site_layout as layout
+
+    importlib.reload(layout)
+    domain = "safe-retry.example.com"
+    layout.ensure_site_scaffold(
+        layout.SiteSpec(domain=domain, flavor="wp", use_mysql=True, use_redis=False)
+    )
+    root = layout.app_dir(domain)
+    (root / "operator.txt").write_text("keep me", encoding="utf-8")
+    upload = root / "wp-content" / "uploads" / "operator.txt"
+    upload.parent.mkdir(parents=True)
+    upload.write_text("keep upload", encoding="utf-8")
+    _mock_wordpress_download(
+        monkeypatch,
+        layout,
+        {
+            "index.php": b"<?php\n",
+            "wp-config-sample.php": b"sample\n",
+            "wp-includes/version.php": b"<?php $wp_version = '7.0.1';\n",
+        },
+    )
+
+    result = layout.bootstrap_site_files(domain)
+
+    assert result.exit_code == 0
+    assert (root / "operator.txt").read_text(encoding="utf-8") == "keep me"
+    assert upload.read_text(encoding="utf-8") == "keep upload"
+
+
+def test_wordpress_bootstrap_rejects_partial_retry_while_runtime_is_active(tmp_wpfy_home, monkeypatch):
+    import wpfy.site_layout as layout
+
+    importlib.reload(layout)
+    domain = "active-retry.example.com"
+    layout.ensure_site_scaffold(
+        layout.SiteSpec(domain=domain, flavor="wp", use_mysql=True, use_redis=False)
+    )
+    layout.healthcheck_path(domain).unlink()
+
+    class Proc:
+        returncode = 0
+        stdout = "running-container-id\n"
+        stderr = ""
+
+    monkeypatch.setattr(layout, "docker_available", lambda: True)
+    monkeypatch.setattr(layout, "runtime_skip_requested", lambda: False)
+    monkeypatch.setattr(layout, "compose_command", lambda *args: Proc())
+    monkeypatch.setattr(
+        layout,
+        "urlopen",
+        lambda *args, **kwargs: pytest.fail("download started while runtime could mutate destination"),
+    )
+
+    result = layout.bootstrap_site_files(domain)
+
+    assert result.exit_code != 0
+    assert "stop the site runtime before retrying" in result.message
+    assert not layout.healthcheck_path(domain).exists()
 
 
 @pytest.mark.parametrize("payload", [b"{}", b"not-json", b'{"offers":[]}'])
@@ -766,6 +1420,7 @@ def test_restore_rejects_non_tar_before_runtime_stop(tmp_wpfy_home, monkeypatch,
 
 def test_backup_site_uploads_verified_archive_to_s3(tmp_wpfy_home, monkeypatch):
     import wpfy.site_layout
+    from wpfy.s3_backup import S3Uploader
 
     importlib.reload(wpfy.site_layout)
     monkeypatch.setenv("WPFY_SKIP_RUNTIME", "1")
@@ -780,17 +1435,27 @@ def test_backup_site_uploads_verified_archive_to_s3(tmp_wpfy_home, monkeypatch):
     wpfy.site_layout.ensure_site_scaffold(spec)
     captured = {}
 
-    class FakeUploader:
-        def upload_archive(self, config, archive_path, domain_arg):
-            captured["bucket"] = config.bucket
-            captured["key"] = f"{config.prefix}/{domain_arg}/{archive_path.name}"
-            return f"s3://{config.bucket}/{captured['key']}"
+    class Response(io.BytesIO):
+        status = 200
 
-    result = wpfy.site_layout.backup_site(domain, upload_s3=True, uploader=FakeUploader())
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            self.close()
+
+    def opener(request, *, timeout):
+        captured["authorization"] = request.headers["Authorization"]
+        captured["file_body"] = not isinstance(request.data, bytes)
+        captured["url"] = request.full_url
+        return Response()
+
+    result = wpfy.site_layout.backup_site(domain, upload_s3=True, uploader=S3Uploader(opener))
 
     assert result.exit_code == 0
-    assert captured["bucket"] == "site-backups"
-    assert captured["key"].startswith("daily/s3.example.com/s3.example.com-")
+    assert captured["file_body"] is True
+    assert "SignedHeaders=content-length;host;x-amz-content-sha256;x-amz-date" in captured["authorization"]
+    assert captured["url"].startswith("https://storage.example.test/site-backups/daily/s3.example.com/s3.example.com-")
     assert "uploaded to: s3://site-backups/daily/s3.example.com/" in result.message
     assert "secret-key" not in result.message
 
@@ -945,7 +1610,11 @@ def test_provision_wordpress_runs_expected_wp_cli_sequence(tmp_wpfy_home, monkey
         return Proc()
 
     monkeypatch.setattr(wpfy.site_layout, "docker_available", lambda: True)
-    monkeypatch.setattr(wpfy.site_layout, "_wait_for_service", lambda domain_arg, service: RuntimeResult(0, "db ready", ran=True))
+    monkeypatch.setattr(
+        wpfy.site_layout,
+        "wait_for_service",
+        lambda domain_arg, service: RuntimeResult(0, "db ready", ran=True),
+    )
     monkeypatch.setattr(wpfy.site_layout, "wp_cli_command", fake_wp_cli)
 
     result = wpfy.site_layout.provision_wordpress_site(
@@ -1002,7 +1671,11 @@ def test_provision_wordpress_uses_https_url_when_ssl_enabled(tmp_wpfy_home, monk
         return Proc()
 
     monkeypatch.setattr(wpfy.site_layout, "docker_available", lambda: True)
-    monkeypatch.setattr(wpfy.site_layout, "_wait_for_service", lambda domain_arg, service: RuntimeResult(0, "db ready", ran=True))
+    monkeypatch.setattr(
+        wpfy.site_layout,
+        "wait_for_service",
+        lambda domain_arg, service: RuntimeResult(0, "db ready", ran=True),
+    )
     monkeypatch.setattr(wpfy.site_layout, "wp_cli_command", fake_wp_cli)
 
     result = wpfy.site_layout.provision_wordpress_site(domain, "admin", "admin@example.com", "secret-password")
@@ -1035,7 +1708,11 @@ def test_provision_wordpress_downloads_core_when_absent(tmp_wpfy_home, monkeypat
         return Proc()
 
     monkeypatch.setattr(wpfy.site_layout, "docker_available", lambda: True)
-    monkeypatch.setattr(wpfy.site_layout, "_wait_for_service", lambda domain_arg, service: RuntimeResult(0, "db ready", ran=True))
+    monkeypatch.setattr(
+        wpfy.site_layout,
+        "wait_for_service",
+        lambda domain_arg, service: RuntimeResult(0, "db ready", ran=True),
+    )
     monkeypatch.setattr(wpfy.site_layout, "wp_cli_command", fake_wp_cli)
 
     result = wpfy.site_layout.provision_wordpress_site(domain, "admin", "admin@example.com", "secret-password")
@@ -1098,7 +1775,11 @@ def test_provision_wordpress_redacts_password_from_errors(tmp_wpfy_home, monkeyp
         return Proc()
 
     monkeypatch.setattr(wpfy.site_layout, "docker_available", lambda: True)
-    monkeypatch.setattr(wpfy.site_layout, "_wait_for_service", lambda domain_arg, service: RuntimeResult(0, "db ready", ran=True))
+    monkeypatch.setattr(
+        wpfy.site_layout,
+        "wait_for_service",
+        lambda domain_arg, service: RuntimeResult(0, "db ready", ran=True),
+    )
     monkeypatch.setattr(wpfy.site_layout, "wp_cli_command", fake_wp_cli)
 
     result = wpfy.site_layout.provision_wordpress_site(domain, "admin", "admin@example.com", "secret-password")
@@ -1205,6 +1886,36 @@ def test_restore_rejects_link_member(tmp_wpfy_home, monkeypatch):
     assert "unsupported link" in result.message
 
 
+def test_restore_rejects_fifo_member_before_stopping_runtime(tmp_wpfy_home, monkeypatch):
+    import wpfy.site_layout
+
+    importlib.reload(wpfy.site_layout)
+    domain = "fifo.example.com"
+    archive = Path(tmp_wpfy_home.state_dir) / "fifo.tar.gz"
+    archive.parent.mkdir(parents=True, exist_ok=True)
+    with tarfile.open(archive, "w:gz") as tar:
+        root = tarfile.TarInfo(domain)
+        root.type = tarfile.DIRTYPE
+        tar.addfile(root)
+        fifo = tarfile.TarInfo(f"{domain}/blocked-pipe")
+        fifo.type = tarfile.FIFOTYPE
+        tar.addfile(fifo)
+    calls = []
+    monkeypatch.setattr(wpfy.site_layout, "docker_available", lambda: True)
+    monkeypatch.setattr(wpfy.site_layout, "runtime_skip_requested", lambda: False)
+    monkeypatch.setattr(
+        wpfy.site_layout,
+        "compose_command",
+        lambda *args: calls.append(args) or pytest.fail("runtime stopped for unsafe archive"),
+    )
+
+    result = wpfy.site_layout.restore_site(domain, str(archive))
+
+    assert result.exit_code == 2
+    assert "unsupported device file" in result.message
+    assert calls == []
+
+
 def test_restore_rejects_archive_for_other_domain(tmp_wpfy_home, monkeypatch):
     import wpfy.site_layout
 
@@ -1218,6 +1929,121 @@ def test_restore_rejects_archive_for_other_domain(tmp_wpfy_home, monkeypatch):
 
     assert result.exit_code == 2
     assert "another site" in result.message
+
+
+def test_restore_rejects_regular_file_site_root_before_stopping_runtime(
+    tmp_wpfy_home, monkeypatch
+):
+    import wpfy.site_layout
+
+    importlib.reload(wpfy.site_layout)
+    domain = "file-root.example.com"
+    archive = Path(tmp_wpfy_home.state_dir) / "file-root.tar.gz"
+    archive.parent.mkdir(parents=True, exist_ok=True)
+    _write_tar_with_text(archive, {domain: "not a directory"})
+    calls = []
+
+    class Proc:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    monkeypatch.setattr(wpfy.site_layout, "docker_available", lambda: True)
+    monkeypatch.setattr(wpfy.site_layout, "runtime_skip_requested", lambda: False)
+    monkeypatch.setattr(
+        wpfy.site_layout,
+        "compose_command",
+        lambda *args: calls.append(args) or Proc(),
+    )
+
+    result = wpfy.site_layout.restore_site(domain, str(archive))
+
+    assert result.exit_code == 2
+    assert "site root is not a directory" in result.message
+    assert calls == []
+
+
+def test_restore_rejects_database_volume_members_without_changing_live_data(
+    tmp_wpfy_home, monkeypatch
+):
+    import wpfy.site_layout
+
+    importlib.reload(wpfy.site_layout)
+    monkeypatch.setenv("WPFY_SKIP_RUNTIME", "1")
+    domain = "db-volume.example.com"
+    archive = Path(tmp_wpfy_home.state_dir) / "db-volume.tar.gz"
+    archive.parent.mkdir(parents=True, exist_ok=True)
+    _write_tar_with_text(archive, {f"{domain}/db-data/ibdata1": "replacement"})
+    live_data = wpfy.site_layout.db_data_dir(domain) / "ibdata1"
+    live_data.parent.mkdir(parents=True)
+    live_data.write_text("live", encoding="utf-8")
+
+    result = wpfy.site_layout.restore_site(domain, str(archive))
+
+    assert result.exit_code == 2
+    assert "excluded database volume data" in result.message
+    assert live_data.read_text(encoding="utf-8") == "live"
+
+
+def test_restore_defensively_excludes_database_volume_from_merge(
+    tmp_wpfy_home, monkeypatch
+):
+    import wpfy.site_layout
+
+    importlib.reload(wpfy.site_layout)
+    monkeypatch.setenv("WPFY_SKIP_RUNTIME", "1")
+    monkeypatch.setattr(wpfy.site_layout, "_validate_restore_member", lambda *args: None)
+    domain = "db-volume-defense.example.com"
+    archive = Path(tmp_wpfy_home.state_dir) / "db-volume-defense.tar.gz"
+    archive.parent.mkdir(parents=True, exist_ok=True)
+    _write_tar_with_text(archive, {
+        f"{domain}/compose.yaml": "services: {}\n",
+        f"{domain}/db-data/ibdata1": "replacement",
+    })
+    live_data = wpfy.site_layout.db_data_dir(domain) / "ibdata1"
+    live_data.parent.mkdir(parents=True)
+    live_data.write_text("live", encoding="utf-8")
+
+    result = wpfy.site_layout.restore_site(domain, str(archive))
+
+    assert result.exit_code == 0
+    assert live_data.read_text(encoding="utf-8") == "live"
+
+
+def test_restore_reports_file_replacement_failure_without_restarting(
+    tmp_wpfy_home, monkeypatch
+):
+    import wpfy.site_layout
+
+    importlib.reload(wpfy.site_layout)
+    domain = "replace-failure.example.com"
+    archive = Path(tmp_wpfy_home.state_dir) / "replace-failure.tar.gz"
+    archive.parent.mkdir(parents=True, exist_ok=True)
+    _write_tar_with_text(archive, {f"{domain}/compose.yaml": "services: {}\n"})
+
+    class Proc:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    monkeypatch.setattr(wpfy.site_layout, "docker_available", lambda: True)
+    monkeypatch.setattr(wpfy.site_layout, "runtime_skip_requested", lambda: False)
+    monkeypatch.setattr(wpfy.site_layout, "compose_command", lambda *args: Proc())
+    monkeypatch.setattr(
+        wpfy.site_layout,
+        "_remove_entries_safely",
+        lambda *args: (_ for _ in ()).throw(OSError("replacement failed")),
+    )
+    monkeypatch.setattr(
+        wpfy.site_layout,
+        "start_site_runtime",
+        lambda domain_arg: pytest.fail("runtime restarted after a partial restore"),
+    )
+
+    result = wpfy.site_layout.restore_site(domain, str(archive))
+
+    assert result.exit_code == 3
+    assert "failed to replace site files during restore" in result.message
 
 
 def test_restore_valid_archive_preserves_private_env(tmp_wpfy_home, monkeypatch):
@@ -1237,6 +2063,111 @@ def test_restore_valid_archive_preserves_private_env(tmp_wpfy_home, monkeypatch)
     assert result.exit_code == 0
     mode = stat.S_IMODE(wpfy.site_layout.env_path("valid.example.com").stat().st_mode)
     assert mode == 0o600
+
+
+def test_restore_rejects_symlinked_site_root(tmp_wpfy_home, monkeypatch, tmp_path):
+    import wpfy.site_layout
+
+    importlib.reload(wpfy.site_layout)
+    monkeypatch.setenv("WPFY_SKIP_RUNTIME", "1")
+    domain = "root-symlink.example.com"
+    archive = Path(tmp_wpfy_home.state_dir) / "root-symlink.tar.gz"
+    archive.parent.mkdir(parents=True, exist_ok=True)
+    _write_tar_with_text(archive, {f"{domain}/compose.yaml": "services: {}\n"})
+    external = tmp_path / "external-site-root"
+    external.mkdir()
+    (external / "sentinel").write_bytes(b"sentinel")
+    target = wpfy.site_layout.site_dir(domain)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.symlink_to(external, target_is_directory=True)
+
+    result = wpfy.site_layout.restore_site(domain, str(archive))
+
+    assert result.exit_code != 0
+    assert "restore target is an unsafe symlink" in result.message
+    assert [path.name for path in external.iterdir()] == ["sentinel"]
+
+
+def test_restore_rejects_broken_destination_symlink_without_following_it(
+    tmp_wpfy_home, monkeypatch, tmp_path
+):
+    import wpfy.site_layout
+
+    importlib.reload(wpfy.site_layout)
+    monkeypatch.setenv("WPFY_SKIP_RUNTIME", "1")
+    domain = "broken-symlink.example.com"
+    archive = Path(tmp_wpfy_home.state_dir) / "broken-symlink.tar.gz"
+    archive.parent.mkdir(parents=True, exist_ok=True)
+    _write_tar_with_text(archive, {f"{domain}/app/index.php": "<?php\n"})
+    target = wpfy.site_layout.site_dir(domain)
+    target.mkdir(parents=True)
+    external = tmp_path / "missing-external-app"
+    (target / "app").symlink_to(external, target_is_directory=True)
+
+    result = wpfy.site_layout.restore_site(domain, str(archive))
+
+    assert result.exit_code != 0
+    assert "restore target contains an unsafe symlink" in result.message
+    assert not external.exists()
+
+
+def test_restore_rejects_env_symlink_without_changing_external_mode(
+    tmp_wpfy_home, monkeypatch, tmp_path
+):
+    import wpfy.site_layout
+
+    importlib.reload(wpfy.site_layout)
+    monkeypatch.setenv("WPFY_SKIP_RUNTIME", "1")
+    domain = "env-symlink.example.com"
+    archive = Path(tmp_wpfy_home.state_dir) / "env-symlink.tar.gz"
+    archive.parent.mkdir(parents=True, exist_ok=True)
+    _write_tar_with_text(archive, {f"{domain}/compose.yaml": "services: {}\n"})
+    target = wpfy.site_layout.site_dir(domain)
+    target.mkdir(parents=True)
+    external = tmp_path / "external-env"
+    external.write_bytes(b"sentinel")
+    external.chmod(0o644)
+    (target / ".env").symlink_to(external)
+
+    result = wpfy.site_layout.restore_site(domain, str(archive))
+
+    assert result.exit_code != 0
+    assert "restore target contains an unsafe symlink" in result.message
+    assert external.read_bytes() == b"sentinel"
+    assert stat.S_IMODE(external.stat().st_mode) == 0o644
+
+
+def test_restore_rejects_env_symlink_inserted_after_tree_scan(
+    tmp_wpfy_home, monkeypatch, tmp_path
+):
+    import wpfy.site_layout
+
+    importlib.reload(wpfy.site_layout)
+    monkeypatch.setenv("WPFY_SKIP_RUNTIME", "1")
+    domain = "env-race.example.com"
+    archive = Path(tmp_wpfy_home.state_dir) / "env-race.tar.gz"
+    archive.parent.mkdir(parents=True, exist_ok=True)
+    _write_tar_with_text(archive, {f"{domain}/compose.yaml": "services: {}\n"})
+    target = wpfy.site_layout.site_dir(domain)
+    target.mkdir(parents=True)
+    external = tmp_path / "external-env-race"
+    external.write_bytes(b"sentinel")
+    external.chmod(0o644)
+    original_tree_symlink = wpfy.site_layout._tree_symlink
+
+    def swap_after_scan(root):
+        unsafe = original_tree_symlink(root)
+        if root == target and unsafe is None:
+            (target / ".env").symlink_to(external)
+        return unsafe
+
+    monkeypatch.setattr(wpfy.site_layout, "_tree_symlink", swap_after_scan)
+
+    result = wpfy.site_layout.restore_site(domain, str(archive))
+
+    assert result.exit_code != 0
+    assert external.read_bytes() == b"sentinel"
+    assert stat.S_IMODE(external.stat().st_mode) == 0o644
 
 
 def test_restore_reapplies_site_ownership_after_copy(tmp_wpfy_home, monkeypatch):
@@ -1262,6 +2193,40 @@ def test_restore_reapplies_site_ownership_after_copy(tmp_wpfy_home, monkeypatch)
 
     assert result.exit_code == 0
     assert calls == ["ownership.example.com"]
+
+
+def test_restore_stops_after_ownership_failure(tmp_wpfy_home, monkeypatch):
+    import wpfy.site_layout
+
+    importlib.reload(wpfy.site_layout)
+    domain = "restore-ownership-failure.example.com"
+    archive = Path(tmp_wpfy_home.state_dir) / "restore-ownership-failure.tar.gz"
+    archive.parent.mkdir(parents=True, exist_ok=True)
+    _write_tar_with_text(archive, {f"{domain}/compose.yaml": "services: {}\n"})
+
+    class Proc:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    monkeypatch.setattr(wpfy.site_layout, "docker_available", lambda: True)
+    monkeypatch.setattr(wpfy.site_layout, "runtime_skip_requested", lambda: False)
+    monkeypatch.setattr(wpfy.site_layout, "compose_command", lambda *args: Proc())
+    monkeypatch.setattr(
+        wpfy.site_layout,
+        "apply_site_ownership",
+        lambda domain_arg: wpfy.site_layout.RuntimeResult(3, "unsafe site ownership symlink"),
+    )
+    monkeypatch.setattr(
+        wpfy.site_layout,
+        "start_site_runtime",
+        lambda domain_arg: pytest.fail("runtime restarted after ownership failure"),
+    )
+
+    result = wpfy.site_layout.restore_site(domain, str(archive))
+
+    assert result.exit_code == 3
+    assert "unsafe site ownership symlink" in result.message
 
 
 def test_nginx_conf_allows_large_uploads_and_long_requests(tmp_wpfy_home, monkeypatch):
@@ -1415,7 +2380,9 @@ def test_restore_preserves_live_db_credentials_when_db_initialized(tmp_wpfy_home
     # the archive now carries stale credentials the volume no longer accepts.
     env_file = wpfy.site_layout.env_path(domain)
     rotated = wpfy.site_layout.read_env(env_file)
-    old_password = rotated["DB_PASSWORD"]
+    archived = dict(rotated)
+    rotated["DB_NAME"] = "rotated_live_name"
+    rotated["DB_USER"] = "rotated_live_user"
     rotated["DB_PASSWORD"] = "rotated-live-password"
     rotated["DB_ROOT_PASSWORD"] = "rotated-root-password"
     env_file.write_text("\n".join(f"{k}={v}" for k, v in rotated.items()) + "\n", encoding="utf-8")
@@ -1425,9 +2392,9 @@ def test_restore_preserves_live_db_credentials_when_db_initialized(tmp_wpfy_home
 
     restored = wpfy.site_layout.read_env(env_file)
     assert result.exit_code == 0
-    assert restored["DB_PASSWORD"] == "rotated-live-password"
-    assert restored["DB_ROOT_PASSWORD"] == "rotated-root-password"
-    assert restored["DB_PASSWORD"] != old_password
+    for key in ("DB_NAME", "DB_USER", "DB_PASSWORD", "DB_ROOT_PASSWORD"):
+        assert restored[key] == rotated[key]
+        assert restored[key] != archived[key]
 
 
 def test_restore_keeps_archive_credentials_for_uninitialized_db(tmp_wpfy_home, monkeypatch):
@@ -1446,7 +2413,10 @@ def test_restore_keeps_archive_credentials_for_uninitialized_db(tmp_wpfy_home, m
     env_file = wpfy.site_layout.env_path(domain)
     archived = wpfy.site_layout.read_env(env_file)
     rotated = dict(archived)
+    rotated["DB_NAME"] = "rotated_live_name"
+    rotated["DB_USER"] = "rotated_live_user"
     rotated["DB_PASSWORD"] = "rotated-live-password"
+    rotated["DB_ROOT_PASSWORD"] = "rotated-root-password"
     env_file.write_text("\n".join(f"{k}={v}" for k, v in rotated.items()) + "\n", encoding="utf-8")
     # db-data stays empty: MariaDB will initialize from the restored .env.
 
@@ -1454,4 +2424,5 @@ def test_restore_keeps_archive_credentials_for_uninitialized_db(tmp_wpfy_home, m
 
     restored = wpfy.site_layout.read_env(env_file)
     assert result.exit_code == 0
-    assert restored["DB_PASSWORD"] == archived["DB_PASSWORD"]
+    for key in ("DB_NAME", "DB_USER", "DB_PASSWORD", "DB_ROOT_PASSWORD"):
+        assert restored[key] == archived[key]

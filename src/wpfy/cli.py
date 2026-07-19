@@ -25,6 +25,7 @@ from urllib.request import Request, urlopen
 
 from . import __version__
 from . import backup_schedule
+from . import cache_operations
 from . import cron
 from . import dns
 from . import edge_backup
@@ -33,9 +34,9 @@ from . import registry
 from . import smtp
 from . import sftp
 from . import site_lifecycle
-from . import traefik
+from . import stack
 from . import operational_inspection
-from .php_runtime import DEFAULT_PHP_VERSION, PHP_IMAGE_REPOSITORY, SUPPORTED_PHP_VERSIONS, php_image
+from .php_runtime import DEFAULT_PHP_VERSION, SUPPORTED_PHP_VERSIONS
 from .certificate_lifecycle import cert_expiry_days, force_renew_cert, get_cert_info, preflight_ssl
 from .site_definition import SiteDefinition
 from .s3_backup import (
@@ -50,8 +51,6 @@ from .s3_backup import (
 )
 from .smtp import SMTPConfig
 from .site_layout import (
-    MARIADB_IMAGE,
-    REDIS_IMAGE,
     WORDPRESS_FLAVORS,
     backup_site,
     ensure_site_scaffold,
@@ -69,14 +68,16 @@ from .site_paths import (
     domain_to_project,
     env_path,
     read_env,
-    site_dir,
     site_exists,
     validate_domain,
 )
 from .site_runtime import (
     RuntimeResult,
     compose_command,
+    reset_site_logs,
+    run_wp_cli,
     runtime_skip_requested,
+    site_logs,
     site_health,
     start_site_runtime,
     stop_site_runtime,
@@ -91,6 +92,10 @@ class WpfyHelpFormatter(argparse.ArgumentDefaultsHelpFormatter, argparse.RawDesc
 class CommandResult:
     message: str
     exit_code: int = 0
+
+
+DISK_THRESHOLDS: Final = (80.0, 90.0)
+LOAD_THRESHOLDS: Final = (1.5, 3.0)
 
 
 def _show_progress() -> bool:
@@ -470,47 +475,40 @@ def add_clean_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentPar
 
 
 def handle_clean(args: argparse.Namespace) -> CommandResult:
-    from .site_layout import compose_command as _compose_cmd, site_exists, list_sites
-
-    domain = getattr(args, "domain", None)
-    clear_redis = getattr(args, "redis", False)
-    clear_opcache = getattr(args, "opcache", False)
-    clear_all = getattr(args, "all", False)
-
-    clear_nginx = not clear_redis and not clear_opcache and not clear_all
-
-    if clear_all:
-        clear_nginx = True
-        clear_redis = True
-        clear_opcache = True
-
+    result = cache_operations.clear(cache_operations.CacheRequest(
+        domain=getattr(args, "domain", None),
+        redis=getattr(args, "redis", False),
+        opcache=getattr(args, "opcache", False),
+        clear_all=getattr(args, "all", False),
+    ))
     messages: list[str] = []
     errors: list[str] = []
-
-    if domain:
-        sites = [{"domain": domain}]
-    else:
-        sites = list_sites()
-
-    no_sites_found = not domain and not sites
-
-    for site in sites:
-        site_domain = site["domain"] if isinstance(site, dict) else site
-        if not site_exists(site_domain):
-            messages.append(f"[{site_domain}] skipped: site not found")
-            continue
-
-        if clear_nginx:
-            _clear_nginx_cache(site_domain, messages, errors)
-
-        if clear_redis:
-            _clear_redis_cache(site_domain, messages, errors)
-
-        if clear_opcache:
-            _clear_opcache(site_domain, messages, errors)
+    for outcome in result.outcomes:
+        if outcome.cache == "site":
+            line = f"[{outcome.domain}] skipped: {outcome.message}"
+        elif outcome.cache == "nginx":
+            line = (
+                f"[{outcome.domain}] nginx cache cleared"
+                if outcome.status == "ok"
+                else f"[{outcome.domain}] nginx cache: {outcome.message}"
+            )
+        elif outcome.cache == "redis":
+            if outcome.status == "ok":
+                line = f"[{outcome.domain}] redis cache flushed"
+            elif outcome.status == "skipped":
+                line = f"[{outcome.domain}] redis: {outcome.message} (skipped)"
+            else:
+                line = f"[{outcome.domain}] redis: {outcome.message}"
+        else:
+            line = (
+                f"[{outcome.domain}] opcache reset"
+                if outcome.status == "ok"
+                else f"[{outcome.domain}] opcache: {outcome.message}"
+            )
+        (errors if outcome.status == "error" else messages).append(line)
 
     lines = [_section("cache clear")]
-    if no_sites_found:
+    if result.no_sites_found:
         lines.append("no managed sites found")
     elif messages:
         lines.extend(messages)
@@ -519,47 +517,7 @@ def handle_clean(args: argparse.Namespace) -> CommandResult:
     if errors:
         lines.append("errors:")
         lines.extend(f"  {error}" for error in errors)
-    return CommandResult("\n".join(lines))
-
-
-def _clear_nginx_cache(domain: str, messages: list[str], errors: list[str]) -> None:
-    from .site_layout import compose_command as _compose_cmd
-    cache_dirs = ["/var/cache/nginx/fastcgi", "/var/cache/nginx/proxy", "/var/cache/nginx/uwsgi"]
-    cleared_any = False
-    for cache_dir in cache_dirs:
-        proc = _compose_cmd(domain, "exec", "-T", "web", "sh", "-lc", f"rm -rf {cache_dir}/* 2>/dev/null || true")
-        if proc.returncode == 0:
-            cleared_any = True
-    if cleared_any:
-        messages.append(f"[{domain}] nginx cache cleared")
-    else:
-        errors.append(f"[{domain}] nginx cache: docker exec failed")
-
-
-def _clear_redis_cache(domain: str, messages: list[str], errors: list[str]) -> None:
-    from .site_layout import compose_command as _compose_cmd, site_info
-    try:
-        info = site_info(domain)
-    except (FileNotFoundError, ValueError):
-        messages.append(f"[{domain}] redis: site not found")
-        return
-    if info.get("redis") != "1":
-        messages.append(f"[{domain}] redis: not enabled (skipped)")
-        return
-    proc = _compose_cmd(domain, "exec", "-T", "redis", "redis-cli", "FLUSHALL")
-    if proc.returncode == 0:
-        messages.append(f"[{domain}] redis cache flushed")
-    else:
-        errors.append(f"[{domain}] redis: exec failed (site may be stopped)")
-
-
-def _clear_opcache(domain: str, messages: list[str], errors: list[str]) -> None:
-    from .site_layout import compose_command as _compose_cmd
-    proc = _compose_cmd(domain, "exec", "-T", "app", "sh", "-lc", "kill -USR2 1")
-    if proc.returncode == 0:
-        messages.append(f"[{domain}] opcache reset")
-    else:
-        errors.append(f"[{domain}] opcache: exec failed (site may be stopped)")
+    return CommandResult("\n".join(lines), exit_code=result.exit_code)
 
 
 def add_secure_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
@@ -1397,20 +1355,37 @@ def add_config_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentPa
     parser.set_defaults(handler=handle_config)
 
 
+def _required_secret(
+    read_stdin: bool,
+    *,
+    prompt: str,
+    stdin_error: str,
+    tty_error: str,
+    empty_error: str,
+) -> tuple[str | None, CommandResult | None]:
+    if read_stdin:
+        secret = sys.stdin.readline().rstrip("\r\n")
+        if not secret:
+            return None, CommandResult(stdin_error, exit_code=2)
+        return secret, None
+    if not sys.stdin.isatty():
+        return None, CommandResult(tty_error, exit_code=2)
+    secret = getpass.getpass(prompt)
+    if not secret:
+        return None, CommandResult(empty_error, exit_code=2)
+    return secret, None
+
+
 def _config_password(args: argparse.Namespace) -> tuple[str | None, CommandResult | None]:
-    if getattr(args, "password_stdin", False):
-        password = sys.stdin.readline().rstrip("\r\n")
-        if not password:
-            return None, CommandResult("password required on stdin", exit_code=2)
-        return password, None
-    if getattr(args, "password", False):
-        if not sys.stdin.isatty():
-            return None, CommandResult("password prompt requires a TTY; use --password-stdin for scripts", exit_code=2)
-        password = getpass.getpass("WordPress admin password: ")
-        if not password:
-            return None, CommandResult("password cannot be empty", exit_code=2)
-        return password, None
-    return None, None
+    if not (getattr(args, "password_stdin", False) or getattr(args, "password", False)):
+        return None, None
+    return _required_secret(
+        getattr(args, "password_stdin", False),
+        prompt="WordPress admin password: ",
+        stdin_error="password required on stdin",
+        tty_error="password prompt requires a TTY; use --password-stdin for scripts",
+        empty_error="password cannot be empty",
+    )
 
 
 def _has_config_mutation(args: argparse.Namespace) -> bool:
@@ -1621,13 +1596,13 @@ def add_healthcheck_parser(subparsers: argparse._SubParsersAction[argparse.Argum
 
     disk_parser = _add_parser(health_subparsers, "disk", help="Check host disk usage.")
     disk_parser.add_argument("--path", default="/", help="filesystem path to inspect")
-    disk_parser.add_argument("--warn", type=float, default=80.0, help="warning threshold percentage")
-    disk_parser.add_argument("--fail", type=float, default=90.0, help="failure threshold percentage")
+    disk_parser.add_argument("--warn", type=float, default=DISK_THRESHOLDS[0], help="warning threshold percentage")
+    disk_parser.add_argument("--fail", type=float, default=DISK_THRESHOLDS[1], help="failure threshold percentage")
     disk_parser.set_defaults(health_target="disk")
 
     load_parser = _add_parser(health_subparsers, "load", help="Check host load average per CPU.")
-    load_parser.add_argument("--warn", type=float, default=1.5, help="warning threshold per CPU")
-    load_parser.add_argument("--fail", type=float, default=3.0, help="failure threshold per CPU")
+    load_parser.add_argument("--warn", type=float, default=LOAD_THRESHOLDS[0], help="warning threshold per CPU")
+    load_parser.add_argument("--fail", type=float, default=LOAD_THRESHOLDS[1], help="failure threshold per CPU")
     load_parser.set_defaults(health_target="load")
 
     app_parser = _add_parser(health_subparsers, "app", help="Check one or all managed sites.")
@@ -1785,8 +1760,8 @@ def handle_healthcheck(args: argparse.Namespace) -> CommandResult:
         return CommandResult(f"unknown healthcheck target: {target}", exit_code=2)
 
     results = [
-        _healthcheck_disk("/", 80.0, 90.0),
-        _healthcheck_load(1.5, 3.0),
+        _healthcheck_disk("/", *DISK_THRESHOLDS),
+        _healthcheck_load(*LOAD_THRESHOLDS),
         _healthcheck_system(),
         _healthcheck_all_sites(),
     ]
@@ -2290,9 +2265,6 @@ def handle_log_show(args: argparse.Namespace) -> CommandResult:
     except (FileNotFoundError, ValueError) as exc:
         return CommandResult(str(exc), exit_code=2)
 
-    compose_file = str(compose_path(domain))
-    site_directory = str(site_dir(domain))
-
     service_filter: list[str] = []
     if args.nginx:
         service_filter.append("web")
@@ -2301,22 +2273,13 @@ def handle_log_show(args: argparse.Namespace) -> CommandResult:
     if args.mysql:
         service_filter.append("db")
 
-    cmd = ["docker", "compose", "-f", compose_file, "logs"]
-    cmd.extend(["--tail", str(args.lines)])
-    if args.follow:
-        cmd.append("--follow")
-    for svc in service_filter:
-        cmd.append(svc)
-
-    if args.follow:
-        proc = subprocess.run(cmd, cwd=site_directory, check=False)
-        return CommandResult("", exit_code=proc.returncode)
-
-    proc = subprocess.run(cmd, cwd=site_directory, check=False, capture_output=True, text=True)
-    output = proc.stdout
-    if not output and proc.stderr:
-        output = proc.stderr
-    return CommandResult(output, exit_code=proc.returncode)
+    result = site_logs(
+        domain,
+        services=tuple(service_filter),
+        lines=args.lines,
+        follow=args.follow,
+    )
+    return CommandResult(result.stdout or result.stderr, exit_code=result.exit_code)
 
 
 def handle_log_cron(args: argparse.Namespace) -> CommandResult:
@@ -2331,32 +2294,20 @@ def handle_log_reset(args: argparse.Namespace) -> CommandResult:
     except (FileNotFoundError, ValueError) as exc:
         return CommandResult(str(exc), exit_code=2)
 
-    compose_file = str(compose_path(domain))
-    site_directory = str(site_dir(domain))
-
-    down_proc = subprocess.run(
-        ["docker", "compose", "-f", compose_file, "down"],
-        cwd=site_directory, check=False, capture_output=True, text=True,
-    )
-    if down_proc.returncode != 0:
-        err = down_proc.stderr.strip() or down_proc.stdout.strip() or "docker compose down failed"
+    result = reset_site_logs(domain)
+    if result.stop.exit_code != 0 or result.stop.skipped:
         return CommandResult(
-            _render_summary("log reset", [f"domain: {domain}", f"runtime: FAIL {err}"]),
-            exit_code=down_proc.returncode,
+            _render_summary("log reset", [f"domain: {domain}", f"runtime: FAIL {result.stop.message}"]),
+            exit_code=result.exit_code,
         )
-
-    up_proc = subprocess.run(
-        ["docker", "compose", "-f", compose_file, "up", "-d"],
-        cwd=site_directory, check=False, capture_output=True, text=True,
-    )
-    if up_proc.returncode != 0:
-        err = up_proc.stderr.strip() or up_proc.stdout.strip() or "docker compose up failed"
+    if result.restart is None or result.restart.exit_code != 0 or result.restart.skipped:
+        message = result.restart.message if result.restart is not None else "restart did not run"
         lines = [
             _section("log reset"),
             "runtime: OK stopped",
-            f"restart: FAIL {err}",
+            f"restart: FAIL {message}",
         ]
-        return CommandResult("\n".join(lines), exit_code=up_proc.returncode)
+        return CommandResult("\n".join(lines), exit_code=result.exit_code)
 
     lines = [
         _section("log reset"),
@@ -2510,189 +2461,89 @@ def make_site_handler(name: str):
     return handler
 
 
-def _pull_php_image(php_ver: str) -> tuple[bool, str]:
-    image = php_image(php_ver)
-    return _pull_image(image)
-
-
-def _pull_image(image: str) -> tuple[bool, str]:
-    proc = subprocess.run(["docker", "pull", image], check=False, capture_output=True, text=True)
-    if proc.returncode == 0:
-        return True, f"pulled {image}"
-    err = (proc.stderr.strip() or proc.stdout.strip() or "pull failed").splitlines()[-1]
-    return False, f"error: {err}"
-
-
 def handle_stack_install(args: argparse.Namespace) -> CommandResult:
-    results: list[str] = [_section("stack install")]
-    exit_code = 0
-    pulled_php_versions: set[str] = set()
-    install_all = getattr(args, "all", False)
-
-    if install_all or getattr(args, "nginx", False):
-        _progress("Starting shared Traefik edge proxy...")
-        result = traefik.start_traefik()
-        results.append(_step_line("Traefik", result))
-        if result.exit_code != 0:
-            exit_code = result.exit_code
-
-    php_ver = getattr(args, "php", None)
-    if install_all and not php_ver:
-        php_ver = DEFAULT_PHP_VERSION
-    if php_ver:
-        _progress(f"Pulling PHP {php_ver} runtime image...")
-        ok, msg = _pull_php_image(php_ver)
-        results.append(f"PHP {php_ver}: {'OK' if ok else 'FAIL'} {msg}")
-        if not ok:
-            exit_code = 1
-        else:
-            pulled_php_versions.add(php_ver)
-
-    if install_all or getattr(args, "mysql", False) or getattr(args, "mariadb", False):
-        image = MARIADB_IMAGE
-        _progress(f"Pulling {image} image...")
-        proc = subprocess.run(["docker", "pull", image], check=False, capture_output=True, text=True)
-        if proc.returncode == 0:
-            results.append(f"MariaDB: OK pulled {image}")
-        else:
-            err = proc.stderr.strip() or proc.stdout.strip() or "pull failed"
-            results.append(f"MariaDB: FAIL {err}")
-            exit_code = proc.returncode or 1
-
-    if install_all or getattr(args, "redis", False):
-        image = REDIS_IMAGE
-        _progress(f"Pulling {image} image...")
-        proc = subprocess.run(["docker", "pull", image], check=False, capture_output=True, text=True)
-        if proc.returncode == 0:
-            results.append(f"Redis: OK pulled {image}")
-        else:
-            err = proc.stderr.strip() or proc.stdout.strip() or "pull failed"
-            results.append(f"Redis: FAIL {err}")
-            exit_code = proc.returncode or 1
-
-    if getattr(args, "wpcli", False):
-        if DEFAULT_PHP_VERSION in pulled_php_versions:
-            results.append(f"wp-cli: OK using {php_image(DEFAULT_PHP_VERSION)} (bundled)")
-        else:
-            _progress(f"Pulling PHP {DEFAULT_PHP_VERSION} runtime image for WP-CLI...")
-            ok, msg = _pull_php_image(DEFAULT_PHP_VERSION)
-            results.append(f"wp-cli: {'OK' if ok else 'FAIL'} {msg} (bundled)")
-            if not ok:
-                exit_code = 1
-
-    host_flags = ["netdata", "fail2ban", "ufw", "ngxblocker", "nanorc", "dashboard", "extplorer"]
-    for flag in host_flags:
-        if getattr(args, flag, False):
-            results.append(f"{flag}: WARN not applicable in Docker-first wpfy (use host-level tooling separately)")
-
-    helper_images = {
-        "phpmyadmin": "phpmyadmin:5-apache",
-        "adminer": "adminer:5",
-        "composer": "composer:2",
-    }
-    for flag, image in helper_images.items():
-        if getattr(args, flag, False):
-            _progress(f"Pulling helper image {image}...")
-            ok, msg = _pull_image(image)
-            results.append(f"{flag}: {'OK' if ok else 'FAIL'} {msg}")
-            if not ok:
-                exit_code = 1
-    if getattr(args, "mysqltuner", False):
-        results.append("mysqltuner: WARN skipped; no vetted pinned container image yet")
-
-    if len(results) == 1:
+    host_tools = tuple(flag for flag in stack.HOST_TOOLS if getattr(args, flag, False))
+    helpers = tuple(flag for flag in stack.HELPER_IMAGES if getattr(args, flag, False))
+    result = stack.install(stack.StackInstallRequest(
+        install_all=getattr(args, "all", False),
+        nginx=getattr(args, "nginx", False),
+        php_version=getattr(args, "php", None),
+        mysql=getattr(args, "mysql", False),
+        mariadb=getattr(args, "mariadb", False),
+        redis=getattr(args, "redis", False),
+        wpcli=getattr(args, "wpcli", False),
+        host_tools=host_tools,
+        helpers=helpers,
+        mysqltuner=getattr(args, "mysqltuner", False),
+    ), progress=_progress)
+    results = [
+        _section("stack install"),
+        *(f"{fact.name}: {fact.status} {fact.message}" for fact in result.facts),
+    ]
+    if not result.facts:
         results.append("nothing selected")
         results.append("hint: use --nginx, --php, --mysql, --redis, --wpcli, or --all")
-
-    return CommandResult("\n".join(results), exit_code=exit_code)
+    return CommandResult("\n".join(results), exit_code=result.exit_code)
 
 
 def handle_stack_status(args: argparse.Namespace) -> CommandResult:
     results: list[str] = [_section("stack status")]
 
-    status = traefik.traefik_status()
-    results.append(f"Traefik: {status.message}")
-
-    proc = subprocess.run(
-        ["docker", "version", "--format", "{{.Server.Version}}"],
-        check=False, capture_output=True, text=True,
-    )
-    if proc.returncode == 0 and proc.stdout.strip():
-        results.append(f"Docker: {proc.stdout.strip()}")
+    status = stack.status()
+    results.append(f"Traefik: {status.traefik.message}")
+    if status.docker_error:
+        results.append(f"Docker: FAIL {status.docker_error}")
+    elif status.docker_version:
+        results.append(f"Docker: {status.docker_version}")
     else:
         results.append("Docker: unavailable (is Docker installed and running?)")
-
-    proc = subprocess.run(
-        ["docker", "images", "--format", "{{.Repository}}:{{.Tag}}", f"{PHP_IMAGE_REPOSITORY}*"],
-        check=False, capture_output=True, text=True,
-    )
-    if proc.returncode == 0 and proc.stdout.strip():
+    if status.images:
         results.append("Pulled wpfy images:")
-        for line in proc.stdout.strip().splitlines():
+        for line in status.images:
             results.append(f"  - {line}")
+    elif status.images_error:
+        results.append(f"Pulled wpfy images: FAIL {status.images_error}")
     else:
         results.append("Pulled wpfy images: none found")
 
-    return CommandResult("\n".join(results))
+    return CommandResult("\n".join(results), exit_code=status.exit_code)
 
 
 def handle_stack_remove(args: argparse.Namespace) -> CommandResult:
-    result = traefik.stop_traefik()
+    result = stack.remove()
     if result.skipped:
         return CommandResult(_render_summary("stack remove", [f"Traefik: SKIP {result.message}"]))
     if result.exit_code != 0:
-        return CommandResult(_render_summary("stack remove", [f"Traefik: FAIL {result.message}"]), exit_code=result.exit_code)
+        return CommandResult(
+            _render_summary("stack remove", [f"Traefik: FAIL {result.message}"]),
+            exit_code=result.exit_code,
+        )
     return CommandResult(_render_summary("stack remove", [f"Traefik: OK {result.message}"]))
 
 
 def handle_stack_upgrade(args: argparse.Namespace) -> CommandResult:
-    compose_file = traefik.traefik_compose_path()
-    if not compose_file.exists():
-        return CommandResult(
-            _render_summary("stack upgrade", ["Traefik: FAIL not installed; run 'wpfy stack install --nginx' first"]),
-            exit_code=2,
+    result = stack.upgrade()
+    lines = [_section("stack upgrade")]
+    for fact in result.facts:
+        lines.append(
+            f"pull: {fact.message}"
+            if fact.name == "pull"
+            else f"{fact.name}: {fact.status} {fact.message}"
         )
-
-    proc = subprocess.run(
-        ["docker", "compose", "-f", str(compose_file), "pull"],
-        cwd=traefik.traefik_dir(),
-        check=False, capture_output=True, text=True,
-    )
-    if proc.returncode != 0:
-        err = proc.stderr.strip() or proc.stdout.strip() or "pull failed"
-        return CommandResult(_render_summary("stack upgrade", [f"Traefik: FAIL pull failed: {err}"]), exit_code=proc.returncode)
-
-    proc2 = subprocess.run(
-        ["docker", "compose", "-f", str(compose_file), "up", "-d"],
-        cwd=traefik.traefik_dir(),
-        check=False, capture_output=True, text=True,
-    )
-    if proc2.returncode != 0:
-        err = proc2.stderr.strip() or proc2.stdout.strip() or "restart failed"
-        return CommandResult(_render_summary("stack upgrade", [f"Traefik: FAIL restart failed: {err}"]), exit_code=proc2.returncode)
-
-    lines = [_section("stack upgrade"), "Traefik: OK pulled latest images and restarted", "pull: complete"]
-    return CommandResult("\n".join(lines))
+    return CommandResult("\n".join(lines), exit_code=result.exit_code)
 
 
 def handle_stack_purge(args: argparse.Namespace) -> CommandResult:
-    stop_result = traefik.stop_traefik()
-    purge_msgs = [_section("stack purge"), _step_line("Traefik", stop_result)]
-
-    compose_file = traefik.traefik_compose_path()
-    if compose_file.exists():
-        subprocess.run(
-            ["docker", "compose", "-f", str(compose_file), "down", "--volumes", "--remove-orphans"],
-            cwd=traefik.traefik_dir(),
-            check=False, capture_output=True, text=True,
-        )
-        purge_msgs.append("compose project removed")
-
-    purge_msgs.append(
-        f"pulled images: docker rmi {php_image(DEFAULT_PHP_VERSION)} "
-        f"{MARIADB_IMAGE} {REDIS_IMAGE} {traefik.TRAEFIK_IMAGE}"
-    )
-    return CommandResult("\n".join(purge_msgs))
+    result = stack.purge(force=getattr(args, "force", False))
+    lines = [_section("stack purge")]
+    for fact in result.facts:
+        if fact.name == "compose project" and fact.status == "OK":
+            lines.append("compose project removed")
+        elif fact.name == "pulled images":
+            lines.append(f"pulled images: {fact.message}")
+        else:
+            lines.append(f"{fact.name}: {fact.status} {fact.message}")
+    return CommandResult("\n".join(lines), exit_code=result.exit_code)
 
 
 def handle_stack_migrate(args: argparse.Namespace) -> CommandResult:
@@ -2933,17 +2784,13 @@ def _load_backup_storage(profile: str | None = None) -> tuple[S3Config | None, C
 
 
 def _secret_from_args(args: argparse.Namespace) -> tuple[str | None, CommandResult | None]:
-    if getattr(args, "secret_key_stdin", False):
-        secret_key = sys.stdin.readline().rstrip("\r\n")
-        if not secret_key:
-            return None, CommandResult("secret key required on stdin", exit_code=2)
-        return secret_key, None
-    if not sys.stdin.isatty():
-        return None, CommandResult("secret key prompt requires a TTY; use --secret-key-stdin for scripts", exit_code=2)
-    secret_key = getpass.getpass("S3 secret key: ")
-    if not secret_key:
-        return None, CommandResult("secret key cannot be empty", exit_code=2)
-    return secret_key, None
+    return _required_secret(
+        getattr(args, "secret_key_stdin", False),
+        prompt="S3 secret key: ",
+        stdin_error="secret key required on stdin",
+        tty_error="secret key prompt requires a TTY; use --secret-key-stdin for scripts",
+        empty_error="secret key cannot be empty",
+    )
 
 
 def handle_backup_storage(args: argparse.Namespace) -> CommandResult:
@@ -3180,17 +3027,13 @@ def handle_cron(args: argparse.Namespace) -> CommandResult:
 
 
 def _smtp_password_from_args(args: argparse.Namespace) -> tuple[str | None, CommandResult | None]:
-    if getattr(args, "password_stdin", False):
-        password = sys.stdin.readline().rstrip("\r\n")
-        if not password:
-            return None, CommandResult("SMTP password required on stdin", exit_code=2)
-        return password, None
-    if not sys.stdin.isatty():
-        return None, CommandResult("SMTP password prompt requires a TTY; use --password-stdin for scripts", exit_code=2)
-    password = getpass.getpass("SMTP password: ")
-    if not password:
-        return None, CommandResult("SMTP password cannot be empty", exit_code=2)
-    return password, None
+    return _required_secret(
+        getattr(args, "password_stdin", False),
+        prompt="SMTP password: ",
+        stdin_error="SMTP password required on stdin",
+        tty_error="SMTP password prompt requires a TTY; use --password-stdin for scripts",
+        empty_error="SMTP password cannot be empty",
+    )
 
 
 def _load_smtp() -> tuple[SMTPConfig | None, CommandResult | None]:
@@ -3316,24 +3159,8 @@ def handle_site_wp(args: argparse.Namespace) -> CommandResult:
     if not site_exists(domain):
         return CommandResult(f"site not found: {domain}", exit_code=2)
 
-    wp_args = list(args.wp_args or [])
-    # The wpcli container runs as the site's non-root uid; --allow-root is a
-    # harmless no-op there (wp-cli only treats uid 0 as root) and is kept for
-    # parity with the bootstrap path.
-    if "--allow-root" not in wp_args:
-        wp_args.append("--allow-root")
-    compose_file = str(compose_path(domain))
-    site_directory = str(site_dir(domain))
-
-    cmd = ["docker", "compose", "-f", compose_file, "run", "--rm", "wpcli", *wp_args]
-
-    proc = subprocess.run(
-        cmd,
-        cwd=site_directory,
-        check=False,
-    )
-
-    return CommandResult("", exit_code=proc.returncode)
+    result = run_wp_cli(domain, *(args.wp_args or []), interactive=True)
+    return CommandResult("", exit_code=result.exit_code)
 
 
 def _label(ok: bool | None) -> str:

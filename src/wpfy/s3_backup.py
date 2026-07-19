@@ -15,7 +15,9 @@ from urllib.error import URLError
 from urllib.parse import quote, urlparse, urlunparse
 from urllib.request import Request, urlopen
 
+from .redaction import redact_values
 from .settings import PATHS
+from .site_paths import read_env
 
 
 SERVICE: Final = "s3"
@@ -234,14 +236,12 @@ def _load_env_config() -> S3Config | None:
 
 def _load_stored_config(profile: str | None = None) -> S3Config | None:
     path = s3_config_path(profile)
-    if not path.exists():
+    try:
+        values = {key: value.strip() for key, value in read_env(path).items()}
+    except OSError as exc:
+        raise S3ConfigError(f"cannot read backup storage config: {exc}") from exc
+    if not values and not path.exists():
         return None
-    values: dict[str, str] = {}
-    for line in path.read_text(encoding="utf-8").splitlines():
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, value = line.split("=", 1)
-        values[key] = value.strip()
     missing = [key for key in REQUIRED_ENV if not values.get(key)]
     if missing:
         raise S3ConfigError(f"missing {', '.join(missing)}")
@@ -268,11 +268,7 @@ def s3_object_key(prefix: str, domain: str, archive_name: str) -> str:
 
 
 def redact_s3_secrets(message: str, config: S3Config) -> str:
-    redacted = message
-    for secret in (config.access_key, config.secret_key):
-        if secret:
-            redacted = redacted.replace(secret, "***REDACTED***")
-    return redacted
+    return redact_values(message, (config.access_key, config.secret_key))
 
 
 def signed_put_request(config: S3Config, key: str, payload: bytes) -> Request:
@@ -319,7 +315,7 @@ def _signed_request(
     }
     if content_length is not None:
         headers["Content-Length"] = str(content_length)
-    signed_headers = "host;x-amz-content-sha256;x-amz-date"
+    signed_headers = ";".join(name.lower() for name in sorted(headers))
     canonical_headers = "\n".join(f"{name.lower()}:{headers[name]}" for name in sorted(headers)) + "\n"
     canonical_request = "\n".join([
         method,

@@ -3,13 +3,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 import os
-import shlex
 import shutil
 import stat
 import subprocess
 from typing import Final
 
 from .settings import PATHS
+from . import systemd
 from .site_definition import WORDPRESS_FLAVORS
 from .site_layout import list_sites
 from .site_runtime import RuntimeResult, runtime_skip_requested, site_health, wp_cli_command
@@ -34,10 +34,6 @@ class CronRun:
     exit_code: int = 0
 
 
-def systemd_dir() -> Path:
-    return Path(os.environ.get("WPFY_SYSTEMD_DIR", "/etc/systemd/system"))
-
-
 def cron_log_path() -> Path:
     return Path(PATHS.log_dir) / LOG_NAME
 
@@ -47,30 +43,20 @@ def custom_hook_path(interval: str) -> Path:
 
 
 def install_timers() -> RuntimeResult:
-    root = systemd_dir()
-    root.mkdir(parents=True, exist_ok=True)
+    units: dict[Path, str] = {}
     for interval in INTERVALS:
-        service_path(interval).write_text(_service_content(interval), encoding="utf-8")
-        timer_path(interval).write_text(_timer_content(interval), encoding="utf-8")
-    for command in (["systemctl", "daemon-reload"], ["systemctl", "enable", "--now", *timer_names()]):
-        result = _run_systemctl(command)
-        if result.exit_code != 0:
-            return result
-    return RuntimeResult(0, f"cron timers installed: {', '.join(INTERVALS)}", ran=True)
+        units[service_path(interval)] = _service_content(interval)
+        units[timer_path(interval)] = _timer_content(interval)
+    return systemd.install_units(
+        units,
+        timer_names(),
+        f"cron timers installed: {', '.join(INTERVALS)}",
+    )
 
 
 def disable_timers() -> RuntimeResult:
-    result = _run_systemctl(["systemctl", "disable", "--now", *timer_names()])
-    if result.exit_code != 0:
-        return result
-    for interval in INTERVALS:
-        for path in (timer_path(interval), service_path(interval)):
-            if path.exists():
-                path.unlink()
-    reload_result = _run_systemctl(["systemctl", "daemon-reload"])
-    if reload_result.exit_code != 0:
-        return reload_result
-    return RuntimeResult(0, "cron timers disabled", ran=True)
+    paths = [path for interval in INTERVALS for path in (timer_path(interval), service_path(interval))]
+    return systemd.disable_units(timer_names(), paths, "cron timers disabled")
 
 
 def timers_status() -> RuntimeResult:
@@ -103,11 +89,11 @@ def read_cron_log(lines: int) -> RuntimeResult:
 
 
 def service_path(interval: str) -> Path:
-    return systemd_dir() / f"wpfy-cron-{interval}.service"
+    return systemd.systemd_dir() / f"wpfy-cron-{interval}.service"
 
 
 def timer_path(interval: str) -> Path:
-    return systemd_dir() / f"wpfy-cron-{interval}.timer"
+    return systemd.systemd_dir() / f"wpfy-cron-{interval}.timer"
 
 
 def timer_names() -> list[str]:
@@ -253,7 +239,7 @@ def _service_content(interval: str) -> str:
         "",
         "[Service]",
         "Type=oneshot",
-        f"ExecStart={_command_line(['/usr/local/bin/wpfy', 'cron', interval])}",
+        f"ExecStart={systemd.command_line(['/usr/local/bin/wpfy', 'cron', interval])}",
         "",
     ])
 
@@ -271,18 +257,3 @@ def _timer_content(interval: str) -> str:
         "WantedBy=timers.target",
         "",
     ])
-
-
-def _command_line(command: list[str]) -> str:
-    return " ".join(shlex.quote(part) for part in command)
-
-
-def _run_systemctl(command: list[str]) -> RuntimeResult:
-    try:
-        proc = subprocess.run(command, check=False, capture_output=True, text=True)
-    except FileNotFoundError:
-        return RuntimeResult(1, "systemctl not found")
-    if proc.returncode != 0:
-        message = proc.stderr.strip() or proc.stdout.strip() or f"{command[0]} failed"
-        return RuntimeResult(proc.returncode, message)
-    return RuntimeResult(0, "ok", ran=True)

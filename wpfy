@@ -623,7 +623,7 @@ sync_source() {
 
     rm -rf "$STAGED_APP_DIR"
     mkdir -p "$STAGED_APP_DIR"
-    rsync -a --delete --exclude '.git' --exclude '__pycache__' "$src_dir"/ "$STAGED_APP_DIR"/
+    rsync -a --delete --exclude '.git' --exclude '__pycache__' --exclude 'tests/' "$src_dir"/ "$STAGED_APP_DIR"/
 
     rm -rf "$PREVIOUS_APP_DIR"
     if [[ -d "$APP_DIR" ]]; then

@@ -36,3 +36,25 @@ def test_env_override_replaces_ranges(monkeypatch):
     assert is_cloudflare_ip("10.1.2.3") is True
     # Real Cloudflare IP no longer matches once the table is overridden.
     assert is_cloudflare_ip("104.16.0.1") is False
+
+
+def test_effective_ranges_parse_once_and_follow_override_changes(monkeypatch):
+    import wpfy.cloudflare_ranges as ranges
+
+    calls = []
+    real_parser = ranges.ipaddress.ip_network
+    monkeypatch.setattr(
+        ranges.ipaddress,
+        "ip_network",
+        lambda cidr, **kwargs: calls.append(cidr) or real_parser(cidr, **kwargs),
+    )
+    monkeypatch.setenv("WPFY_CLOUDFLARE_RANGES", "10.0.0.0/8,invalid")
+
+    assert ranges.is_cloudflare_ip("10.1.2.3") is True
+    assert ranges.is_cloudflare_ip("10.2.3.4") is True
+    assert calls == ["10.0.0.0/8", "invalid"]
+
+    monkeypatch.setenv("WPFY_CLOUDFLARE_RANGES", "192.0.2.0/24")
+    assert ranges.is_cloudflare_ip("10.1.2.3") is False
+    assert ranges.is_cloudflare_ip("192.0.2.1") is True
+    assert calls == ["10.0.0.0/8", "invalid", "192.0.2.0/24"]

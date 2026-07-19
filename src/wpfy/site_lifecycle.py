@@ -4,6 +4,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 from .php_runtime import DEFAULT_PHP_VERSION
+from .redaction import redact_values
 from .site_layout import (
     SiteSpec,
     apply_site_ownership,
@@ -209,7 +210,20 @@ def create_site(
         )
     # Re-own files written during bootstrap (e.g. downloaded WordPress core) with
     # the per-site uid before containers start.
-    apply_site_ownership(request.domain)
+    ownership = apply_site_ownership(request.domain)
+    if ownership.exit_code != 0:
+        return CreateSiteResult(
+            spec=spec,
+            touched=touched,
+            bootstrap=bootstrap,
+            runtime=RuntimeResult(
+                ownership.exit_code,
+                f"runtime skipped because ownership failed: {ownership.message}",
+                skipped=True,
+            ),
+            preflight_message=preflight_message,
+            exit_code=ownership.exit_code,
+        )
     report("runtime")
     runtime = start_site_runtime(request.domain)
 
@@ -257,10 +271,15 @@ def update_site(request: UpdateSiteRequest) -> UpdateSiteResult:
     domain = request.domain
     try:
         site_info(domain)
+    except OSError as exc:
+        raise SiteLifecycleError(f"unsafe site environment: {exc}") from exc
     except (FileNotFoundError, ValueError) as exc:
         raise SiteLifecycleError(str(exc)) from exc
 
-    existing_env = read_env(env_path(domain))
+    try:
+        existing_env = read_env(env_path(domain))
+    except OSError as exc:
+        raise SiteLifecycleError(f"unsafe site environment: {exc}") from exc
     current_flavor = existing_env.get("SITE_FLAVOR", "unknown")
     current_php = existing_env.get("PHP_VERSION", DEFAULT_PHP_VERSION)
     current_letsencrypt = existing_env.get("LETSENCRYPT_MODE", "") or None
@@ -346,7 +365,7 @@ def update_site(request: UpdateSiteRequest) -> UpdateSiteResult:
         )
         if proc.returncode != 0:
             message = proc.stderr.strip() or proc.stdout.strip() or "wp user update failed"
-            password_summary = f"FAIL {message.replace(request.password, '***REDACTED***')}"
+            password_summary = f"FAIL {redact_values(message, (request.password,))}"
         else:
             password_summary = f"OK password updated for {admin_user}"
 
@@ -377,10 +396,15 @@ def enable_ssl(
 
     try:
         existing_info = site_info(domain)
+    except OSError as exc:
+        raise SiteLifecycleError(f"unsafe site environment: {exc}") from exc
     except (FileNotFoundError, ValueError) as exc:
         raise SiteLifecycleError(str(exc)) from exc
 
-    existing_env = read_env(env_path(domain))
+    try:
+        existing_env = read_env(env_path(domain))
+    except OSError as exc:
+        raise SiteLifecycleError(f"unsafe site environment: {exc}") from exc
     flavor = existing_info.get("flavor", "site")
     spec = _site_spec(
         domain=domain,

@@ -2,8 +2,10 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 import hashlib
+import hmac
 import io
 import stat
+from urllib.parse import urlsplit
 
 import pytest
 
@@ -31,6 +33,37 @@ class Response(io.BytesIO):
         self.close()
 
 
+def _reconstruct_signature(request, secret_key):
+    authorization = request.headers["Authorization"]
+    fields = dict(part.split("=", 1) for part in authorization.split(" ", 1)[1].split(", "))
+    credential_scope = fields["Credential"].split("/", 1)[1]
+    signed_headers = fields["SignedHeaders"].split(";")
+    headers = {name.lower(): value.strip() for name, value in request.headers.items()}
+    parsed = urlsplit(request.full_url)
+    canonical_headers = "".join(f"{name}:{headers[name]}\n" for name in signed_headers)
+    canonical_request = "\n".join([
+        request.method,
+        parsed.path,
+        parsed.query,
+        canonical_headers,
+        fields["SignedHeaders"],
+        headers["x-amz-content-sha256"],
+    ])
+    amz_date = headers["x-amz-date"]
+    string_to_sign = "\n".join([
+        "AWS4-HMAC-SHA256",
+        amz_date,
+        credential_scope,
+        hashlib.sha256(canonical_request.encode()).hexdigest(),
+    ])
+    date_stamp, region, service, terminal = credential_scope.split("/")
+    date_key = hmac.new(f"AWS4{secret_key}".encode(), date_stamp.encode(), hashlib.sha256).digest()
+    region_key = hmac.new(date_key, region.encode(), hashlib.sha256).digest()
+    service_key = hmac.new(region_key, service.encode(), hashlib.sha256).digest()
+    signing_key = hmac.new(service_key, terminal.encode(), hashlib.sha256).digest()
+    return fields, hmac.new(signing_key, string_to_sign.encode(), hashlib.sha256).hexdigest()
+
+
 def test_signed_put_request_has_deterministic_signature(monkeypatch):
     import wpfy.s3_backup as s3_backup
 
@@ -54,8 +87,16 @@ def test_signed_put_request_has_deterministic_signature(monkeypatch):
     )
 
 
-@pytest.mark.parametrize("payload", [b"", b"archive payload\n" * 1000])
-def test_upload_archive_uses_file_body_with_exact_hash_and_length(tmp_path, payload):
+@pytest.mark.parametrize("payload", [b"", b"archive payload\n" * 1000], ids=["empty", "nonempty"])
+def test_upload_archive_uses_file_body_with_exact_hash_and_length(tmp_path, monkeypatch, payload):
+    import wpfy.s3_backup as s3_backup
+
+    class FixedDatetime:
+        @classmethod
+        def now(cls, tz):
+            return datetime(2013, 5, 24, tzinfo=timezone.utc)
+
+    monkeypatch.setattr(s3_backup, "datetime", FixedDatetime)
     archive = tmp_path / "example.tar.gz"
     archive.write_bytes(payload)
     observed = {}
@@ -66,6 +107,9 @@ def test_upload_archive_uses_file_body_with_exact_hash_and_length(tmp_path, payl
         observed["payload"] = body.read()
         observed["length"] = request.headers["Content-length"]
         observed["hash"] = request.headers["X-amz-content-sha256"]
+        fields, reconstructed = _reconstruct_signature(request, _config().secret_key)
+        observed["signed_headers"] = fields["SignedHeaders"]
+        observed["signature_matches"] = reconstructed == fields["Signature"]
         return Response()
 
     uploaded = S3Uploader(opener).upload_archive(_config(), archive, "example.com")
@@ -76,6 +120,8 @@ def test_upload_archive_uses_file_body_with_exact_hash_and_length(tmp_path, payl
         "payload": payload,
         "length": str(len(payload)),
         "hash": hashlib.sha256(payload).hexdigest(),
+        "signed_headers": "content-length;host;x-amz-content-sha256;x-amz-date",
+        "signature_matches": True,
     }
 
 

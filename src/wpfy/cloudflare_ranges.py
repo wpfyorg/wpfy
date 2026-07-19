@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ipaddress
 import os
+from functools import lru_cache
 
 # Cloudflare's published edge IP ranges.
 # Source: https://www.cloudflare.com/ips-v4 and https://www.cloudflare.com/ips-v6
@@ -36,12 +37,15 @@ CLOUDFLARE_IPV6 = (
 )
 
 
-def _networks() -> tuple[ipaddress._BaseNetwork, ...]:
+def _effective_cidrs() -> tuple[str, ...]:
     override = os.environ.get("WPFY_CLOUDFLARE_RANGES")
     if override:
-        cidrs = [raw.strip() for raw in override.split(",") if raw.strip()]
-    else:
-        cidrs = list(CLOUDFLARE_IPV4) + list(CLOUDFLARE_IPV6)
+        return tuple(raw.strip() for raw in override.split(",") if raw.strip())
+    return CLOUDFLARE_IPV4 + CLOUDFLARE_IPV6
+
+
+@lru_cache(maxsize=None)
+def _networks(cidrs: tuple[str, ...]) -> tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...]:
     nets: list[ipaddress._BaseNetwork] = []
     for cidr in cidrs:
         try:
@@ -56,7 +60,7 @@ def is_cloudflare_ip(ip: str) -> bool:
         addr = ipaddress.ip_address(ip)
     except ValueError:
         return False
-    for net in _networks():
+    for net in _networks(_effective_cidrs()):
         if addr.version == net.version and addr in net:
             return True
     return False

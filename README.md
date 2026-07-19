@@ -53,20 +53,24 @@ Traditional WordPress stack managers install Nginx, PHP, and MySQL directly on t
 
 ## Installation
 
-On a fresh Ubuntu VPS, as a user with sudo access:
+On a fresh Ubuntu VPS, as a user with sudo access. RC2 is published as
+`v1.0.0-rc2`; use its immutable tag and published archive checksum:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/wpfyorg/wpfy/main/install.sh | sudo bash
+curl -fsSLO https://raw.githubusercontent.com/wpfyorg/wpfy/v1.0.0-rc2/install.sh
+less install.sh
+sudo WPFY_REF=v1.0.0-rc2 WPFY_SOURCE_SHA256=<published-rc2-archive-sha256> bash install.sh
 ```
 
 The installer detects your system, downloads the wpfy source archive from GitHub, and runs a step-by-step guided install. It logs to `/var/log/wpfy/install.log` and supports `--dry-run`, `--verbose`, and `--no-color`.
 
-> **Note on piping to bash:** the command above fetches the installer from the mutable `main` branch. For a reviewable, reproducible install, download the script first and inspect it, and pin the source:
+> **Note:** copy the checksum from the RC2 release notes. `main` remains useful
+> for development, not for a reproducible production install:
 >
 > ```bash
-> curl -fsSLO https://raw.githubusercontent.com/wpfyorg/wpfy/main/install.sh
+> curl -fsSLO https://raw.githubusercontent.com/wpfyorg/wpfy/v1.0.0-rc2/install.sh
 > less install.sh   # review before running
-> sudo WPFY_REF=<tag-or-commit> WPFY_SOURCE_SHA256=<checksum> bash install.sh
+> sudo WPFY_REF=v1.0.0-rc2 WPFY_SOURCE_SHA256=<published-rc2-archive-sha256> bash install.sh
 > ```
 >
 > Supported environment overrides: `WPFY_REF` (branch/tag/commit, default `main`), `WPFY_SOURCE_SHA256` (verify the downloaded archive), `WPFY_SOURCE_ARCHIVE`, `WPFY_REPO_OWNER`, `WPFY_REPO_NAME`.
@@ -373,12 +377,19 @@ wpfy site delete example.com      # prompts: Delete example.com? [y/N]
 - **Helper tools are opt-in prep only** — `--phpmyadmin`, `--adminer`, and `--composer` pull pinned-major helper images but do not expose a public dashboard. `--mysqltuner` skips until a vetted pinned image exists. Host-level options from classic stack managers (`--fail2ban`, `--ufw`, `--netdata`, etc.) are intentionally not managed by wpfy's Docker-first design — configure them on the host yourself.
 - **Destructive commands:**
   - `wpfy site delete` asks for confirmation interactively, but proceeds without a prompt when run non-interactively (e.g., in scripts) — treat it as immediate in automation. `--force` skips the prompt explicitly.
-  - `wpfy stack purge` removes the edge proxy Compose project **without a confirmation prompt**. Know what you're running.
+  - `wpfy stack purge` removes the edge proxy Compose project only with explicit `--force`; without it, the command exits nonzero before mutation.
 - **No independent security audit yet** — see [Safety model](#safety-model--isolation).
 
 ## Roadmap
 
 See [ROADMAP.md](ROADMAP.md). Headlines: beta hardening on real-world VPS providers, installer hardening (signed/checksummed release artifacts, pinned-version installs), expanded documentation, and deferred host-stack migration.
+
+## Release validation policy
+
+Public source tags retain Python tests and run them on GitHub Actions. Tests are
+excluded from wheels, sdists, and `/opt/wpfy/app`; production hosts receive only
+runtime material. RC2 is locally validated only until disposable-VPS and provider
+evidence is published; see [ROADMAP.md](ROADMAP.md) for remaining gates.
 
 ## Security
 

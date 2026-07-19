@@ -5,7 +5,9 @@ from pathlib import Path
 from urllib.error import URLError
 from urllib.request import Request, urlopen
 
+from .redaction import redact_values
 from .settings import PATHS
+from .site_paths import read_env
 
 
 @dataclass(frozen=True, slots=True)
@@ -31,14 +33,12 @@ def write_cloudflare_config(config: CloudflareConfig) -> Path:
 
 def load_cloudflare_config() -> CloudflareConfig:
     path = cloudflare_config_path()
-    if not path.exists():
+    try:
+        values = {key: value.strip() for key, value in read_env(path).items()}
+    except OSError as exc:
+        raise DNSConfigError(f"cannot read Cloudflare DNS config: {exc}") from exc
+    if not values and not path.exists():
         raise DNSConfigError("Cloudflare DNS is not configured; run `wpfy dns cloudflare set --token-stdin`")
-    values: dict[str, str] = {}
-    for line in path.read_text(encoding="utf-8").splitlines():
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, value = line.split("=", 1)
-        values[key] = value.strip()
     token = values.get("CF_DNS_API_TOKEN", "")
     if not token:
         raise DNSConfigError("Cloudflare DNS token is missing")
@@ -68,4 +68,4 @@ def test_cloudflare_config(config: CloudflareConfig) -> str:
 
 
 def redact_cloudflare_secret(message: str, config: CloudflareConfig) -> str:
-    return message.replace(config.token, "***REDACTED***")
+    return redact_values(message, (config.token,))

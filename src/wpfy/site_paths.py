@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 import re
 
@@ -68,9 +69,19 @@ def read_text(path: Path) -> str | None:
 
 def read_env(path: Path) -> dict[str, str]:
     values: dict[str, str] = {}
-    text = read_text(path)
-    if text is None:
+    try:
+        parent_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except FileNotFoundError:
         return values
+    try:
+        try:
+            file_fd = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=parent_fd)
+        except FileNotFoundError:
+            return values
+        with os.fdopen(file_fd, "r", encoding="utf-8") as source:
+            text = source.read()
+    finally:
+        os.close(parent_fd)
     for line in text.splitlines():
         if not line or line.startswith("#") or "=" not in line:
             continue

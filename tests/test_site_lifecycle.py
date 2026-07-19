@@ -107,6 +107,119 @@ def test_create_site_stops_after_bootstrap_failure(monkeypatch):
     assert calls == []
 
 
+def test_create_site_stops_after_real_bootstrap_symlink_rejection(
+    tmp_wpfy_home, monkeypatch, tmp_path
+):
+    import importlib
+    import pytest
+    import wpfy.site_layout as layout
+    import wpfy.site_lifecycle as lifecycle
+
+    importlib.reload(layout)
+    importlib.reload(lifecycle)
+    domain = "unsafe-create.example.com"
+    external = tmp_path / "external-content"
+    external.mkdir()
+    (external / "sentinel").write_bytes(b"sentinel")
+    real_scaffold = lifecycle.ensure_site_scaffold
+
+    def scaffold_with_symlink(spec):
+        touched = real_scaffold(spec)
+        (layout.app_dir(domain) / "wp-content").symlink_to(
+            external, target_is_directory=True
+        )
+        return touched
+
+    monkeypatch.setattr(lifecycle, "ensure_site_scaffold", scaffold_with_symlink)
+    monkeypatch.setattr(
+        lifecycle,
+        "apply_site_ownership",
+        lambda domain_arg: pytest.fail("ownership ran after bootstrap rejection"),
+    )
+    monkeypatch.setattr(
+        lifecycle,
+        "start_site_runtime",
+        lambda domain_arg: pytest.fail("runtime ran after bootstrap rejection"),
+    )
+    monkeypatch.setattr(
+        lifecycle,
+        "provision_wordpress_site",
+        lambda *args: pytest.fail("WordPress provisioning ran after bootstrap rejection"),
+    )
+
+    result = lifecycle.create_site(
+        lifecycle.CreateSiteRequest(domain, "wp"),
+        credentials=lambda: pytest.fail("credentials requested after bootstrap rejection"),
+    )
+
+    assert result.exit_code != 0
+    assert result.runtime.skipped is True
+    assert "unsafe WordPress destination symlink" in result.bootstrap.message
+    assert (external / "sentinel").read_bytes() == b"sentinel"
+
+
+def test_create_site_rejects_preexisting_healthcheck_symlink_before_runtime(
+    tmp_wpfy_home, monkeypatch, tmp_path
+):
+    import importlib
+    import pytest
+    import wpfy.site_layout as layout
+    import wpfy.site_lifecycle as lifecycle
+
+    importlib.reload(layout)
+    importlib.reload(lifecycle)
+    domain = "health-create.example.com"
+    app_root = layout.app_dir(domain)
+    app_root.mkdir(parents=True)
+    external = tmp_path / "external-health"
+    external.write_bytes(b"sentinel")
+    layout.healthcheck_path(domain).symlink_to(external)
+    monkeypatch.setattr(
+        lifecycle,
+        "start_site_runtime",
+        lambda domain_arg: pytest.fail("runtime ran after scaffold rejection"),
+    )
+
+    with pytest.raises(lifecycle.SiteLifecycleError, match="unsafe scaffold destination symlink"):
+        lifecycle.create_site(
+            lifecycle.CreateSiteRequest(domain, "wp"),
+            credentials=lambda: pytest.fail("credentials requested after scaffold rejection"),
+        )
+
+    assert external.read_bytes() == b"sentinel"
+
+
+def test_create_site_stops_runtime_after_ownership_failure(monkeypatch):
+    import pytest
+    import wpfy.site_lifecycle as lifecycle
+
+    monkeypatch.setattr(lifecycle, "ensure_site_scaffold", lambda spec: ["compose.yaml"])
+    monkeypatch.setattr(
+        lifecycle,
+        "bootstrap_site_files",
+        lambda domain: RuntimeResult(0, "bootstrapped", ran=True),
+    )
+    monkeypatch.setattr(
+        lifecycle,
+        "apply_site_ownership",
+        lambda domain: RuntimeResult(3, "unsafe site ownership symlink"),
+    )
+    monkeypatch.setattr(
+        lifecycle,
+        "start_site_runtime",
+        lambda domain: pytest.fail("runtime ran after ownership failure"),
+    )
+
+    result = lifecycle.create_site(
+        lifecycle.CreateSiteRequest("ownership-failure.example.com", "wp"),
+        credentials=lambda: pytest.fail("credentials requested after ownership failure"),
+    )
+
+    assert result.exit_code == 3
+    assert result.runtime.skipped is True
+    assert "ownership failed" in result.runtime.message
+
+
 def test_update_site_passes_authoritative_definition_to_scaffold(monkeypatch):
     import wpfy.site_lifecycle as lifecycle
 
@@ -260,6 +373,56 @@ def test_update_site_password_falls_back_to_admin_when_lookup_fails(monkeypatch)
 
     assert "admin" in calls[-1]
     assert result.password_summary == "OK password updated for admin"
+
+
+def test_update_site_does_not_start_runtime_after_scaffold_ownership_failure(monkeypatch):
+    import pytest
+    import wpfy.site_lifecycle as lifecycle
+
+    monkeypatch.setattr(lifecycle, "site_info", lambda domain: {"domain": domain, "flavor": "wp"})
+    monkeypatch.setattr(lifecycle, "read_env", lambda path: {"SITE_FLAVOR": "wp", "PHP_VERSION": "8.4"})
+    monkeypatch.setattr(
+        lifecycle,
+        "ensure_site_scaffold",
+        lambda spec: (_ for _ in ()).throw(ValueError("ownership failed safely")),
+    )
+    monkeypatch.setattr(
+        lifecycle,
+        "start_site_runtime",
+        lambda domain: pytest.fail("runtime started after ownership failure"),
+    )
+
+    with pytest.raises(lifecycle.SiteLifecycleError, match="ownership failed safely"):
+        lifecycle.update_site(lifecycle.UpdateSiteRequest("example.com"))
+
+
+def test_update_site_rejects_environment_symlink_before_runtime(
+    tmp_wpfy_home, monkeypatch, tmp_path
+):
+    import importlib
+    import pytest
+    import wpfy.site_layout as layout
+    import wpfy.site_lifecycle as lifecycle
+
+    importlib.reload(layout)
+    importlib.reload(lifecycle)
+    domain = "update-env-symlink.example.com"
+    site_root = layout.site_dir(domain)
+    site_root.mkdir(parents=True)
+    layout.compose_path(domain).write_text("services: {}\n", encoding="utf-8")
+    external = tmp_path / "external-update-env"
+    external.write_text("SITE_FLAVOR=wp\nPHP_VERSION=8.4\n", encoding="utf-8")
+    layout.env_path(domain).symlink_to(external)
+    monkeypatch.setattr(
+        lifecycle,
+        "start_site_runtime",
+        lambda domain_arg: pytest.fail("runtime started after unsafe env rejection"),
+    )
+
+    with pytest.raises(lifecycle.SiteLifecycleError, match="unsafe site environment"):
+        lifecycle.update_site(lifecycle.UpdateSiteRequest(domain))
+
+    assert external.read_text(encoding="utf-8") == "SITE_FLAVOR=wp\nPHP_VERSION=8.4\n"
 
 
 def test_update_site_password_failure_is_redacted(monkeypatch):

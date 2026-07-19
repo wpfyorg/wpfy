@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -10,6 +11,7 @@ import shutil
 import subprocess
 import secrets
 import os
+import stat
 import tarfile
 import tempfile
 from urllib.request import urlopen
@@ -17,6 +19,7 @@ from urllib.request import urlopen
 from .settings import PATHS
 from . import registry
 from .php_runtime import PHP_IMAGE_REPOSITORY as _PHP_IMAGE_REPOSITORY, php_image
+from .redaction import redact_values
 from .s3_backup import S3ConfigError, S3Uploader, load_s3_config, redact_s3_secrets
 from .site_definition import MYSQL_FLAVORS, WORDPRESS_FLAVORS, SiteDefinition, sftp_service_lines
 from .site_paths import (
@@ -40,8 +43,7 @@ from .site_paths import (
 from .site_runtime import (
     HealthResult,
     RuntimeResult,
-    _http_probe_site,
-    _wait_for_service,
+    wait_for_service,
     compose_command,
     docker_available,
     runtime_skip_requested,
@@ -403,57 +405,294 @@ def env_content(spec: SiteSpec, existing: dict[str, str] | None = None) -> str:
     return "\n".join(f"{key}={value}" for key, value in values) + "\n"
 
 
+def _destination_symlink(root: Path, destinations: Iterable[Path]) -> Path | None:
+    for destination in destinations:
+        current = destination
+        while True:
+            if current.is_symlink():
+                return current
+            if current == root:
+                break
+            parent = current.parent
+            if parent == current:
+                break
+            current = parent
+    return None
+
+
+def _tree_symlink(root: Path) -> Path | None:
+    for directory, directory_names, file_names in os.walk(root, followlinks=False):
+        for name in (*directory_names, *file_names):
+            candidate = Path(directory) / name
+            if candidate.is_symlink():
+                return candidate
+    return None
+
+
+def _merge_tree_safely(
+    source_root: Path,
+    destination_root: Path,
+    excluded_names: Iterable[str] = (),
+) -> None:
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    excluded = set(excluded_names)
+
+    def merge(source: Path, destination_fd: int, excluded_children: set[str]) -> None:
+        for child in source.iterdir():
+            if child.name in excluded_children:
+                continue
+            mode = child.stat().st_mode & 0o777
+            if child.is_dir():
+                try:
+                    os.mkdir(child.name, mode=mode, dir_fd=destination_fd)
+                except FileExistsError:
+                    pass
+                child_fd = os.open(child.name, directory_flags, dir_fd=destination_fd)
+                try:
+                    merge(child, child_fd, set())
+                finally:
+                    os.close(child_fd)
+                continue
+
+            file_fd = os.open(
+                child.name,
+                os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW,
+                mode,
+                dir_fd=destination_fd,
+            )
+            with child.open("rb") as source_file, os.fdopen(file_fd, "wb") as destination_file:
+                shutil.copyfileobj(source_file, destination_file)
+                os.fchmod(destination_file.fileno(), mode)
+
+    root_fd = os.open(destination_root, directory_flags)
+    try:
+        merge(source_root, root_fd, excluded)
+    finally:
+        os.close(root_fd)
+
+
+def _write_text_safely(root: Path, name: str, content: str) -> None:
+    root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        file_fd = os.open(
+            name,
+            os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW,
+            0o644,
+            dir_fd=root_fd,
+        )
+        with os.fdopen(file_fd, "w", encoding="utf-8") as destination:
+            destination.write(content)
+    finally:
+        os.close(root_fd)
+
+
+def _read_text_safely(root: Path, name: str) -> str | None:
+    root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        try:
+            file_fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=root_fd)
+        except FileNotFoundError:
+            return None
+        with os.fdopen(file_fd, "r", encoding="utf-8") as source:
+            return source.read()
+    finally:
+        os.close(root_fd)
+
+
+def _read_env_safely(root: Path, name: str) -> dict[str, str]:
+    root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        try:
+            file_fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=root_fd)
+        except FileNotFoundError:
+            return {}
+        with os.fdopen(file_fd, "r", encoding="utf-8") as source:
+            lines = source.read().splitlines()
+    finally:
+        os.close(root_fd)
+    values = {}
+    for line in lines:
+        if line and not line.startswith("#") and "=" in line:
+            key, value = line.split("=", 1)
+            values[key] = value
+    return values
+
+
+def _chmod_file_safely(root: Path, name: str, mode: int) -> None:
+    root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        file_fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=root_fd)
+        try:
+            os.fchmod(file_fd, mode)
+        finally:
+            os.close(file_fd)
+    finally:
+        os.close(root_fd)
+
+
+def _ensure_directories_safely(root: Path, names: tuple[str, ...]) -> None:
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    directory_fd = os.open(root, directory_flags)
+    try:
+        for name in names:
+            try:
+                os.mkdir(name, dir_fd=directory_fd)
+            except FileExistsError:
+                pass
+            child_fd = os.open(name, directory_flags, dir_fd=directory_fd)
+            os.close(directory_fd)
+            directory_fd = child_fd
+    finally:
+        os.close(directory_fd)
+
+
+def _remove_entries_safely(root: Path, names: Iterable[str]) -> None:
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+
+    def clear(directory_fd: int) -> None:
+        for name in os.listdir(directory_fd):
+            metadata = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+            if stat.S_ISDIR(metadata.st_mode):
+                child_fd = os.open(name, directory_flags, dir_fd=directory_fd)
+                try:
+                    clear(child_fd)
+                finally:
+                    os.close(child_fd)
+                os.rmdir(name, dir_fd=directory_fd)
+            else:
+                os.unlink(name, dir_fd=directory_fd)
+
+    root_fd = os.open(root, directory_flags)
+    try:
+        for name in names:
+            try:
+                metadata = os.stat(name, dir_fd=root_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            if stat.S_ISDIR(metadata.st_mode):
+                child_fd = os.open(name, directory_flags, dir_fd=root_fd)
+                try:
+                    clear(child_fd)
+                finally:
+                    os.close(child_fd)
+                os.rmdir(name, dir_fd=root_fd)
+            else:
+                os.unlink(name, dir_fd=root_fd)
+    finally:
+        os.close(root_fd)
+
+
 def bootstrap_site_files(domain: str) -> RuntimeResult:
     validate_domain(domain)
     if os.environ.get("WPFY_SKIP_BOOTSTRAP", "0") == "1":
         return RuntimeResult(0, "bootstrap skipped by WPFY_SKIP_BOOTSTRAP=1", skipped=True)
 
     root = app_dir(domain)
+    unsafe = _destination_symlink(root, (root,))
+    if unsafe is not None:
+        return RuntimeResult(3, "wordpress bootstrap failed: unsafe WordPress destination symlink: app")
     root.mkdir(parents=True, exist_ok=True)
     health_file = healthcheck_path(domain)
-    if not health_file.exists():
-        health_file.write_text(f"wpfy-ok {domain}\n", encoding="utf-8")
-
+    unsafe = _destination_symlink(root, (health_file,))
+    if unsafe is not None:
+        return RuntimeResult(
+            3,
+            f"wordpress bootstrap failed: unsafe WordPress destination symlink: {unsafe.relative_to(root)}",
+        )
     flavor = read_env(env_path(domain)).get("SITE_FLAVOR", "site")
+    if flavor in WORDPRESS_FLAVORS:
+        index_path = root / "index.php"
+        config_path = root / "wp-config.php"
+        unsafe = _tree_symlink(root)
+        if unsafe is not None:
+            return RuntimeResult(
+                3,
+                f"wordpress bootstrap failed: unsafe WordPress destination symlink: {unsafe.relative_to(root)}",
+            )
+        if index_path.exists() and config_path.exists() and health_file.exists():
+            return RuntimeResult(0, "wordpress files already bootstrapped", ran=True)
+        if docker_available() and not runtime_skip_requested():
+            running = compose_command(domain, "ps", "--status", "running", "-q")
+            if running.returncode != 0:
+                message = running.stderr.strip() or running.stdout.strip() or "runtime status failed"
+                return RuntimeResult(3, f"wordpress bootstrap failed: {message}")
+            if running.stdout.strip():
+                return RuntimeResult(3, "wordpress bootstrap failed: stop the site runtime before retrying")
+
+    if not health_file.exists():
+        try:
+            _write_text_safely(root, health_file.name, f"wpfy-ok {domain}\n")
+        except OSError as exc:
+            return RuntimeResult(3, f"wordpress bootstrap failed: {exc}")
+
     if flavor not in WORDPRESS_FLAVORS:
         # Non-WordPress flavors must never have WordPress core dumped into them.
         if flavor == "html":
             index_html = root / "index.html"
+            if index_html.is_symlink():
+                return RuntimeResult(3, "static html bootstrap failed: unsafe index.html symlink")
             if not index_html.exists():
-                index_html.write_text(
-                    "<!doctype html>\n<html lang=\"en\">\n<head><meta charset=\"utf-8\">"
-                    f"<title>{domain}</title></head>\n<body><h1>{domain}</h1>"
-                    "<p>Static site provisioned by wpfy.</p></body>\n</html>\n",
-                    encoding="utf-8",
-                )
+                try:
+                    _write_text_safely(
+                        root,
+                        index_html.name,
+                        "<!doctype html>\n<html lang=\"en\">\n<head><meta charset=\"utf-8\">"
+                        f"<title>{domain}</title></head>\n<body><h1>{domain}</h1>"
+                        "<p>Static site provisioned by wpfy.</p></body>\n</html>\n",
+                    )
+                except OSError as exc:
+                    return RuntimeResult(3, f"static html bootstrap failed: {exc}")
             return RuntimeResult(0, "static html placeholder created", ran=True)
         index_php = root / "index.php"
+        if index_php.is_symlink():
+            return RuntimeResult(3, "php bootstrap failed: unsafe index.php symlink")
         if not index_php.exists():
-            index_php.write_text(
-                "<?php\n// wpfy placeholder — replace with your application.\n"
-                "header('Content-Type: text/plain');\n"
-                "echo 'wpfy php site ready';\n",
-                encoding="utf-8",
-            )
+            try:
+                _write_text_safely(
+                    root,
+                    index_php.name,
+                    "<?php\n// wpfy placeholder — replace with your application.\n"
+                    "header('Content-Type: text/plain');\n"
+                    "echo 'wpfy php site ready';\n",
+                )
+            except OSError as exc:
+                return RuntimeResult(3, f"php bootstrap failed: {exc}")
         return RuntimeResult(0, "php site placeholder created", ran=True)
 
     # WordPress flavors below.
+    index_existed = index_path.exists()
+    config_existed = config_path.exists()
+
     wp_content = root / "wp-content"
     uploads = wp_content / "uploads"
-    wp_content.mkdir(parents=True, exist_ok=True)
-    uploads.mkdir(parents=True, exist_ok=True)
+    unsafe = _destination_symlink(root, (wp_content, uploads))
+    if unsafe is not None:
+        return RuntimeResult(
+            3,
+            f"wordpress bootstrap failed: unsafe WordPress destination symlink: {unsafe.relative_to(root)}",
+        )
+    try:
+        _ensure_directories_safely(root, (wp_content.name, uploads.name))
+    except OSError as exc:
+        return RuntimeResult(3, f"wordpress bootstrap failed: {exc}")
 
-    if (root / "index.php").exists() and (root / "wp-config.php").exists():
-        return RuntimeResult(0, "wordpress files already bootstrapped", ran=True)
-
-    index_existed = (root / "index.php").exists()
-    config_existed = (root / "wp-config.php").exists()
     if os.environ.get("WPFY_SKIP_WORDPRESS_DOWNLOAD", "0") == "1":
-        if not index_existed:
-            (root / "index.php").write_text("<?php echo 'wpfy bootstrap placeholder';\n", encoding="utf-8")
-        if not config_existed:
-            (root / "wp-config.php").write_text(
-                _wordpress_config_content(read_env(env_path(domain))), encoding="utf-8"
+        try:
+            if not index_existed:
+                _write_text_safely(root, "index.php", "<?php echo 'wpfy bootstrap placeholder';\n")
+            if not config_existed:
+                _write_text_safely(
+                    root,
+                    "wp-config.php",
+                    _wordpress_config_content(read_env(env_path(domain))),
+                )
+        except OSError as exc:
+            return RuntimeResult(3, f"wordpress bootstrap failed: {exc}")
+        unsafe = _tree_symlink(root)
+        if unsafe is not None:
+            return RuntimeResult(
+                3,
+                f"wordpress bootstrap failed: unsafe WordPress destination symlink: {unsafe.relative_to(root)}",
             )
         return RuntimeResult(
             0,
@@ -483,21 +722,33 @@ def bootstrap_site_files(domain: str) -> RuntimeResult:
             wordpress_root = Path(temp_dir) / "wordpress"
             if not wordpress_root.is_dir():
                 raise FileNotFoundError("downloaded archive does not contain a wordpress directory")
-            for child in wordpress_root.iterdir():
-                destination = root / child.name
-                if child.is_dir():
-                    shutil.copytree(child, destination, dirs_exist_ok=True)
-                else:
-                    shutil.copy2(child, destination)
+            destinations = (
+                root / source.relative_to(wordpress_root)
+                for source in wordpress_root.rglob("*")
+            )
+            unsafe = _destination_symlink(root, destinations)
+            if unsafe is not None:
+                raise ValueError(
+                    f"unsafe WordPress destination symlink: {unsafe.relative_to(root)}"
+                )
+            _merge_tree_safely(wordpress_root, root)
 
             sample = root / "wp-config-sample.php"
             if sample.exists():
-                (root / "wp-config.php").write_text(
-                    _wordpress_config_content(read_env(env_path(domain))), encoding="utf-8"
+                _write_text_safely(
+                    root,
+                    "wp-config.php",
+                    _wordpress_config_content(read_env(env_path(domain))),
                 )
 
             if not (root / "index.php").exists():
-                (root / "index.php").write_text("<?php require __DIR__ . '/wp-blog-header.php';\n", encoding="utf-8")
+                _write_text_safely(root, "index.php", "<?php require __DIR__ . '/wp-blog-header.php';\n")
+
+            unsafe = _tree_symlink(root)
+            if unsafe is not None:
+                raise ValueError(
+                    f"unsafe WordPress destination symlink: {unsafe.relative_to(root)}"
+                )
 
             return RuntimeResult(
                 0,
@@ -666,6 +917,9 @@ def _wordpress_config_content(env: dict[str, str]) -> str:
 
 def _ensure_wordpress_config(domain: str) -> RuntimeResult:
     config = app_dir(domain) / "wp-config.php"
+    unsafe = _destination_symlink(config.parent, (config,))
+    if unsafe is not None:
+        return RuntimeResult(2, "unsafe WordPress destination symlink: wp-config.php")
     if config.exists():
         return RuntimeResult(0, "wp-config.php already exists", ran=True)
 
@@ -675,7 +929,10 @@ def _ensure_wordpress_config(domain: str) -> RuntimeResult:
     if missing:
         return RuntimeResult(2, f"missing database settings for wp-config.php: {', '.join(missing)}")
 
-    config.write_text(_wordpress_config_content(env), encoding="utf-8")
+    try:
+        _write_text_safely(config.parent, config.name, _wordpress_config_content(env))
+    except OSError as exc:
+        return RuntimeResult(2, f"failed to create wp-config.php: {exc}")
     return RuntimeResult(0, "wp-config.php created", ran=True)
 
 
@@ -693,13 +950,9 @@ def wordpress_install_state(domain: str) -> RuntimeResult:
     return RuntimeResult(1, message, ran=True)
 
 
-def _redact_secret(text: str, secret: str) -> str:
-    return text.replace(secret, "***REDACTED***") if secret else text
-
-
 def _wp_cli_error(proc: subprocess.CompletedProcess[str], fallback: str, secret: str = "") -> str:
     message = proc.stderr.strip() or proc.stdout.strip() or fallback
-    return _redact_secret(message, secret)
+    return redact_values(message, (secret,))
 
 
 def provision_wordpress_site(
@@ -718,7 +971,7 @@ def provision_wordpress_site(
     if install_state.exit_code == 0 and install_state.ran:
         return install_state
 
-    db_ready = _wait_for_service(domain, "db")
+    db_ready = wait_for_service(domain, "db")
     if db_ready.exit_code != 0:
         return db_ready
 
@@ -770,6 +1023,8 @@ def _unsafe_member_reason(member: tarfile.TarInfo) -> str | None:
         return f"unsupported link: {name}"
     if member.isdev():
         return f"unsupported device file: {name}"
+    if not member.isfile() and not member.isdir():
+        return f"unsupported special file: {name}"
     return None
 
 
@@ -782,24 +1037,32 @@ def _validate_restore_member(member: tarfile.TarInfo, domain: str) -> str | None
         return f"backup archive contains unsafe path: {name}"
     if not path.parts or path.parts[0] != domain:
         return f"backup archive contains data for another site: {name}"
+    if len(path.parts) == 1 and not member.isdir():
+        return f"backup archive site root is not a directory: {name}"
+    if (
+        len(path.parts) > 1
+        and path.parts[1] == "db-data"
+        and (len(path.parts) > 2 or not member.isdir())
+    ):
+        return f"backup archive contains excluded database volume data: {name}"
     if member.issym() or member.islnk():
         return f"backup archive contains unsupported link: {name}"
     if member.isdev():
         return f"backup archive contains unsupported device file: {name}"
+    if not member.isfile() and not member.isdir():
+        return f"backup archive contains unsupported special file: {name}"
     return None
 
 
 def _extract_tar_safely(archive: tarfile.TarFile, destination: str) -> None:
-    """Extract with the stdlib data filter; on Pythons without the filter
-    kwarg, reject traversal/link/device members ourselves before extracting."""
+    members = archive.getmembers()
+    for member in members:
+        reason = _unsafe_member_reason(member)
+        if reason:
+            raise ValueError(f"unsafe archive member: {reason}")
     try:
-        archive.extractall(destination, filter="data")
+        archive.extractall(destination, members=members, filter="data")
     except TypeError:
-        members = archive.getmembers()
-        for member in members:
-            reason = _unsafe_member_reason(member)
-            if reason:
-                raise RuntimeError(f"refusing to extract archive member with {reason}")
         archive.extractall(destination, members=members)
 
 
@@ -811,45 +1074,87 @@ def _restore_archive_to_temp(source: Path, domain: str, temp_dir: str) -> Runtim
                 error = _validate_restore_member(member, domain)
                 if error:
                     return RuntimeResult(2, error)
-            archive.extractall(temp_dir, members=members)
-    except tarfile.TarError as exc:
+            _extract_tar_safely(archive, temp_dir)
+    except (tarfile.TarError, EOFError) as exc:
         return RuntimeResult(2, f"invalid backup archive: {exc}")
     except OSError as exc:
         return RuntimeResult(3, f"failed to read or extract backup archive: {exc}")
     return None
 
 
-def _preserve_live_db_credentials(domain: str, live_env: dict[str, str]) -> None:
+def _preserve_live_db_credentials(domain: str, live_env: dict[str, str]) -> RuntimeResult | None:
     """Backups carry the SQL dump but not db-data/, so an initialized MariaDB
     volume keeps its pre-restore users. Restoring the archive's old DB
     credentials into .env would break authentication; keep the live ones."""
     keys = ("DB_NAME", "DB_USER", "DB_PASSWORD", "DB_ROOT_PASSWORD")
     preserved = {key: live_env[key] for key in keys if live_env.get(key)}
     if not preserved:
-        return
+        return None
     data_dir = db_data_dir(domain)
-    if not data_dir.exists() or not any(data_dir.iterdir()):
-        return
-    ep = env_path(domain)
-    restored = read_env(ep)
+    try:
+        data_fd = os.open(data_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        return RuntimeResult(3, f"failed to inspect live database state: {exc}")
+    try:
+        initialized = bool(os.listdir(data_fd))
+    finally:
+        os.close(data_fd)
+    if not initialized:
+        return None
+    target = site_dir(domain)
+    try:
+        restored = _read_env_safely(target, ".env")
+    except OSError as exc:
+        return RuntimeResult(3, f"failed to read restored environment: {exc}")
     if not restored:
-        return
+        return None
     merged = dict(restored)
     merged.update(preserved)
     if merged == restored:
-        return
-    ep.write_text("\n".join(f"{key}={value}" for key, value in merged.items()) + "\n", encoding="utf-8")
-    ep.chmod(0o600)
+        return None
+    try:
+        _write_text_safely(target, ".env", "\n".join(f"{key}={value}" for key, value in merged.items()) + "\n")
+        _chmod_file_safely(target, ".env", 0o600)
+    except OSError as exc:
+        return RuntimeResult(3, f"failed to preserve live database credentials: {exc}")
+    return None
 
 
-def _harden_restored_permissions(domain: str) -> None:
-    ep = env_path(domain)
-    if ep.exists():
-        ep.chmod(0o600)
-    backup_root = site_dir(domain) / "backups"
-    if backup_root.exists():
-        for path in backup_root.glob("*.sql"):
-            path.chmod(0o600)
+def _harden_restored_permissions(domain: str) -> RuntimeResult | None:
+    target = site_dir(domain)
+    try:
+        try:
+            _chmod_file_safely(target, ".env", 0o600)
+        except FileNotFoundError:
+            pass
+        target_fd = os.open(target, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            try:
+                backup_fd = os.open(
+                    "backups",
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                    dir_fd=target_fd,
+                )
+            except FileNotFoundError:
+                return None
+            try:
+                for name in os.listdir(backup_fd):
+                    if not name.endswith(".sql"):
+                        continue
+                    file_fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=backup_fd)
+                    try:
+                        os.fchmod(file_fd, 0o600)
+                    finally:
+                        os.close(file_fd)
+            finally:
+                os.close(backup_fd)
+        finally:
+            os.close(target_fd)
+    except OSError as exc:
+        return RuntimeResult(3, f"failed to harden restored permissions: {exc}")
+    return None
 
 
 def restore_site(domain: str, archive_path: str) -> RuntimeResult:
@@ -861,7 +1166,15 @@ def restore_site(domain: str, archive_path: str) -> RuntimeResult:
     # Check disk space before restore
     archive_size = source.stat().st_size
     target = site_dir(domain)
+    if target.is_symlink():
+        return RuntimeResult(2, "restore target is an unsafe symlink")
     target.mkdir(parents=True, exist_ok=True)
+    unsafe = _tree_symlink(target)
+    if unsafe is not None:
+        return RuntimeResult(
+            2,
+            f"restore target contains an unsafe symlink: {unsafe.relative_to(target)}",
+        )
     disk = shutil.disk_usage(target)
     needed = archive_size * 3  # rough estimate: archive + extracted + safety margin
     if needed > disk.free:
@@ -878,6 +1191,8 @@ def restore_site(domain: str, archive_path: str) -> RuntimeResult:
         extracted_root = Path(temp_dir) / domain
         if not extracted_root.exists():
             return RuntimeResult(2, f"backup archive missing site root: {archive_path}")
+        if not extracted_root.is_dir():
+            return RuntimeResult(2, f"backup archive site root is not a directory: {archive_path}")
 
         # Stop runtime only after archive validation has passed, so rejected archives do not leave sites down.
         if docker_available() and not runtime_skip_requested():
@@ -886,22 +1201,26 @@ def restore_site(domain: str, archive_path: str) -> RuntimeResult:
                 message = stop_proc.stderr.strip() or stop_proc.stdout.strip() or "docker compose down failed"
                 return RuntimeResult(stop_proc.returncode, f"failed to stop runtime before restore: {message}")
 
-        live_env = read_env(target / ".env")
-        for entry in extracted_root.iterdir():
-            destination = target / entry.name
-            if destination.exists():
-                if destination.is_dir():
-                    shutil.rmtree(destination)
-                else:
-                    destination.unlink()
-            if entry.is_dir():
-                shutil.copytree(entry, destination)
-            else:
-                shutil.copy2(entry, destination)
+        try:
+            live_env = _read_env_safely(target, ".env")
+        except OSError as exc:
+            return RuntimeResult(3, f"failed to read live environment: {exc}")
+        restore_names = tuple(entry.name for entry in extracted_root.iterdir() if entry.name != "db-data")
+        try:
+            _remove_entries_safely(target, restore_names)
+            _merge_tree_safely(extracted_root, target, excluded_names=("db-data",))
+        except OSError as exc:
+            return RuntimeResult(3, f"failed to replace site files during restore: {exc}")
 
-        _preserve_live_db_credentials(domain, live_env)
-        _harden_restored_permissions(domain)
-        apply_site_ownership(domain)
+        credential_error = _preserve_live_db_credentials(domain, live_env)
+        if credential_error is not None:
+            return credential_error
+        permission_error = _harden_restored_permissions(domain)
+        if permission_error is not None:
+            return permission_error
+        ownership = apply_site_ownership(domain)
+        if ownership.exit_code != 0:
+            return ownership
         sql_files = sorted((target / "backups").glob("*.sql")) if (target / "backups").exists() else []
         if docker_available() and not runtime_skip_requested():
             start_result = start_site_runtime(domain)
@@ -909,7 +1228,7 @@ def restore_site(domain: str, archive_path: str) -> RuntimeResult:
                 return RuntimeResult(start_result.exit_code, f"failed to start runtime after restore: {start_result.message}")
 
         if sql_files and docker_available() and not runtime_skip_requested():
-            db_ready = _wait_for_service(domain, "db")
+            db_ready = wait_for_service(domain, "db")
             if db_ready.exit_code != 0:
                 return db_ready
             latest_sql = sql_files[-1]
@@ -1078,22 +1397,51 @@ def _apply_site_ownership(domain: str, uid: int) -> RuntimeResult:
     ]
     try:
         for path, mode, recursive in targets:
-            if not path.exists():
+            try:
+                metadata = path.lstat()
+            except FileNotFoundError:
                 continue
-            os.chown(path, uid, uid)
-            path.chmod(mode)
-            if recursive:
-                for child in path.rglob("*"):
-                    os.chown(child, uid, uid)
+            if stat.S_ISLNK(metadata.st_mode):
+                return RuntimeResult(3, f"ownership failed: unsafe site ownership symlink: {path.name}")
+            directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+
+            def own_directory(directory_fd: int) -> None:
+                for name in os.listdir(directory_fd):
+                    metadata = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+                    if stat.S_ISLNK(metadata.st_mode):
+                        raise OSError(f"unsafe site ownership symlink: {name}")
+                    if stat.S_ISDIR(metadata.st_mode):
+                        child_fd = os.open(name, directory_flags, dir_fd=directory_fd)
+                        try:
+                            os.fchown(child_fd, uid, uid)
+                            own_directory(child_fd)
+                        finally:
+                            os.close(child_fd)
+                    else:
+                        os.chown(name, uid, uid, dir_fd=directory_fd, follow_symlinks=False)
+
+            path_fd = os.open(path, directory_flags)
+            try:
+                os.fchown(path_fd, uid, uid)
+                os.fchmod(path_fd, mode)
+                if recursive:
+                    own_directory(path_fd)
+            finally:
+                os.close(path_fd)
     except PermissionError as exc:
         return RuntimeResult(0, f"ownership skipped (chown not permitted: {exc})", skipped=True)
+    except OSError as exc:
+        return RuntimeResult(3, f"ownership failed: {exc}")
     return RuntimeResult(0, f"site files owned by uid {uid}", ran=True)
 
 
 def apply_site_ownership(domain: str) -> RuntimeResult:
     """Re-own a site's host files from its persisted SITE_UID. Used after
     bootstrap, which writes WordPress core as the operator before containers run."""
-    value = read_env(env_path(domain)).get("SITE_UID")
+    try:
+        value = read_env(env_path(domain)).get("SITE_UID")
+    except OSError as exc:
+        return RuntimeResult(3, f"ownership failed: unsafe site environment: {exc}")
     if not value or not value.isdigit():
         return RuntimeResult(0, "ownership skipped (no SITE_UID allocated)", skipped=True)
     return _apply_site_ownership(domain, int(value))
@@ -1101,19 +1449,43 @@ def apply_site_ownership(domain: str) -> RuntimeResult:
 
 def ensure_site_scaffold(spec: SiteSpec) -> list[str]:
     validate_domain(spec.domain)
-    conflict = _project_collision(spec.domain)
+    # Allocate (or reuse) this site's unique uid before rendering the templates,
+    # so .env and compose.yaml both carry it.
+    site_root = site_dir(spec.domain)
+    env_file = env_path(spec.domain)
+    managed_paths = (
+        site_root,
+        site_root / "compose.yaml",
+        site_root / ".env",
+        site_root / "nginx",
+        site_root / "nginx" / "default.conf",
+        site_root / "php",
+        site_root / "backups",
+        site_root / "app",
+        site_root / "app" / "healthz.html",
+        site_root / "db-data" if spec.use_mysql else site_root,
+        site_root / "redis-data" if spec.use_redis else site_root,
+    )
+    unsafe = _destination_symlink(site_root, managed_paths)
+    if unsafe is not None:
+        raise ValueError(f"unsafe scaffold destination symlink: {unsafe}")
+    try:
+        conflict = _project_collision(spec.domain)
+        existing_env = read_env(env_file)
+    except OSError as exc:
+        raise ValueError(f"unsafe scaffold destination: {exc}") from exc
     if conflict is not None:
         raise ValueError(
             f"domain {spec.domain} conflicts with existing site {conflict}: "
             f"both map to compose project {domain_to_project(spec.domain)}"
         )
-    # Allocate (or reuse) this site's unique uid before rendering the templates,
-    # so .env and compose.yaml both carry it.
-    env_file = env_path(spec.domain)
-    spec = replace(spec, site_uid=_allocate_site_uid(spec.domain, read_env(env_file)))
+    try:
+        spec = replace(spec, site_uid=_allocate_site_uid(spec.domain, existing_env))
+    except OSError as exc:
+        raise ValueError(f"unsafe scaffold destination: {exc}") from exc
     touched: list[str] = []
     for path in (
-        site_dir(spec.domain),
+        site_root,
         nginx_dir(spec.domain),
         php_dir(spec.domain),
         backups_dir(spec.domain),
@@ -1124,12 +1496,27 @@ def ensure_site_scaffold(spec: SiteSpec) -> list[str]:
             path.mkdir(parents=True, exist_ok=True)
             touched.append(str(path))
 
+    health_file = healthcheck_path(spec.domain)
+    health_content = f"wpfy-ok {spec.domain}\n"
+    try:
+        health_file.parent.mkdir(parents=True, exist_ok=True)
+        health_current = _read_text_safely(health_file.parent, health_file.name)
+    except OSError as exc:
+        raise ValueError(f"unsafe healthcheck destination: {exc}") from exc
+
     compose_file = compose_path(spec.domain)
-    if write_if_changed(compose_file, compose_content(spec)):
-        touched.append(str(compose_file))
-    if write_if_changed(env_file, env_content(spec, read_env(env_file))):
-        touched.append(str(env_file))
-    env_file.chmod(0o600)
+    compose_rendered = compose_content(spec)
+    try:
+        if _read_text_safely(site_root, compose_file.name) != compose_rendered:
+            _write_text_safely(site_root, compose_file.name, compose_rendered)
+            touched.append(str(compose_file))
+        env_rendered = env_content(spec, existing_env)
+        if _read_text_safely(site_root, env_file.name) != env_rendered:
+            _write_text_safely(site_root, env_file.name, env_rendered)
+            touched.append(str(env_file))
+        _chmod_file_safely(site_root, env_file.name, 0o600)
+    except OSError as exc:
+        raise ValueError(f"unsafe scaffold destination: {exc}") from exc
     nginx_file = nginx_conf_path(spec.domain)
     nginx_lines = [
         "server {",
@@ -1180,20 +1567,30 @@ def ensure_site_scaffold(spec: SiteSpec) -> list[str]:
         "",
     ])
     nginx_content = "\n".join(nginx_lines)
-    if write_if_changed(nginx_file, nginx_content):
-        touched.append(str(nginx_file))
-    health_file = healthcheck_path(spec.domain)
-    if write_if_changed(health_file, f"wpfy-ok {spec.domain}\n"):
-        touched.append(str(health_file))
+    try:
+        if _read_text_safely(nginx_file.parent, nginx_file.name) != nginx_content:
+            _write_text_safely(nginx_file.parent, nginx_file.name, nginx_content)
+            touched.append(str(nginx_file))
+    except OSError as exc:
+        raise ValueError(f"unsafe scaffold destination: {exc}") from exc
+    try:
+        if health_current != health_content:
+            _write_text_safely(health_file.parent, health_file.name, health_content)
+            touched.append(str(health_file))
+    except OSError as exc:
+        raise ValueError(f"unsafe healthcheck destination: {exc}") from exc
 
     metadata = spec.registry_metadata()
     existing_metadata = registry.get_site(spec.domain) or {}
     for key in ("created_at", "maintenance"):
         if key in existing_metadata:
             metadata[key] = existing_metadata[key]
-    registry.add_site(spec.domain, metadata)
+    if metadata != existing_metadata:
+        registry.add_site(spec.domain, metadata)
 
     if spec.site_uid is not None:
-        _apply_site_ownership(spec.domain, spec.site_uid)
+        ownership = _apply_site_ownership(spec.domain, spec.site_uid)
+        if ownership.exit_code != 0:
+            raise ValueError(ownership.message)
 
     return touched

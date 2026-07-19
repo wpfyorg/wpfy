@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import Final
 
 from .php_runtime import DEFAULT_PHP_VERSION
+from .site_paths import domain_to_project
 
 
 WORDPRESS_FLAVORS: Final = frozenset({
@@ -56,7 +57,7 @@ class SiteDefinition:
         )
 
     def env_values(self, existing: dict[str, str], generated_secret: Callable[[], str]) -> list[tuple[str, str]]:
-        project = self.domain.replace(".", "-").replace("_", "-").lower()
+        project = domain_to_project(self.domain)
         values = [
             ("DOMAIN", self.domain),
             ("COMPOSE_PROJECT_NAME", project),
@@ -102,7 +103,7 @@ class SiteDefinition:
 
 
 def sftp_service_lines(definition: SiteDefinition) -> list[str]:
-    project = definition.domain.replace(".", "-").replace("_", "-").lower()
+    project = domain_to_project(definition.domain)
     uid = definition.site_uid if definition.site_uid is not None else 1000
     return [
         "  sftp:",

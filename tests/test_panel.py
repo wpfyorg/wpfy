@@ -171,27 +171,59 @@ def test_wp_endpoint_validates_args(panel_server, monkeypatch):
     status, _, _ = _request(base_url, "/api/sites/example.com/wp", method="POST", body={"args": []})
     assert status == 400
 
-    class FakeProc:
-        returncode = 0
-        stdout = "5.9.1\n"
-        stderr = ""
-
     import wpfy.panel
+    from wpfy.site_runtime import ProcessResult
     captured: dict = {}
 
-    def fake_wp(domain, *args):
+    def fake_wp(domain, *args, interactive=False):
         captured["domain"] = domain
         captured["args"] = args
-        return FakeProc()
+        return ProcessResult(0, stdout="5.9.1\n", ran=True)
 
-    monkeypatch.setattr(wpfy.panel, "wp_cli_command", fake_wp)
+    monkeypatch.setattr(wpfy.panel, "run_wp_cli", fake_wp)
     status, body, _ = _request(
         base_url, "/api/sites/example.com/wp", method="POST", body={"args": ["core", "version"]},
     )
     assert status == 200
     assert json.loads(body)["stdout"] == "5.9.1\n"
     assert captured["domain"] == "example.com"
-    assert "--allow-root" in captured["args"]
+    assert captured["args"] == ("core", "version")
+
+
+def test_logs_api_delegates_to_runtime(monkeypatch):
+    import wpfy.panel as panel
+    from wpfy.site_runtime import ProcessResult
+
+    calls = []
+    monkeypatch.setattr(panel, "_known_domain", lambda domain: domain)
+    monkeypatch.setattr(
+        panel,
+        "site_logs",
+        lambda domain, **kwargs: calls.append((domain, kwargs)) or ProcessResult(0, stdout="line\n", ran=True),
+    )
+
+    assert panel.api_site_logs("example.com", "web", 5000) == {"logs": "line\n"}
+    assert calls == [("example.com", {"services": ("web",), "lines": 2000, "no_color": True})]
+
+
+def test_wp_api_rejects_unrun_runtime_result(monkeypatch):
+    import wpfy.panel as panel
+    from wpfy.site_runtime import ProcessResult
+
+    monkeypatch.setattr(panel, "_known_domain", lambda domain: domain)
+    monkeypatch.setattr(
+        panel,
+        "run_wp_cli",
+        lambda *args: ProcessResult(1, stderr="runtime unavailable", skipped=True),
+    )
+
+    try:
+        panel.api_site_wp("example.com", ["core", "version"])
+    except panel.PanelError as exc:
+        assert exc.status == 500
+        assert str(exc) == "runtime unavailable"
+    else:
+        raise AssertionError("unrun WP result returned HTTP success")
 
 
 def test_static_ui_served_without_token(panel_server):

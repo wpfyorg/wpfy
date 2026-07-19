@@ -107,6 +107,7 @@ def detect_public_ips() -> tuple[tuple[str, ...], tuple[str, ...]]:
         parsed = ipaddress.ip_address(value)
         if parsed.version == 4:
             ipv4.add(str(parsed))
+            break
         else:
             ipv6.add(str(parsed))
 

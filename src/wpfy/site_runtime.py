@@ -39,6 +39,29 @@ class HealthResult:
     message: str
 
 
+@dataclass(frozen=True, slots=True)
+class ProcessResult:
+    exit_code: int
+    stdout: str = ""
+    stderr: str = ""
+    ran: bool = False
+    skipped: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class LogResetResult:
+    stop: RuntimeResult
+    restart: RuntimeResult | None = None
+
+    @property
+    def exit_code(self) -> int:
+        if self.stop.exit_code != 0 or self.stop.skipped:
+            return self.stop.exit_code or 1
+        if self.restart is None:
+            return 1
+        return self.restart.exit_code or (1 if self.restart.skipped else 0)
+
+
 def runtime_skip_requested() -> bool:
     return os.environ.get("WPFY_SKIP_RUNTIME", "0") == "1"
 
@@ -120,29 +143,35 @@ def _compose_service_ids(domain: str, service: str) -> list[str]:
     return [line.strip() for line in proc.stdout.splitlines() if line.strip()]
 
 
-def _container_health(container_id: str) -> str:
+def _container_healths(container_ids: list[str]) -> list[str]:
+    if not container_ids:
+        return []
     docker = shutil.which("docker")
     if not docker:
-        return "unknown"
-    proc = subprocess.run(
-        [
-            docker,
-            "inspect",
-            "--format",
-            "{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}",
-            container_id,
-        ],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
+        return ["unknown"] * len(container_ids)
+    try:
+        proc = subprocess.run(
+            [
+                docker,
+                "inspect",
+                "--format",
+                "{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}",
+                *container_ids,
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ["unknown"] * len(container_ids)
     if proc.returncode != 0:
-        return "unknown"
-    return proc.stdout.strip().lower() or "unknown"
+        return ["unknown"] * len(container_ids)
+    statuses = [line.strip().lower() or "unknown" for line in proc.stdout.splitlines()]
+    return statuses if len(statuses) == len(container_ids) else ["unknown"] * len(container_ids)
 
 
 def _compose_service_health(domain: str, service: str) -> list[str]:
-    return [_container_health(container_id) for container_id in _compose_service_ids(domain, service)]
+    return _container_healths(_compose_service_ids(domain, service))
 
 
 def _compose_exec(domain: str, *args: str) -> subprocess.CompletedProcess[str]:
@@ -155,7 +184,7 @@ def _compose_exec(domain: str, *args: str) -> subprocess.CompletedProcess[str]:
     )
 
 
-def _http_probe_site(domain: str) -> RuntimeResult:
+def http_probe_site(domain: str) -> RuntimeResult:
     if runtime_skip_requested() or not docker_available():
         return RuntimeResult(0, "http probe skipped", skipped=True)
     proc = _compose_exec(domain, "web", "sh", "-lc", "wget -qO- http://127.0.0.1:8080/healthz.html")
@@ -198,15 +227,19 @@ def site_health(domain: str) -> HealthResult:
     needs_redis = flavor == "wpredis"
     db_ids = _compose_service_ids(domain, "db") if needs_mysql else []
     redis_ids = _compose_service_ids(domain, "redis") if needs_redis else []
-    web_health = [_container_health(container_id) for container_id in web_ids]
-    app_health = [_container_health(container_id) for container_id in app_ids]
-    db_health = [_container_health(container_id) for container_id in db_ids]
-    redis_health = [_container_health(container_id) for container_id in redis_ids]
+    health = _container_healths(web_ids + app_ids + db_ids + redis_ids)
+    web_end = len(web_ids)
+    app_end = web_end + len(app_ids)
+    db_end = app_end + len(db_ids)
+    web_health = health[:web_end]
+    app_health = health[web_end:app_end]
+    db_health = health[app_end:db_end]
+    redis_health = health[db_end:]
     web_ok = bool(web_ids) and all(status == "healthy" for status in web_health)
     app_ok = bool(app_ids) and all(status == "healthy" for status in app_health)
     db_ok = (not needs_mysql) or (bool(db_ids) and all(status == "healthy" for status in db_health))
     redis_ok = (not needs_redis) or (bool(redis_ids) and all(status == "healthy" for status in redis_health))
-    http_probe = _http_probe_site(domain)
+    http_probe = http_probe_site(domain)
     http_ready = http_probe.ran and http_probe.exit_code == 0
     runtime_ready = web_ok and app_ok and db_ok and redis_ok and http_ready
 
@@ -237,7 +270,9 @@ def site_health(domain: str) -> HealthResult:
     return HealthResult(domain, scaffold_ready, bootstrap_ready, runtime_ready, http_ready, status, message)
 
 
-def _wait_for_service(domain: str, service: str, timeout_seconds: int = 60) -> RuntimeResult:
+def wait_for_service(domain: str, service: str, timeout_seconds: int = 60) -> RuntimeResult:
+    if runtime_skip_requested() or not docker_available():
+        return RuntimeResult(0, f"{service} wait skipped (Docker/Compose not available)", skipped=True)
     deadline = time.monotonic() + timeout_seconds
     last_status = "unknown"
     while time.monotonic() < deadline:
@@ -248,3 +283,80 @@ def _wait_for_service(domain: str, service: str, timeout_seconds: int = 60) -> R
             last_status = ",".join(statuses)
         time.sleep(2)
     return RuntimeResult(1, f"{service} not ready after {timeout_seconds}s (last status: {last_status})")
+
+
+LOG_SERVICES = frozenset({"web", "app", "db", "redis", "sftp"})
+
+
+def site_logs(
+    domain: str,
+    *,
+    services: tuple[str, ...] = (),
+    lines: int = 100,
+    follow: bool = False,
+    no_color: bool = False,
+) -> ProcessResult:
+    unknown = set(services) - LOG_SERVICES
+    if unknown:
+        raise ValueError(f"unknown log service: {sorted(unknown)[0]}")
+    if runtime_skip_requested() or not docker_available():
+        return ProcessResult(1, stderr="runtime unavailable (Docker/Compose not available)", skipped=True)
+    command = ["docker", "compose", "logs", "--tail", str(lines)]
+    if no_color:
+        command.append("--no-color")
+    if follow:
+        command.append("--follow")
+    command.extend(services)
+    try:
+        proc = subprocess.run(
+            command,
+            cwd=site_dir(domain),
+            check=False,
+            capture_output=not follow,
+            text=not follow,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return ProcessResult(1, stderr=str(exc))
+    return ProcessResult(
+        proc.returncode,
+        proc.stdout or "" if not follow else "",
+        proc.stderr or "" if not follow else "",
+        ran=True,
+    )
+
+
+def reset_site_logs(domain: str) -> LogResetResult:
+    stop = stop_site_runtime(domain)
+    if stop.exit_code != 0 or stop.skipped:
+        return LogResetResult(stop)
+    return LogResetResult(stop, start_site_runtime(domain))
+
+
+def _wp_cli_args(args: tuple[str, ...], *, interactive: bool) -> list[str]:
+    wp_args = [arg for arg in args if arg != "--allow-root"]
+    wp_args.append("--allow-root")
+    command = ["docker", "compose", "--profile", "cli", "run", "--rm"]
+    if not interactive:
+        command.append("-T")
+    return [*command, "wpcli", *wp_args]
+
+
+def run_wp_cli(domain: str, *args: str, interactive: bool = False) -> ProcessResult:
+    if runtime_skip_requested() or not docker_available():
+        return ProcessResult(1, stderr="runtime unavailable (Docker/Compose not available)", skipped=True)
+    try:
+        proc = subprocess.run(
+            _wp_cli_args(args, interactive=interactive),
+            cwd=site_dir(domain),
+            check=False,
+            capture_output=not interactive,
+            text=not interactive,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return ProcessResult(1, stderr=str(exc))
+    return ProcessResult(
+        proc.returncode,
+        proc.stdout or "" if not interactive else "",
+        proc.stderr or "" if not interactive else "",
+        ran=True,
+    )

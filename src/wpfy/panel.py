@@ -25,11 +25,11 @@ from .site_layout import (
 from .site_paths import site_exists, validate_domain
 from .site_runtime import (
     RuntimeResult,
-    compose_command,
+    run_wp_cli,
+    site_logs,
     site_health,
     start_site_runtime,
     stop_site_runtime,
-    wp_cli_command,
 )
 
 DEFAULT_PANEL_PORT = 8642
@@ -154,15 +154,9 @@ def api_site_logs(domain: str, service: str, lines: int) -> dict:
     if service and service not in _LOG_SERVICES:
         raise PanelError(400, f"unknown log service: {service}")
     lines = max(1, min(lines, _MAX_LOG_LINES))
-    args = ["logs", "--no-color", "--tail", str(lines)]
-    if service:
-        args.append(service)
-    try:
-        proc = compose_command(domain, *args)
-    except (OSError, subprocess.SubprocessError) as exc:
-        raise PanelError(500, f"log collection failed: {exc}")
-    output = proc.stdout or proc.stderr
-    if proc.returncode != 0:
+    result = site_logs(domain, services=(service,) if service else (), lines=lines, no_color=True)
+    output = result.stdout or result.stderr
+    if result.exit_code != 0:
         raise PanelError(500, output.strip() or "docker compose logs failed")
     return {"logs": output}
 
@@ -231,15 +225,12 @@ def api_site_wp(domain: str, wp_args: list) -> tuple[int, dict]:
     _known_domain(domain)
     if not wp_args or not all(isinstance(arg, str) and "\x00" not in arg for arg in wp_args):
         raise PanelError(400, "wp requires a non-empty list of string arguments")
-    if "--allow-root" not in wp_args:
-        wp_args = [*wp_args, "--allow-root"]
-    try:
-        proc = wp_cli_command(domain, *wp_args)
-    except (OSError, subprocess.SubprocessError) as exc:
-        raise PanelError(500, f"wp-cli failed: {exc}")
+    proc = run_wp_cli(domain, *wp_args)
+    if not proc.ran:
+        raise PanelError(500, proc.stderr.strip() or "wp-cli failed to run")
     return 200, {
-        "ok": proc.returncode == 0,
-        "exit_code": proc.returncode,
+        "ok": proc.exit_code == 0,
+        "exit_code": proc.exit_code,
         "stdout": proc.stdout,
         "stderr": proc.stderr,
     }

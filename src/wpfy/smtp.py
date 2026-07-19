@@ -7,7 +7,9 @@ import smtplib
 import ssl
 from typing import Final, Literal
 
+from .redaction import redact_values
 from .settings import PATHS
+from .site_paths import read_env
 
 
 TLSMode = Literal["starttls", "ssl", "none"]
@@ -54,14 +56,12 @@ def write_smtp_config(config: SMTPConfig) -> Path:
 
 def load_smtp_config() -> SMTPConfig:
     path = smtp_config_path()
-    if not path.exists():
+    try:
+        values = {key: value.strip() for key, value in read_env(path).items()}
+    except OSError as exc:
+        raise SMTPConfigError(f"cannot read SMTP config: {exc}") from exc
+    if not values and not path.exists():
         raise SMTPConfigError("smtp is not configured; run `wpfy smtp set`")
-    values: dict[str, str] = {}
-    for line in path.read_text(encoding="utf-8").splitlines():
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, value = line.split("=", 1)
-        values[key] = value.strip()
     missing = [key for key in _required_keys() if not values.get(key)]
     if missing:
         raise SMTPConfigError(f"missing {', '.join(missing)}")
@@ -120,11 +120,7 @@ def send_test_message(config: SMTPConfig, recipient: str, *, dry_run: bool = Fal
 
 
 def redact_smtp_secret(message: str, config: SMTPConfig) -> str:
-    redacted = message
-    for secret in (config.username, config.password):
-        if secret:
-            redacted = redacted.replace(secret, "***REDACTED***")
-    return redacted
+    return redact_values(message, (config.username, config.password))
 
 
 def _login(client: smtplib.SMTP, config: SMTPConfig) -> None:
