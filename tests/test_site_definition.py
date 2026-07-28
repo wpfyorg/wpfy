@@ -46,8 +46,44 @@ def test_site_definition_loads_current_state_from_env():
         },
     )
 
+    assert definition.flavor == "wp"
+    assert definition.page_cache == "none"
+    assert definition.object_cache == "redis"
     assert definition.use_mysql is True
     assert definition.use_redis is True
     assert definition.ssl_enabled is True
     assert definition.proxied is True
     assert definition.sftp_port == "2225"
+
+
+def test_site_definition_migrates_legacy_page_cache_flavor_on_load():
+    definition = SiteDefinition.from_env(
+        "legacy.example.com",
+        {"SITE_FLAVOR": "wpfc", "PHP_VERSION": "8.4"},
+    )
+
+    assert definition.flavor == "wp"
+    assert definition.page_cache == "wpfc"
+    assert definition.object_cache == "none"
+    rendered = env_content(definition)
+    assert "SITE_FLAVOR=wp\n" in rendered
+    assert "PAGE_CACHE=wpfc\n" in rendered
+
+
+def test_site_definition_persists_orthogonal_page_and_object_cache():
+    definition = SiteDefinition(
+        domain="cache.example.com",
+        flavor="wp",
+        use_mysql=True,
+        use_redis=True,
+        page_cache="w3-total-cache",
+        object_cache="redis",
+    )
+
+    rendered = env_content(definition)
+    metadata = definition.registry_metadata()
+
+    assert "PAGE_CACHE=w3-total-cache\n" in rendered
+    assert "REDIS_ENABLED=1\n" in rendered
+    assert metadata["page_cache"] == "w3-total-cache"
+    assert metadata["object_cache"] == "redis"

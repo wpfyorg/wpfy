@@ -16,8 +16,13 @@ from urllib.parse import quote, urlparse, urlunparse
 from urllib.request import Request, urlopen
 
 from .redaction import redact_values
-from .settings import PATHS
 from .site_paths import read_env
+
+
+def _current_paths():
+    from .settings import PATHS as current_paths
+
+    return current_paths
 
 
 SERVICE: Final = "s3"
@@ -171,8 +176,8 @@ def _profile_name(profile: str | None) -> str | None:
 def s3_config_path(profile: str | None = None) -> Path:
     name = _profile_name(profile)
     if name is None:
-        return Path(PATHS.config_dir) / CONFIG_FILENAME
-    return Path(PATHS.config_dir) / PROFILE_DIRNAME / f"{name}.env"
+        return Path(_current_paths().config_dir) / CONFIG_FILENAME
+    return Path(_current_paths().config_dir) / PROFILE_DIRNAME / f"{name}.env"
 
 
 def write_s3_config(config: S3Config, profile: str | None = None) -> Path:

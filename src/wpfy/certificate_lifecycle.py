@@ -12,9 +12,14 @@ import tempfile
 from urllib.request import urlopen
 
 from .cloudflare_ranges import ips_are_cloudflare
-from .settings import PATHS
 from .site_runtime import RuntimeResult, docker_available, runtime_skip_requested
 from .traefik import TRAEFIK_CONTAINER
+
+
+def _current_paths():
+    from .settings import PATHS as current_paths
+
+    return current_paths
 
 
 @dataclass(frozen=True)
@@ -157,7 +162,7 @@ def preflight_ssl(domain: str) -> SSLPreflightResult:
 
 
 def _acme_json_path() -> str:
-    return os.path.join(PATHS.traefik_dir, "letsencrypt", "acme.json")
+    return os.path.join(_current_paths().traefik_dir, "letsencrypt", "acme.json")
 
 
 def _read_acme_file() -> list[dict] | None:
@@ -216,36 +221,7 @@ def _parse_cert_data(cert_entry: dict) -> dict | None:
         return None
     # Traefik stores certs as base64-encoded PEM (not DER); detect by header.
     is_pem = cert_bytes.lstrip().startswith(b"-----BEGIN")
-    try:
-        from cryptography import x509
-    except ImportError:
-        return _parse_cert_data_with_openssl(cert_bytes, is_pem=is_pem)
-    try:
-        if is_pem:
-            cert = x509.load_pem_x509_certificate(cert_bytes)
-        else:
-            cert = x509.load_der_x509_certificate(cert_bytes)
-    except Exception:
-        return _parse_cert_data_with_openssl(cert_bytes, is_pem=is_pem)
-    issuer_parts = []
-    for attr in cert.issuer:
-        issuer_parts.append(attr.value)
-    issuer = ", ".join(issuer_parts) if issuer_parts else "unknown"
-    not_before = cert.not_valid_before_utc.isoformat() if hasattr(cert, "not_valid_before_utc") else ""
-    not_after = cert.not_valid_after_utc.isoformat() if hasattr(cert, "not_valid_after_utc") else ""
-    sans: list[str] = []
-    try:
-        for ext in cert.extensions:
-            if ext.oid == x509.oid.ExtensionOID.SUBJECT_ALTERNATIVE_NAME:
-                sans = [san.encode("utf-8").decode("utf-8") for san in ext.value]
-    except Exception:
-        pass
-    return {
-        "issuer": issuer,
-        "not_before": not_before,
-        "not_after": not_after,
-        "sans": sans,
-    }
+    return _parse_cert_data_with_openssl(cert_bytes, is_pem=is_pem)
 
 
 def _parse_cert_data_with_openssl(cert_bytes: bytes, *, is_pem: bool = False) -> dict | None:

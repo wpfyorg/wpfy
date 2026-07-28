@@ -6,13 +6,67 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### First-run panel setup and telemetry (2026-07-28)
+- Added a run-token-authorized two-step browser setup wizard that creates the first administrator, records separate licence and telemetry choices, retires both setup routes with HTTP 410 after first use, refuses edge-bound account creation, and applies the existing client throttle plus a 12-character password minimum.
+- Extended panel users with forward-compatible first-name, last-name, and email fields; added mode-0600 install-scoped state with a stable UUID; and added verified-before-persisted TOTP enrollment or an explicit consequence-confirmed skip.
+- Vendored pinned MIT QRCode.js with source revision, licence, URL, and SHA-256 while preserving the existing CSP.
+- Added opt-out anonymous telemetry with an exhaustive seven-field payload, at-most-daily background stdlib delivery, inert unset endpoint, `WPFY_TELEMETRY=0`, and `wpfy telemetry status|enable|disable`.
+
+### Security hardening corrections (2026-07-28)
+- Remove the tracked internal backup artifact and exclude evidence, agent, graph, audit, log, test, and editor-tool trees from the staged production application payload.
+- Separate requested SSL routing from observed certificate issuance in site list/info/status, reserving `ssl=enabled` for a matching certificate in Traefik's local ACME state and reporting unissued intent as `ssl=requested`.
+- Recreate a running Traefik container only when its static configuration changes, so updated ACME contact settings take effect without restarting the edge on unchanged installs.
+- Derive PHP's HTTPS state from `X-Forwarded-Proto` only when the original connection belongs to the discovered Traefik edge CIDR, fixing WordPress admin redirect loops without trusting client-spoofed headers or forcing plain-HTTP sites secure.
+- Preserve nginx's embedded access-log timestamp during fail2ban matching, so the existing failed-login status rule reaches live combined-format lines instead of being applied after fail2ban strips the middle of the regex target.
+- Make `panel expose` report router configuration rather than public readiness until the required service is installed, and add `panel expose --status` for router/domain/service inspection.
+- Normalize run-token authentication to the same principal mapping shape used by named sessions, so identity and TOTP routes return defined responses instead of indexing a string.
+- Return a generic JSON 500 for unexpected panel route exceptions while logging the traceback server-side and preserving unread-body connection closure.
+- Close panel connections before responding when a declared request body remains unread, preventing keep-alive request desynchronization behind pooled Traefik connections.
+- Late-bind settings paths in modules that previously captured `PATHS` during import, so redirected test roots consistently apply across the package.
+
+### Phase 7e fail2ban and WordPress hardening (2026-07-28)
+- Added opt-in per-site `wpfy site security <domain> fail2ban on|off` jails with a compiled-testable WordPress filter, per-site host-visible combined access logs, logrotate retention, and `DOCKER-USER` Docker ban actions.
+- Made Nginx resolve every access-log client through the discovered Traefik edge CIDRs before logging, so a fail2ban jail never bans the shared proxy address.
+- Blocked WordPress installer and upgrader endpoints plus narrow UpdraftPlus and Sucuri archive locations, and explicitly disabled the legacy `X-XSS-Protection` browser filter without blocking ordinary WordPress paths.
+
+### Phase 7b Optional Traefik Panel Exposure (2026-07-28)
+- Added opt-in `wpfy panel expose` routing through Traefik with mandatory named-user authentication, at least one enrolled TOTP factor, DNS/IP preflight, and exact-domain typed confirmation.
+- Added a dedicated `wpfy-panel-edge` bridge and edge-gateway-only panel service bind; wildcard, public, hostname, and off-network binds remain refused while ad-hoc `wpfy panel` stays loopback-only.
+- Added a read-only Traefik file-provider mount, TLS-only `websecure` router with ACME and edge rate limiting, truthful filesystem-derived exposure status, and idempotent disable/reversal even without bookkeeping state.
+- Added token-free systemd service installation/removal plus hostile-domain, secret-leakage, privilege, mount, idempotency, and reversal coverage.
+
+### Phase 7a Panel Authentication, Roles, and 2FA (2026-07-27)
+- Added a mode-0600 disk-backed panel user store with per-user scrypt salts, password verification that masks unknown users, administrator and site-manager roles, and CLI user/site-assignment management without argv secrets.
+- Added in-memory bearer sessions with idle and absolute expiry, logout invalidation, per-user login lockouts with event records, RFC 6238 TOTP enrollment and replay prevention, and immediate run-token retirement once any user exists.
+- Added login, identity, TOTP, and administrator user APIs; centralized default-deny authorization now covers every panel route, while site, job, and event responses are filtered to a site-manager's assigned domains.
+- Hardened login and account lifecycle edges: TOTP accepts ASCII digits only, locked and unknown refusals perform equal dummy-scrypt work, and every non-empty user store retains an administrator while final-user removal restores run-token bootstrap.
+
+### Phase 5a Metrics sampler (2026-07-27)
+- Added a stdlib SQLite time-series store in the state directory with WAL-mode concurrent appends, indexed scope/range reads, and 14-day retention.
+- Added host CPU, memory, disk, and load sampling plus one-shot whole-machine Docker stats attribution to exact managed domain scopes.
+- Added `wpfy metrics sample|show|prune`, minute-tick sampling, daily pruning, and explicit cron-log failures without interrupting the other minute tenants.
+- Fixed the daily all-site health summary to use `HealthResult` readiness semantics instead of the nonexistent `exit_code` field.
+
+### Phase 4a.2 Per-site security lockout controls (2026-07-27)
+- Added per-site basic auth with one-time generated passwords, redacted events, an out-of-document-root `nginx/htpasswd` hash, and in-place rotation for the individually mounted credential file.
+- Added Traefik edge Cloudflare-only allow lists sourced from effective Cloudflare ranges, plus DNS lockout preflight warnings and CLI `--force` handling.
+- Replaced hostname real-IP trust with the discovered wpfy edge CIDR and added Cloudflare hop trust for proxied sites; discovery failures return non-zero after installing fail-closed rules.
+- Exempted the managed health endpoint from server-level basic auth so Docker healthchecks remain healthy.
+- Verified 33 Phase 4 security gates, real-image `nginx -t`, Compose config validation, and live old-password rejection/new-password acceptance after rotation. Cron gates remain on their separate branch.
+
 ### Release
 - Prepared `1.0.0rc2`: package and CLI version identity now matches planned
   `v1.0.0-rc2` tag. Public source retains Python tests and public CI; package
   artifacts and installed production source exclude tests.
 
 ### Added
-- Local browser control panel: `wpfy panel` serves a loopback-only, token-protected dashboard (stdlib HTTP server + static UI, no new dependencies). It reuses the same Python operation layer as the CLI for overview, site list/detail, health, diagnostics, logs, backups/restore, runtime start/stop/restart, SFTP enable/disable/status, a WP-CLI runner, and PHP version changes. Remote access is documented via SSH tunnel only; secrets are never returned by the API.
+- Phase 4a.3 per-site cron foundations: atomic `<site>/cron.json` job storage, write-time schedule and service validation, a pure five-field matcher with traditional day-of-month/day-of-week OR semantics, and backup/regeneration coverage. Job execution, locking, the minute tick, and CLI remain Phase 4a.4.
+- Phase 3a native cache integration: orthogonal page/object cache state with legacy migration, free-plugin installation, paid/BYO staging, wpfy's FastCGI cache rules, Redis Object Cache wiring, layered purge, and `wpfy cache show|set|object|purge` CLI operations. Panel adoption remains Phase 3b.
+- Per-site `cache-data/` bind mounts for `wpfc` FastCGI cache files, owned by each site's uid and kept outside the backup archive so unprivileged Nginx can start without the image's default cache directory.
+- Phase 2b panel UI: per-site Databases, PHP Settings, and Vhost tabs with typed destructive confirmations, one-time database credentials, Adminer loopback guidance, PHP dry-run previews, and verbatim Nginx validation output.
+- Phase 2a operation and control surfaces: isolated per-site databases and scoped users, loopback-only Adminer, validated per-site PHP overrides with operator-owned custom ini files, and fail-closed validated Nginx custom includes exposed through CLI and panel APIs.
+- Panel Phase 1a backend and UI: declarative permission-aware API routes, asynchronous site lifecycle jobs with live progress and one-time credential delivery, append-only redacted operation events, panel site create/delete/config/SFTP rotation endpoints, dry-run change previews, events and per-site activity views, client-side site search, and `wpfy log events`.
+- Local browser control panel: `wpfy panel` serves a loopback-only, token-protected dashboard (stdlib HTTP server + static UI, no new dependencies). It reuses the same Python operation layer as the CLI for overview, site list/detail, health, diagnostics, logs, backups/restore, runtime start/stop/restart, SFTP enable/disable/status, a WP-CLI runner, and PHP version changes. Remote access is documented via SSH tunnel only; generated credentials are delivered only through one-time payloads and are not returned again after consumption.
 - Feature parity build: backup retention/prune, explicit `restore --latest`, named S3-compatible storage profiles, remote backup list/restore/delete/prune, Traefik/ACME edge backup/restore, Cloudflare-only wildcard SSL, `wpfy dns cloudflare`, and pull-only phpMyAdmin/Adminer/Composer helper images.
 - Page 8 release validation coverage: documentation sync for the completed flat CLI surface and disposable-VPS runner probes for flat site creation, runtime commands, config/refresh, backup/restore, cron, SMTP dry-run/status, operator utilities, log cron, and flat deletion.
 - Cron and SMTP operator surface: `wpfy cron minute|five-minute|hourly|six-hour|daily|weekly`, systemd-backed `wpfy cron install|status|disable`, `wpfy log cron`, safe custom cron hooks, and `wpfy smtp set|status|test|clear`.
@@ -26,6 +80,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - CI workflow running the pytest suite on pushes and pull requests.
 
 ### Changed
+- Phase 4a.5 cron correction enforces job timeouts inside the selected site container with a process-group supervisor and longer host-side backstop, probes Compose runtime state instead of classifying job output text, and removes the profile-only `wpcli` service from new cron targets while migrating prior entries to the running `app` service.
+- Phase 3a correction updates individually bind-mounted generated files in place so running containers keep the same inode, and site health/diagnostics now run `nginx -t` to expose rejected generated configuration. Cache reload failures retry briefly for delayed shared-folder propagation, then return non-zero with a `wpfy debug` next step.
+- Phase 3a correction writes trusted deterministic cache snippets without scaffold-time container validation, avoiding read-only include mount failures and the unavailable `app` upstream while retaining fail-closed validation for operator-owned `custom.conf`.
+- Phase 2a correction hardens database grants against system schemas, redacts database-user passwords from SQL failures, creates bind-mount source files before publishing `compose.yaml`, clarifies stopped-runtime Nginx validation failures, and covers multi-database dump/restore shape.
 - Phase F bounds four runtime hot paths without changing CLI behavior: Cloudflare CIDRs parse once per effective range set, public-IP fallback stops after the first IPv4, container health uses one batched `docker inspect`, and unchanged scaffolds leave registry bytes and timestamps untouched.
 - Phase E consolidates SMTP, Cloudflare DNS, and stored S3 config reads through the no-follow env reader; exact-value error redaction now handles empty, duplicate, and overlapping secrets; cron and backup schedules share tested systemd mechanics; matching CLI secret input and health/project defaults have one source. Symlink-backed secret configs now fail with controlled domain errors.
 - Phase D moved shared-stack operations into `stack.py`, cache selection/execution into `cache_operations.py`, and log/reset/WP execution behind public `site_runtime.py` APIs used by both CLI and panel. `stack purge` now requires `--force` and propagates stop/teardown failures; requested cache-operation failures now return non-zero.

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import re
+
 from wpfy import cache_operations as cache
 
 
@@ -21,8 +23,18 @@ def test_default_clear_targets_nginx_only(monkeypatch):
 
     result = cache.clear(cache.CacheRequest(domain="example.com"))
 
+    from wpfy import site_cache
+
+    match = re.search(r"fastcgi_cache_path (\S+)", site_cache._cache_path_snippet("wpfc"))
+    assert match is not None
+    purge_commands = [args[-1] for _, args in calls]
+
     assert result.exit_code == 0
-    assert len(calls) == 3
+    assert purge_commands == [
+        f"rm -rf {match.group(1)}/* 2>/dev/null || true",
+        "rm -rf /var/cache/nginx/proxy/* 2>/dev/null || true",
+        "rm -rf /var/cache/nginx/uwsgi/* 2>/dev/null || true",
+    ]
     assert result.outcomes == (cache.CacheOutcome("example.com", "nginx", "ok", "cache cleared"),)
 
 

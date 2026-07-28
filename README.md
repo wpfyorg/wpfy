@@ -100,7 +100,7 @@ The panel listens only on loopback and requires a fresh token. On the VPS, run `
 ssh -L 8642:127.0.0.1:8642 user@your-server
 ```
 
-The screenshot above is the real current panel against a sanitized local demo state. It shows an overview; the panel also exposes site details, health, diagnostics, logs, backups/restores, runtime actions, SFTP, WP-CLI, and PHP changes.
+The screenshot above is the real current panel against a sanitized local demo state. It shows an overview; the panel also exposes site details, health, diagnostics, logs, backups/restores, runtime actions, SFTP, WP-CLI, and PHP changes. Phase 1 adds site creation and deletion from the panel, with background jobs and live step progress. Newly created or rotated credentials are displayed in a one-time panel; deletion requires typing the exact domain and is refused if the pre-delete backup fails. The Config tab can show a dry-run change preview before applying a mutation, and the Events view plus each site’s Activity tab expose recorded operations. Recent events are also available from the CLI with `wpfy log events` (optionally filtered by `--domain` and limited with `--limit`). The panel remains loopback-only and bearer-token protected for one operator; it has no user accounts or roles yet, so remote access should still use an SSH tunnel.
 
 ### Develop from source
 

@@ -70,6 +70,34 @@ def test_site_health_queries_each_required_service_once(tmp_wpfy_home, monkeypat
     assert inspect_calls == [["web-id", "app-id", "db-id", "redis-id"]]
 
 
+def test_site_health_reports_rejected_running_nginx_config(tmp_wpfy_home, monkeypatch):
+    import wpfy.site_layout as layout
+    import wpfy.site_runtime as runtime
+
+    importlib.reload(layout)
+    importlib.reload(runtime)
+    domain = "bad-nginx.example.com"
+    _ready_site(layout, domain, "wp", mysql=True, redis=False)
+
+    monkeypatch.setattr(runtime, "docker_available", lambda: True)
+    monkeypatch.setattr(runtime, "_compose_service_ids", lambda domain_arg, service: [f"{service}-id"])
+    monkeypatch.setattr(runtime, "_container_healths", lambda container_ids: ["healthy"] * len(container_ids))
+
+    def compose_exec(domain_arg, *args):
+        if args == ("web", "nginx", "-t"):
+            return Proc(1, stderr='nginx: [emerg] "fastcgi_cache" zone "WPFY" is unknown')
+        return Proc(stdout=f"wpfy-ok {domain}")
+
+    monkeypatch.setattr(runtime, "_compose_exec", compose_exec)
+
+    result = runtime.site_health(domain)
+
+    assert result.status == "partial"
+    assert result.runtime_ready is False
+    assert 'nginx_config=nginx: [emerg] "fastcgi_cache" zone "WPFY" is unknown' in result.message
+    assert "http=ok" in result.message
+
+
 def test_site_health_skips_services_not_used_by_flavor(tmp_wpfy_home, monkeypatch):
     import wpfy.site_layout as layout
     import wpfy.site_runtime as runtime
@@ -207,6 +235,52 @@ def test_restore_streams_database_file_to_stdin(tmp_wpfy_home, tmp_path, monkeyp
     result = layout.restore_site(domain, str(archive_path))
 
     assert result.exit_code == 0
+
+
+def test_multi_database_dump_round_trips_through_restore_stdin(tmp_wpfy_home, monkeypatch):
+    import wpfy.site_layout as layout
+
+    importlib.reload(layout)
+    domain = "multi-db-round-trip.example.com"
+    _ready_site(layout, domain, "wp", mysql=True, redis=False)
+    dump = (
+        "CREATE DATABASE IF NOT EXISTS `wp_main`;\n"
+        "USE `wp_main`;\n"
+        "CREATE TABLE main_table (id INT);\n"
+        "CREATE DATABASE IF NOT EXISTS `wp_extra`;\n"
+        "USE `wp_extra`;\n"
+        "CREATE TABLE extra_table (id INT);\n"
+    )
+    dump_commands = []
+    restored_sql = []
+
+    def fake_run(args, **kwargs):
+        if "mariadb-dump" in args[-1]:
+            dump_commands.append(args[-1])
+            kwargs["stdout"].write(dump)
+            return Proc()
+        restored_sql.append(kwargs["stdin"].read())
+        return Proc()
+
+    monkeypatch.setattr(layout, "docker_available", lambda: True)
+    monkeypatch.setattr(layout, "runtime_skip_requested", lambda: False)
+    monkeypatch.setattr(layout, "compose_command", lambda *args: Proc())
+    monkeypatch.setattr(layout, "start_site_runtime", lambda domain_arg: layout.RuntimeResult(0, "started", ran=True))
+    monkeypatch.setattr(layout, "wait_for_service", lambda *args: layout.RuntimeResult(0, "ready", ran=True))
+    monkeypatch.setattr(layout.subprocess, "run", fake_run)
+
+    backup = layout.backup_site(domain)
+    assert backup.exit_code == 0
+    archive_path = backup.message.removeprefix("backup created: ").split(";", 1)[0]
+
+    restored = layout.restore_site(domain, archive_path)
+
+    assert restored.exit_code == 0
+    assert len(dump_commands) == 1
+    assert "--databases $databases" in dump_commands[0]
+    assert restored_sql == [dump]
+    assert "USE `wp_main`;" in restored_sql[0]
+    assert "USE `wp_extra`;" in restored_sql[0]
 
 
 def test_wordpress_download_copies_bounded_chunks(tmp_wpfy_home, monkeypatch):

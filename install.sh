@@ -51,114 +51,6 @@ log() {
     printf '%s\n' "$*"
 }
 
-host_value() {
-    local override_name="$1"
-    shift
-    local override_value="${!override_name:-}"
-    if [[ -n "$override_value" ]]; then
-        printf '%s\n' "$override_value"
-        return 0
-    fi
-    "$@"
-}
-
-host_os() {
-    if [[ -r /etc/os-release ]]; then
-        (
-            . /etc/os-release
-            printf '%s\n' "${PRETTY_NAME:-${NAME:-Linux}}"
-        )
-    else
-        uname -srm
-    fi
-}
-
-host_hostname() {
-    local value
-    value="$(hostname -f 2>/dev/null || hostname 2>/dev/null || true)"
-    printf '%s\n' "${value:-unknown}"
-}
-
-host_virtualization() {
-    local value="unknown"
-    if command -v systemd-detect-virt >/dev/null 2>&1; then
-        value="$(systemd-detect-virt 2>/dev/null || true)"
-        [[ "$value" == "none" ]] && value="physical"
-    fi
-    printf '%s\n' "$value"
-}
-
-host_disk() {
-    local value
-    value="$(df -hP / 2>/dev/null | awk 'NR == 2 { printf "%s free of %s total (%s used)", $4, $2, $5 }' || true)"
-    printf '%s\n' "${value:-unknown}"
-}
-
-host_memory_value() {
-    local row="$1"
-    if command -v free >/dev/null 2>&1; then
-        free -h | awk -v row="$row" '$1 == row":" { print $2 }'
-    else
-        printf 'unknown\n'
-    fi
-}
-
-host_cpu_count() {
-    if command -v nproc >/dev/null 2>&1; then
-        nproc
-    else
-        getconf _NPROCESSORS_ONLN 2>/dev/null || printf 'unknown\n'
-    fi
-}
-
-host_ip() {
-    local family="$1"
-    local destination="$2"
-    local address=""
-    if command -v ip >/dev/null 2>&1; then
-        address="$(ip "-$family" route get "$destination" 2>/dev/null | awk '{ for (i=1; i<=NF; i++) if ($i == "src") { print $(i+1); exit } }' || true)"
-    fi
-    printf '%s\n' "${address:-N/A}"
-}
-
-banner_row() {
-    printf '# %-20s %-55.55s #\n' "$1:" "$2"
-}
-
-show_welcome() {
-    local build os hostname virtualization disk ram swap cpu ipv4 ipv6
-    build="${WPFY_BUILD:-$(date -u +%b%Y | tr '[:lower:]' '[:upper:]')}"
-    os="$(host_value WPFY_TEST_HOST_OS host_os)"
-    hostname="$(host_value WPFY_TEST_HOSTNAME host_hostname)"
-    virtualization="$(host_value WPFY_TEST_VIRTUALIZATION host_virtualization)"
-    disk="$(host_value WPFY_TEST_DISK host_disk)"
-    ram="$(host_value WPFY_TEST_RAM host_memory_value Mem)"
-    swap="$(host_value WPFY_TEST_SWAP host_memory_value Swap)"
-    cpu="$(host_value WPFY_TEST_CPU host_cpu_count)"
-    ipv4="$(host_value WPFY_TEST_IPV4 host_ip 4 1.1.1.1)"
-    ipv6="$(host_value WPFY_TEST_IPV6 host_ip 6 2606:4700:4700::1111)"
-
-    cat <<'EOF'
- __        ______  ______ __   __
- \ \      / /  _ \|  ____|\ \ / /
-  \ \ /\ / /| |_) | |__    \ V /
-   \ V  V / |  __/|  __|    | |
-    \_/\_/  |_|   |_|       |_|
-EOF
-    printf '%80s\n' '' | tr ' ' '#'
-    banner_row "Build" "$build"
-    banner_row "Operating System" "$os"
-    banner_row "Hostname" "$hostname"
-    banner_row "Virtualization" "$virtualization"
-    banner_row "Disk Space" "$disk"
-    banner_row "RAM Memory" "$ram total"
-    banner_row "Swap" "$swap total"
-    banner_row "vCPU Cores" "$cpu"
-    banner_row "IPv4 Address" "$ipv4"
-    banner_row "IPv6 Address" "$ipv6"
-    printf '%80s\n' '' | tr ' ' '#'
-}
-
 die() {
     printf 'wpfy install: %s\n' "$*" >&2
     exit 1
@@ -396,11 +288,6 @@ main() {
     trap on_interrupt INT TERM
     setup_ui
     setup_logging
-    if [[ "$DRY_RUN" == "1" ]]; then
-        show_welcome
-    else
-        show_welcome | tee -a "$LOG_FILE"
-    fi
     [[ "$USE_TTY" == "1" && "$DRY_RUN" != "1" ]] && printf '\033[?25l'
 
     local archive="$TMP_ROOT/wpfy.tar.gz"
@@ -419,7 +306,6 @@ main() {
     WPFY_INSTALL_STARTED_AT="$INSTALL_STARTED_AT" \
     WPFY_VERBOSE="$VERBOSE" \
     WPFY_NO_COLOR="$NO_COLOR_REQUESTED" \
-    WPFY_SKIP_WELCOME=1 \
         bash "$source_dir/wpfy" --skip-wpfy-install "${installer_args[@]}"
 }
 

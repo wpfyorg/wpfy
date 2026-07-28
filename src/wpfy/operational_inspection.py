@@ -6,11 +6,16 @@ from pathlib import Path
 
 from . import registry, traefik
 from .certificate_lifecycle import cert_expiry_days, get_cert_info
-from .settings import PATHS
 from .site_definition import MYSQL_FLAVORS, SiteDefinition
 from .site_layout import list_sites, site_info, web_service_lines
 from .site_paths import domain_to_project, env_path, nginx_conf_path, read_env, site_dir
-from .site_runtime import compose_command, docker_available, http_probe_site, runtime_skip_requested
+from .site_runtime import compose_command, docker_available, http_probe_site, nginx_config_test, runtime_skip_requested
+
+
+def _current_paths():
+    from .settings import PATHS as current_paths
+
+    return current_paths
 
 
 @dataclass(frozen=True, slots=True)
@@ -186,7 +191,7 @@ def _registry_consistency() -> InspectionCheck:
         registered = set()
     filesystem = set()
     try:
-        for child in Path(PATHS.sites_dir).iterdir():
+        for child in Path(_current_paths().sites_dir).iterdir():
             if child.is_dir() and (child / ".env").exists() and (child / "compose.yaml").exists():
                 filesystem.add(child.name)
     except OSError:
@@ -203,7 +208,7 @@ def _registry_consistency() -> InspectionCheck:
 
 def site_diagnostics(domain: str) -> tuple[InspectionCheck, ...]:
     checks = []
-    root = Path(PATHS.sites_dir) / domain
+    root = Path(_current_paths().sites_dir) / domain
     scaffold_ok = (root / "compose.yaml").exists()
     checks.append(InspectionCheck("scaffold", scaffold_ok, "compose.yaml exists" if scaffold_ok else "scaffold missing"))
     if not scaffold_ok: return tuple(checks)
@@ -231,6 +236,15 @@ def site_diagnostics(domain: str) -> tuple[InspectionCheck, ...]:
         proc.returncode == 0,
         "valid" if proc.returncode == 0 else proc.stderr.strip()[:120] or "config invalid",
     ))
+    try:
+        nginx_config = nginx_config_test(domain)
+        checks.append(InspectionCheck(
+            "nginx config",
+            nginx_config.ran and nginx_config.exit_code == 0,
+            nginx_config.message,
+        ))
+    except (OSError, subprocess.SubprocessError, ValueError) as exc:
+        checks.append(InspectionCheck("nginx config", False, str(exc)))
     try:
         probe = http_probe_site(domain)
         checks.append(InspectionCheck("http probe", probe.ran and probe.exit_code == 0, probe.message))

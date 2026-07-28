@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 import os
 import shutil
@@ -8,11 +9,16 @@ import stat
 import subprocess
 from typing import Final
 
-from .settings import PATHS
-from . import systemd
+from . import metrics, site_cron, systemd
 from .site_definition import WORDPRESS_FLAVORS
 from .site_layout import list_sites
-from .site_runtime import RuntimeResult, runtime_skip_requested, site_health, wp_cli_command
+from .site_runtime import RuntimeResult, app_health_ok, runtime_skip_requested, site_health, wp_cli_command
+
+
+def _current_paths():
+    from .settings import PATHS as current_paths
+
+    return current_paths
 
 
 INTERVALS: Final = ("minute", "five-minute", "hourly", "six-hour", "daily", "weekly")
@@ -35,11 +41,11 @@ class CronRun:
 
 
 def cron_log_path() -> Path:
-    return Path(PATHS.log_dir) / LOG_NAME
+    return Path(_current_paths().log_dir) / LOG_NAME
 
 
 def custom_hook_path(interval: str) -> Path:
-    return Path(PATHS.config_dir) / "custom" / "cron" / f"{interval}.sh"
+    return Path(_current_paths().config_dir) / "custom" / "cron" / f"{interval}.sh"
 
 
 def install_timers() -> RuntimeResult:
@@ -128,10 +134,46 @@ def _run_wordpress_cron(lines: list[str]) -> int:
     return exit_code
 
 
+def _run_site_cron(lines: list[str]) -> int:
+    result = site_cron.run_due(datetime.now().replace(second=0, microsecond=0))
+    if not result.jobs:
+        lines.append("site cron: no jobs due")
+        return 0
+    for job in result.jobs:
+        identifier = job.job_id or "unknown"
+        lines.append(
+            f"{job.domain}: cron {identifier} {job.outcome.upper()} duration={job.duration:.3f}s"
+        )
+    return result.exit_code
+
+
+def _sample_metrics(lines: list[str]) -> int:
+    try:
+        result = metrics.sample_once()
+    except Exception as exc:
+        lines.append(f"metrics sample: FAIL {exc}")
+        return 1
+    lines.append(f"metrics sample: OK {len(result.samples)} scope(s)")
+    for warning in result.warnings:
+        lines.append(f"metrics sample: WARN {warning}")
+    return 0
+
+
+def _prune_metrics(lines: list[str]) -> int:
+    try:
+        deleted = metrics.prune()
+    except Exception as exc:
+        lines.append(f"metrics prune: FAIL {exc}")
+        return 1
+    lines.append(f"metrics prune: OK deleted={deleted}")
+    return 0
+
+
 def _run_interval_tasks(interval: str, lines: list[str]) -> int:
     match interval:
         case "minute":
-            return 0
+            exit_code = _run_site_cron(lines)
+            return max(exit_code, _sample_metrics(lines))
         case "five-minute":
             lines.append(_load_health_line())
             return 0
@@ -143,6 +185,7 @@ def _run_interval_tasks(interval: str, lines: list[str]) -> int:
             return 0
         case "daily":
             exit_code = _append_all_site_health(lines)
+            exit_code = max(exit_code, _prune_metrics(lines))
             _rotate_cron_log()
             lines.append("cron log rotation: OK")
             return exit_code
@@ -190,8 +233,9 @@ def _append_all_site_health(lines: list[str]) -> int:
     for site in sites:
         domain = str(site.get("domain", ""))
         result = site_health(domain)
-        status = "OK" if result.exit_code == 0 else "FAIL"
-        if result.exit_code != 0:
+        ok = app_health_ok(result.status, result.bootstrap_ready, result.runtime_ready)
+        status = "OK" if ok is True else "WARN" if ok is None else "FAIL"
+        if ok is False:
             exit_code = 1
         lines.append(f"{domain}: health {status} {result.message}")
     return exit_code
@@ -206,12 +250,12 @@ def _load_health_line() -> str:
 
 
 def _disk_health_line() -> str:
-    probe = Path(PATHS.install_root)
+    probe = Path(_current_paths().install_root)
     while not probe.exists() and probe != probe.parent:
         probe = probe.parent
     usage = shutil.disk_usage(probe)
     used_percent = (usage.used / usage.total) * 100 if usage.total else 0
-    return f"disk health: {used_percent:.1f}% used at {PATHS.install_root}"
+    return f"disk health: {used_percent:.1f}% used at {_current_paths().install_root}"
 
 
 def _append_cron_log(lines: list[str]) -> None:

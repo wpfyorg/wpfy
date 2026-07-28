@@ -6,8 +6,13 @@ from urllib.error import URLError
 from urllib.request import Request, urlopen
 
 from .redaction import redact_values
-from .settings import PATHS
 from .site_paths import read_env
+
+
+def _current_paths():
+    from .settings import PATHS as current_paths
+
+    return current_paths
 
 
 @dataclass(frozen=True, slots=True)
@@ -20,7 +25,7 @@ class DNSConfigError(RuntimeError):
 
 
 def cloudflare_config_path() -> Path:
-    return Path(PATHS.config_dir) / "dns-cloudflare.env"
+    return Path(_current_paths().config_dir) / "dns-cloudflare.env"
 
 
 def write_cloudflare_config(config: CloudflareConfig) -> Path:

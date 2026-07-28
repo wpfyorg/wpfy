@@ -387,6 +387,77 @@ def test_compose_content_traefik_labels_has_loadbalancer():
     assert 'traefik.http.services.test-com.loadbalancer.server.port=8080' in content
 
 
+def test_compose_content_mounts_managed_cache_path_before_default_vhost():
+    content = compose_content(_spec(domain="cache.example.com", flavor="wp", use_mysql=True, use_redis=False))
+
+    cache_mount = "./nginx/cache-path.conf:/etc/nginx/conf.d/00-wpfy-cache-path.conf:ro"
+    default_mount = "./nginx/default.conf:/etc/nginx/conf.d/default.conf:ro"
+    assert cache_mount in content
+    assert content.index(cache_mount) < content.index(default_mount)
+
+
+def test_wpfc_scaffold_creates_mounts_and_owns_cache_data(tmp_wpfy_home, monkeypatch):
+    import wpfy.site_layout
+
+    importlib.reload(wpfy.site_layout)
+    domain = "writable-cache.example.com"
+    spec = wpfy.site_layout.SiteSpec(
+        domain=domain,
+        flavor="wp",
+        use_mysql=True,
+        use_redis=False,
+        page_cache="wpfc",
+    )
+
+    wpfy.site_layout.ensure_site_scaffold(spec)
+
+    cache_root = wpfy.site_layout.site_dir(domain) / "cache-data"
+    compose = wpfy.site_layout.compose_path(domain).read_text(encoding="utf-8")
+    assert cache_root.is_dir()
+    assert "./cache-data:/var/cache/nginx/fastcgi" in compose
+
+    owned_inodes = set()
+    modes = {}
+    monkeypatch.setattr(wpfy.site_layout.os, "geteuid", lambda: 0, raising=False)
+    monkeypatch.setattr(
+        wpfy.site_layout.os,
+        "fchown",
+        lambda fd, uid, gid: owned_inodes.add(os.fstat(fd).st_ino),
+    )
+    monkeypatch.setattr(
+        wpfy.site_layout.os,
+        "fchmod",
+        lambda fd, mode: modes.__setitem__(os.fstat(fd).st_ino, mode),
+    )
+    monkeypatch.setattr(wpfy.site_layout.os, "chown", lambda *args, **kwargs: None)
+
+    result = wpfy.site_layout._apply_site_ownership(domain, 100042)
+
+    assert result.ran is True
+    assert cache_root.stat().st_ino in owned_inodes
+    assert modes[cache_root.stat().st_ino] == 0o700
+
+
+def test_ensure_site_scaffold_writes_cache_managed_paths(tmp_wpfy_home, monkeypatch):
+    import wpfy.site_layout
+
+    importlib.reload(wpfy.site_layout)
+    domain = "cache-paths.example.com"
+    spec = wpfy.site_layout.SiteSpec(
+        domain=domain,
+        flavor="wp",
+        use_mysql=True,
+        use_redis=False,
+        page_cache="wpfc",
+    )
+
+    wpfy.site_layout.ensure_site_scaffold(spec)
+
+    env = wpfy.site_layout.read_env(wpfy.site_layout.env_path(domain))
+    assert env["PAGE_CACHE"] == "wpfc"
+    assert (wpfy.site_layout.nginx_dir(domain) / "cache-path.conf").read_text(encoding="utf-8") == ""
+
+
 def test_ensure_site_scaffold_writes_private_env(tmp_wpfy_home, monkeypatch):
     import wpfy.site_layout
 
@@ -436,6 +507,23 @@ def test_ensure_site_scaffold_propagates_ownership_failure(tmp_wpfy_home, monkey
         wpfy.site_layout.ensure_site_scaffold(spec)
 
 
+def test_ensure_site_scaffold_preserves_non_utf8_access_log(tmp_wpfy_home):
+    import wpfy.site_layout
+
+    importlib.reload(wpfy.site_layout)
+    domain = "non-utf8-access-log.example.com"
+    spec = wpfy.site_layout.SiteSpec(domain=domain, flavor="wp", use_mysql=True, use_redis=False)
+    wpfy.site_layout.ensure_site_scaffold(spec)
+    access_log = wpfy.site_layout.nginx_dir(domain) / wpfy.site_layout.site_security.ACCESS_LOG_FILE
+    original = b'203.0.113.9 - - [28/Jul/2026:01:00:00 +0000] "GET / HTTP/1.1" 200 12 "-" "\xff"\n'
+    access_log.write_bytes(original)
+
+    touched = wpfy.site_layout.ensure_site_scaffold(spec)
+
+    assert access_log.read_bytes() == original
+    assert str(access_log) not in touched
+
+
 def test_ensure_site_scaffold_rejects_env_symlink_inserted_after_validation(
     tmp_wpfy_home, monkeypatch, tmp_path
 ):
@@ -450,7 +538,7 @@ def test_ensure_site_scaffold_rejects_env_symlink_inserted_after_validation(
 
     def read_and_swap(root, name):
         content = original_read(root, name)
-        if name == "compose.yaml" and not wpfy.site_layout.env_path(domain).exists():
+        if name == ".env" and not wpfy.site_layout.env_path(domain).exists():
             wpfy.site_layout.env_path(domain).symlink_to(external)
         return content
 

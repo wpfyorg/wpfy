@@ -1,8 +1,24 @@
 from __future__ import annotations
 
-import pytest
+import importlib
 import json
 from pathlib import Path
+
+import pytest
+
+
+def test_registry_uses_reloaded_settings_paths(tmp_path, monkeypatch):
+    import wpfy.registry
+    import wpfy.settings
+
+    state_dir = tmp_path / "redirected-state"
+    try:
+        with monkeypatch.context() as patch:
+            patch.setenv("WPFY_STATE_DIR", str(state_dir))
+            importlib.reload(wpfy.settings)
+            assert wpfy.registry.Registry()._path == state_dir / "sites.json"
+    finally:
+        importlib.reload(wpfy.settings)
 
 
 def test_registry_add_and_get(clean_registry):
@@ -236,9 +252,11 @@ def test_sync_preserves_registry_fields_and_rebuilds_canonical_metadata(tmp_wpfy
 
     assert reg.get_site("example.com") == {
         "domain": "example.com",
-        "flavor": "wpredis",
+        "flavor": "wp",
         "php_version": "8.3",
         "ssl_enabled": True,
+        "page_cache": "none",
+        "object_cache": "redis",
         "cache_type": "redis",
         "site_uid": 100123,
         "sftp_enabled": True,

@@ -1,26 +1,30 @@
 from __future__ import annotations
 
+import ipaddress
+import json
 import os
 import re
 import shutil
 import subprocess
 from pathlib import Path
 
-from .settings import PATHS
+from . import settings
 from .site_runtime import RuntimeResult, docker_available, runtime_skip_requested
 from .dns import cloudflare_config_path
+from .site_definition import compose_hardening_lines
 
 
 TRAEFIK_IMAGE = "traefik:v3.6.17"
 _DEFAULT_ACME_EMAIL = "admin@localhost"
 _ACME_EMAIL_RE = re.compile(r"[^@\s]+@[^@\s.]+(?:\.[^@\s.]+)+")
 TRAEFIK_NETWORK = "wpfy"
+PANEL_EDGE_NETWORK = "wpfy-panel-edge"
 TRAEFIK_CONTAINER = "wpfy-traefik"
 TRAEFIK_PROJECT = "wpfy-traefik"
 
 
 def traefik_dir() -> Path:
-    return Path(PATHS.traefik_dir)
+    return Path(settings.PATHS.traefik_dir)
 
 
 def traefik_compose_path() -> Path:
@@ -41,23 +45,23 @@ def _traefik_compose(*args: str) -> subprocess.CompletedProcess[str]:
     )
 
 
-def ensure_traefik_network() -> RuntimeResult:
+def _ensure_bridge_network(network_name: str) -> RuntimeResult:
     if runtime_skip_requested():
         return RuntimeResult(0, "traefik network creation skipped by WPFY_SKIP_RUNTIME=1", skipped=True)
     if not docker_available():
         return RuntimeResult(0, "traefik network creation skipped (Docker/Compose not available)", skipped=True)
 
     proc = subprocess.run(
-        ["docker", "network", "inspect", TRAEFIK_NETWORK],
+        ["docker", "network", "inspect", network_name],
         check=False,
         capture_output=True,
         text=True,
     )
     if proc.returncode == 0:
-        return RuntimeResult(0, f"traefik network '{TRAEFIK_NETWORK}' already exists", ran=True)
+        return RuntimeResult(0, f"traefik network '{network_name}' already exists", ran=True)
 
     proc = subprocess.run(
-        ["docker", "network", "create", "--driver", "bridge", TRAEFIK_NETWORK],
+        ["docker", "network", "create", "--driver", "bridge", network_name],
         check=False,
         capture_output=True,
         text=True,
@@ -65,7 +69,60 @@ def ensure_traefik_network() -> RuntimeResult:
     if proc.returncode != 0:
         message = proc.stderr.strip() or proc.stdout.strip() or "docker network create failed"
         return RuntimeResult(proc.returncode, message)
-    return RuntimeResult(0, f"traefik network '{TRAEFIK_NETWORK}' created", ran=True)
+    return RuntimeResult(0, f"traefik network '{network_name}' created", ran=True)
+
+
+def ensure_traefik_network() -> RuntimeResult:
+    return _ensure_bridge_network(TRAEFIK_NETWORK)
+
+
+def ensure_panel_edge_network() -> RuntimeResult:
+    return _ensure_bridge_network(PANEL_EDGE_NETWORK)
+
+
+def traefik_network_cidrs(network_name: str = TRAEFIK_NETWORK) -> tuple[str, ...]:
+    override = os.environ.get("WPFY_TEST_TRAEFIK_NETWORK_CIDRS")
+    if override:
+        raw_cidrs = [item.strip() for item in override.split(",") if item.strip()]
+    else:
+        if not docker_available():
+            raise RuntimeError("cannot determine wpfy edge network CIDR: Docker is unavailable")
+        proc = subprocess.run(
+            [
+                "docker", "network", "inspect", "--format",
+                "{{json .IPAM.Config}}", network_name,
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if proc.returncode != 0:
+            detail = proc.stderr.strip() or proc.stdout.strip() or "network inspect failed"
+            raise RuntimeError(f"cannot determine wpfy edge network CIDR: {detail}")
+        try:
+            configs = json.loads(proc.stdout.strip())
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("cannot determine wpfy edge network CIDR: invalid Docker inspect output") from exc
+        if not isinstance(configs, list):
+            raise RuntimeError("cannot determine wpfy edge network CIDR: Docker reported no IPAM config")
+        raw_cidrs = [
+            item.get("Subnet", "")
+            for item in configs
+            if isinstance(item, dict) and isinstance(item.get("Subnet"), str)
+        ]
+
+    cidrs: list[str] = []
+    for raw in raw_cidrs:
+        try:
+            network = ipaddress.ip_network(raw, strict=False)
+        except ValueError as exc:
+            raise RuntimeError(f"cannot determine wpfy edge network CIDR: invalid subnet {raw!r}") from exc
+        if network.prefixlen == 0:
+            raise RuntimeError("cannot determine wpfy edge network CIDR: wildcard subnet refused")
+        cidrs.append(network.with_prefixlen)
+    if not cidrs:
+        raise RuntimeError("cannot determine wpfy edge network CIDR: Docker reported no subnet")
+    return tuple(sorted(set(cidrs)))
 
 
 def effective_acme_email() -> str:
@@ -90,8 +147,8 @@ def acme_email_problem() -> str | None:
     return (
         f"ACME contact email is not configured (current: {email or 'unset'}); "
         "Let's Encrypt rejects invalid contact addresses. "
-        "Set WPFY_ACME_EMAIL=you@example.com and re-run 'wpfy stack install --nginx', "
-        "then retry enabling SSL"
+        "Set WPFY_ACME_EMAIL=you@example.com and re-run 'wpfy stack install --nginx'; "
+        "wpfy will recreate a running Traefik when its static config changes. Then retry enabling SSL"
     )
 
 
@@ -114,6 +171,9 @@ def traefik_static_config() -> str:
         "    endpoint: \"unix:///var/run/docker.sock\"",
         "    exposedByDefault: false",
         f"    network: {TRAEFIK_NETWORK}",
+        "  file:",
+        "    directory: /etc/traefik/dynamic",
+        "    watch: true",
         "",
         "certificatesResolvers:",
         "  le:",
@@ -142,6 +202,7 @@ def traefik_static_config() -> str:
 
 def traefik_compose_content() -> str:
     config_mount = str(traefik_config_path())
+    dynamic_mount = str(traefik_dir() / "dynamic")
     lines = [
         f"name: {TRAEFIK_PROJECT}",
         "services:",
@@ -149,18 +210,7 @@ def traefik_compose_content() -> str:
         f"    image: {TRAEFIK_IMAGE}",
         f"    container_name: {TRAEFIK_CONTAINER}",
         "    restart: unless-stopped",
-        "    security_opt:",
-        "      - no-new-privileges:true",
-        "    cap_drop:",
-        "      - NET_RAW",
-        "    pids_limit: 256",
-        "    mem_limit: 256m",
-        "    cpus: 0.50",
-        "    logging:",
-        "      driver: json-file",
-        "      options:",
-        "        max-size: 10m",
-        "        max-file: \"3\"",
+        *compose_hardening_lines(256, "256m", "0.50"),
         "    ports:",
         '      - "80:80"',
         '      - "443:443"',
@@ -175,9 +225,11 @@ def traefik_compose_content() -> str:
         "    volumes:",
         "      - /var/run/docker.sock:/var/run/docker.sock:ro",
         f"      - {config_mount}:/etc/traefik/traefik.yml:ro",
+        f"      - {dynamic_mount}:/etc/traefik/dynamic:ro",
         "      - letsencrypt_data:/letsencrypt",
         "    networks:",
         f"      - {TRAEFIK_NETWORK}",
+        f"      - {PANEL_EDGE_NETWORK}",
         "    healthcheck:",
         "      test: [\"CMD\", \"traefik\", \"healthcheck\", \"--ping\"]",
         "      interval: 30s",
@@ -186,6 +238,8 @@ def traefik_compose_content() -> str:
         "",
         "networks:",
         f"  {TRAEFIK_NETWORK}:",
+        "    external: true",
+        f"  {PANEL_EDGE_NETWORK}:",
         "    external: true",
         "",
         "volumes:",
@@ -200,6 +254,16 @@ def ensure_traefik_scaffold() -> list[str]:
     if not td.exists():
         td.mkdir(parents=True, exist_ok=True)
         touched.append(str(td))
+
+    dynamic = td / "dynamic"
+    if dynamic.is_symlink():
+        raise OSError(f"refusing symlinked Traefik dynamic directory: {dynamic}")
+    if not dynamic.exists():
+        dynamic.mkdir(mode=0o755)
+        touched.append(str(dynamic))
+    if not dynamic.is_dir():
+        raise OSError(f"Traefik dynamic path is not a directory: {dynamic}")
+    os.chmod(dynamic, 0o755)
 
     compose_file = traefik_compose_path()
     content = traefik_compose_content()
@@ -222,12 +286,16 @@ def start_traefik() -> RuntimeResult:
     if not docker_available():
         return RuntimeResult(0, "traefik start skipped (Docker/Compose not available)", skipped=True)
 
-    ensure_traefik_scaffold()
-    net_result = ensure_traefik_network()
-    if net_result.exit_code != 0:
-        return net_result
+    was_running = traefik_running()
+    touched = ensure_traefik_scaffold()
+    for ensure_network in (ensure_traefik_network, ensure_panel_edge_network):
+        net_result = ensure_network()
+        if net_result.exit_code != 0:
+            return net_result
 
-    proc = _traefik_compose("up", "-d")
+    static_changed = str(traefik_config_path()) in touched
+    command = ("up", "-d", "--force-recreate", "traefik") if was_running and static_changed else ("up", "-d")
+    proc = _traefik_compose(*command)
     if proc.returncode != 0:
         message = proc.stderr.strip() or proc.stdout.strip() or "docker compose up failed"
         return RuntimeResult(proc.returncode, message)
@@ -240,12 +308,14 @@ def restart_traefik_existing() -> RuntimeResult:
         return RuntimeResult(0, "traefik restart skipped by WPFY_SKIP_RUNTIME=1", skipped=True)
     if not docker_available():
         return RuntimeResult(0, "traefik restart skipped (Docker/Compose not available)", skipped=True)
-    net_result = ensure_traefik_network()
-    if net_result.exit_code != 0:
-        return net_result
-    proc = _traefik_compose("up", "-d")
+    ensure_traefik_scaffold()
+    for ensure_network in (ensure_traefik_network, ensure_panel_edge_network):
+        net_result = ensure_network()
+        if net_result.exit_code != 0:
+            return net_result
+    proc = _traefik_compose("restart", "traefik")
     if proc.returncode != 0:
-        message = proc.stderr.strip() or proc.stdout.strip() or "docker compose up failed"
+        message = proc.stderr.strip() or proc.stdout.strip() or "docker compose restart failed"
         return RuntimeResult(proc.returncode, message)
     message = proc.stdout.strip() or proc.stderr.strip() or "traefik restarted"
     return RuntimeResult(0, message, ran=True)

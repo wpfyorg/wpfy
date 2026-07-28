@@ -8,8 +8,13 @@ import ssl
 from typing import Final, Literal
 
 from .redaction import redact_values
-from .settings import PATHS
 from .site_paths import read_env
+
+
+def _current_paths():
+    from .settings import PATHS as current_paths
+
+    return current_paths
 
 
 TLSMode = Literal["starttls", "ssl", "none"]
@@ -32,7 +37,7 @@ class SMTPConfigError(RuntimeError):
 
 
 def smtp_config_path() -> Path:
-    return Path(PATHS.config_dir) / CONFIG_FILENAME
+    return Path(_current_paths().config_dir) / CONFIG_FILENAME
 
 
 def write_smtp_config(config: SMTPConfig) -> Path:

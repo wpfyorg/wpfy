@@ -4,6 +4,44 @@ from wpfy.site_layout import RuntimeResult
 from wpfy.certificate_lifecycle import SSLPreflightResult
 
 
+def test_delete_site_stops_when_backup_fails(monkeypatch):
+    import wpfy.site_lifecycle as lifecycle
+
+    calls = []
+    monkeypatch.setattr(lifecycle, "site_info", lambda domain: {"domain": domain})
+    monkeypatch.setattr(
+        lifecycle,
+        "backup_site",
+        lambda domain, require_database=False: calls.append(("backup", require_database))
+        or RuntimeResult(1, "backup failed"),
+    )
+    monkeypatch.setattr(lifecycle, "stop_site_runtime", lambda *args, **kwargs: calls.append("stop"))
+    monkeypatch.setattr(lifecycle, "remove_site_scaffold", lambda domain: calls.append("remove"))
+
+    result = lifecycle.delete_site(lifecycle.DeleteSiteRequest("example.com", force=True))
+
+    assert result.exit_code == 1
+    assert result.removed is False
+    assert calls == [("backup", True)]
+
+
+def test_update_site_dry_run_does_not_apply(monkeypatch):
+    import wpfy.site_lifecycle as lifecycle
+
+    monkeypatch.setattr(lifecycle, "site_info", lambda domain: {"domain": domain})
+    monkeypatch.setattr(lifecycle, "read_env", lambda path: {
+        "SITE_FLAVOR": "wp", "PHP_VERSION": "8.4", "LETSENCRYPT_MODE": "",
+    })
+    monkeypatch.setattr(lifecycle, "ensure_site_scaffold", lambda spec: (_ for _ in ()).throw(AssertionError("mutated")))
+    monkeypatch.setattr(lifecycle, "start_site_runtime", lambda domain: (_ for _ in ()).throw(AssertionError("started")))
+
+    result = lifecycle.update_site(lifecycle.UpdateSiteRequest("example.com", php_version="8.3", dry_run=True))
+
+    assert result.changes == ("php 8.4→8.3",)
+    assert result.touched == ()
+    assert result.runtime.skipped is True
+
+
 def test_create_site_runs_lifecycle_in_order(monkeypatch):
     import wpfy.site_lifecycle as lifecycle
 
@@ -237,9 +275,16 @@ def test_update_site_passes_authoritative_definition_to_scaffold(monkeypatch):
     )
     monkeypatch.setattr(lifecycle, "ensure_site_scaffold", lambda spec: captured.setdefault("spec", spec) and [])
     monkeypatch.setattr(lifecycle, "start_site_runtime", lambda domain: RuntimeResult(0, "started", ran=True))
+    monkeypatch.setattr(
+        lifecycle.site_cache,
+        "configure_site_cache",
+        lambda domain: lifecycle.site_cache.CacheConfigurationResult(captured["spec"], ()),
+    )
     result = lifecycle.update_site(lifecycle.UpdateSiteRequest("example.com", php_version="8.4", wpredis=True))
 
-    assert result.changes == ("php 8.3→8.4", "flavor wp→wpredis")
+    assert result.changes == ("php 8.3→8.4", "object cache none→redis")
+    assert captured["spec"].flavor == "wp"
+    assert captured["spec"].object_cache == "redis"
     assert captured["spec"].use_redis is True
     assert captured["spec"].registry_metadata()["php_version"] == "8.4"
     assert captured["spec"].registry_metadata()["cache_type"] == "redis"
@@ -261,7 +306,7 @@ def test_enable_ssl_preserves_existing_site_definition(monkeypatch):
     monkeypatch.setattr(
         lifecycle,
         "read_env",
-        lambda path: {"PHP_VERSION": "8.3"},
+        lambda path: {"SITE_FLAVOR": "wpredis", "PHP_VERSION": "8.3"},
     )
     monkeypatch.setattr(lifecycle, "ensure_site_scaffold", lambda spec: captured.setdefault("spec", spec) and [])
     monkeypatch.setattr(lifecycle, "start_site_runtime", lambda domain: RuntimeResult(0, "started", ran=True))
@@ -276,8 +321,9 @@ def test_enable_ssl_preserves_existing_site_definition(monkeypatch):
 
     result = lifecycle.enable_ssl("example.com", letsencrypt="certbot")
 
-    assert result.spec.flavor == "wpredis"
+    assert result.spec.flavor == "wp"
     assert result.spec.php_version == "8.3"
+    assert result.spec.object_cache == "redis"
     assert result.spec.use_redis is True
     assert result.spec.proxied is True
     assert calls == [
@@ -297,7 +343,7 @@ def test_enable_ssl_returns_failure_when_wordpress_url_update_fails(monkeypatch)
         lambda domain: SSLPreflightResult(domain, ("203.0.113.10",), (), ("203.0.113.10",), (), True, "direct"),
     )
     monkeypatch.setattr(lifecycle, "site_info", lambda domain: {"domain": domain, "flavor": "wp"})
-    monkeypatch.setattr(lifecycle, "read_env", lambda path: {"PHP_VERSION": "8.4"})
+    monkeypatch.setattr(lifecycle, "read_env", lambda path: {"SITE_FLAVOR": "wp", "PHP_VERSION": "8.4"})
     monkeypatch.setattr(lifecycle, "ensure_site_scaffold", lambda spec: [])
     monkeypatch.setattr(lifecycle, "start_site_runtime", lambda domain: RuntimeResult(0, "started", ran=True))
 

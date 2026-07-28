@@ -138,6 +138,42 @@ def test_nginx_service_info_uses_complete_authoritative_web_block(tmp_wpfy_home)
     assert info.checks[1].ok is True
 
 
+def test_site_diagnostics_exposes_rejected_nginx_config(tmp_wpfy_home, monkeypatch):
+    import wpfy.operational_inspection as inspection
+    import wpfy.site_layout as layout
+    import wpfy.site_runtime as runtime
+
+    importlib.reload(layout)
+    importlib.reload(inspection)
+    domain = "diagnostic-cache.example.com"
+    layout.ensure_site_scaffold(layout.SiteSpec(domain=domain, flavor="wp", use_mysql=True, use_redis=False))
+
+    class Proc:
+        returncode = 0
+        stdout = "[]"
+        stderr = ""
+
+    monkeypatch.setattr(inspection.subprocess, "run", lambda *args, **kwargs: Proc())
+    monkeypatch.setattr(
+        inspection,
+        "nginx_config_test",
+        lambda domain_arg: runtime.RuntimeResult(1, 'nginx: [emerg] zone "WPFY" is unknown', ran=True),
+    )
+    monkeypatch.setattr(
+        inspection,
+        "http_probe_site",
+        lambda domain_arg: runtime.RuntimeResult(0, "http probe passed", ran=True),
+    )
+    monkeypatch.setattr(inspection, "get_cert_info", lambda domain_arg: {})
+    monkeypatch.setattr(inspection, "site_info", lambda domain_arg: {"flavor": "html"})
+
+    checks = inspection.site_diagnostics(domain)
+
+    nginx_check = next(check for check in checks if check.name == "nginx config")
+    assert nginx_check.ok is False
+    assert 'zone "WPFY" is unknown' in nginx_check.message
+
+
 def test_php_service_info_distinguishes_stopped_failed_and_success(monkeypatch):
     import wpfy.operational_inspection as inspection
 

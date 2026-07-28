@@ -105,6 +105,21 @@ def test_log_reset_propagates_restart_failure(monkeypatch):
     assert result.exit_code == 7
 
 
+def test_nginx_config_test_preserves_failure_output(monkeypatch):
+    _runtime_ready(monkeypatch)
+    monkeypatch.setattr(
+        runtime,
+        "_compose_exec",
+        lambda *args: Proc(9, stderr='nginx: [emerg] "fastcgi_cache" zone "WPFY" is unknown'),
+    )
+
+    result = runtime.nginx_config_test("example.com")
+
+    assert result.exit_code == 9
+    assert result.ran is True
+    assert 'zone "WPFY" is unknown' in result.message
+
+
 def test_wait_for_service_skips_without_compose(monkeypatch):
     monkeypatch.setattr(runtime, "runtime_skip_requested", lambda: True)
     monkeypatch.setattr(
@@ -217,3 +232,41 @@ def test_wp_nonzero_is_preserved(monkeypatch):
     assert result.ran is True
     assert result.exit_code == 13
     assert result.stderr == "wp failed"
+
+
+def test_restart_uses_env_project_not_the_container_label(monkeypatch):
+    """The compose project comes from `.env`, which wpfy writes, not from a container label.
+
+    A container's `com.docker.compose.project` label is mutable runtime state: anything that
+    ran `docker compose up` with COMPOSE_PROJECT_NAME set overrides it. Trusting it made a
+    restart chase a project wpfy never created. Observed live: containers named
+    `docker-proof-example-com-*` carried project `wpfy-proof-phase3a3` while the site's own
+    `.env` and `compose.yaml` both said `docker-proof-example-com`.
+    """
+    _runtime_ready(monkeypatch)
+    monkeypatch.setattr(runtime, "read_env", lambda path: {"COMPOSE_PROJECT_NAME": "env-owned-project"})
+    calls = []
+    monkeypatch.setattr(
+        runtime.subprocess, "run",
+        lambda command, **kwargs: calls.append(command) or Proc(stdout="restarted\n"),
+    )
+
+    result = runtime.restart_site_service("example.com", "web")
+
+    assert result.exit_code == 0
+    assert calls == [["docker", "compose", "--project-name", "env-owned-project", "restart", "web"]]
+    assert not any("inspect" in part for command in calls for part in command)
+
+
+def test_restart_falls_back_to_derived_project_without_env(monkeypatch):
+    _runtime_ready(monkeypatch)
+    monkeypatch.setattr(runtime, "read_env", lambda path: {})
+    calls = []
+    monkeypatch.setattr(
+        runtime.subprocess, "run",
+        lambda command, **kwargs: calls.append(command) or Proc(stdout="restarted\n"),
+    )
+
+    runtime.restart_site_service("example.com", "web")
+
+    assert calls[0][3] == "example-com"

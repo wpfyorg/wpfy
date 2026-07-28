@@ -7,15 +7,20 @@ from pathlib import Path
 from typing import Any
 
 from .php_runtime import DEFAULT_PHP_VERSION
-from .settings import PATHS
 from .site_definition import SiteDefinition
 from .site_paths import read_env
+
+
+def _current_paths():
+    from .settings import PATHS as current_paths
+
+    return current_paths
 
 
 class Registry:
 
     def __init__(self, path: Path | None = None) -> None:
-        self._path = path or Path(PATHS.state_dir, "sites.json")
+        self._path = path or Path(_current_paths().state_dir, "sites.json")
         self._sites: dict[str, dict[str, Any]] = {}
         self._load()
 
@@ -79,7 +84,7 @@ class Registry:
 
     def sync_from_filesystem(self, sites_dir: str | None = None) -> dict[str, Any]:
         added, removed, updated = 0, 0, 0
-        root = Path(sites_dir) if sites_dir else Path(PATHS.sites_dir)
+        root = Path(sites_dir) if sites_dir else Path(_current_paths().sites_dir)
         fs_domains: set[str] = set()
 
         for child in self._site_dirs(root):

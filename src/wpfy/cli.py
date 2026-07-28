@@ -1,10 +1,8 @@
 from __future__ import annotations
 
 import argparse
-import base64
 from datetime import datetime
 import getpass
-import hashlib
 import importlib.metadata
 import json
 import os
@@ -26,19 +24,30 @@ from urllib.request import Request, urlopen
 from . import __version__
 from . import backup_schedule
 from . import cache_operations
+from . import site_cache
+from . import site_cron
+from . import site_security
 from . import cron
 from . import dns
 from . import edge_backup
+from . import events
+from . import files
+from . import metrics
 from . import panel
+from . import panel_auth
+from . import panel_exposure
 from . import registry
 from . import smtp
 from . import sftp
+from . import site_database
+from . import site_configuration
 from . import site_lifecycle
 from . import stack
+from . import telemetry
 from . import operational_inspection
 from .php_runtime import DEFAULT_PHP_VERSION, SUPPORTED_PHP_VERSIONS
 from .certificate_lifecycle import cert_expiry_days, force_renew_cert, get_cert_info, preflight_ssl
-from .site_definition import SiteDefinition
+from .site_definition import PAGE_CACHE_OPTIONS, SiteDefinition
 from .s3_backup import (
     S3Config,
     S3Uploader,
@@ -55,6 +64,7 @@ from .site_layout import (
     backup_site,
     ensure_site_scaffold,
     generated_secret,
+    get_nginx_custom,
     latest_backup_archive,
     list_backup_archives,
     list_sites,
@@ -62,17 +72,22 @@ from .site_layout import (
     prune_backup_archives,
     restore_site,
     site_info,
+    set_nginx_custom,
+    validate_nginx_custom,
 )
 from .site_paths import (
+    app_dir,
     compose_path,
     domain_to_project,
     env_path,
+    nginx_dir,
     read_env,
     site_exists,
     validate_domain,
 )
 from .site_runtime import (
     RuntimeResult,
+    app_health_ok,
     compose_command,
     reset_site_logs,
     run_wp_cli,
@@ -92,6 +107,7 @@ class WpfyHelpFormatter(argparse.ArgumentDefaultsHelpFormatter, argparse.RawDesc
 class CommandResult:
     message: str
     exit_code: int = 0
+    raw_output: bool = False
 
 
 DISK_THRESHOLDS: Final = (80.0, 90.0)
@@ -144,6 +160,20 @@ def _enabled_text(value: str | bool) -> str:
     return str(value)
 
 
+def _site_ssl_observation(site: dict) -> tuple[str, dict]:
+    domain = str(site.get("domain", ""))
+    configured = site.get("ssl_enabled", site.get("ssl", "disabled"))
+    if _enabled_text(configured) != "enabled":
+        return "disabled", {"status": "disabled"}
+    try:
+        certificate = get_cert_info(domain)
+    except (OSError, ValueError):
+        certificate = {"status": "unavailable"}
+    if certificate.get("status") == "issued":
+        return "enabled", certificate
+    return "requested", certificate
+
+
 def _site_count_summary(touched: list[str]) -> str:
     return "unchanged" if not touched else f"updated {len(touched)} paths"
 
@@ -158,14 +188,23 @@ def _site_type_label(flavor: str) -> str:
     return "php site"
 
 
-def _site_create_next_steps(domain: str, flavor: str) -> list[str]:
+def _site_create_next_steps(
+    domain: str,
+    flavor: str,
+    page_cache: str = "none",
+    object_cache: str = "none",
+) -> list[str]:
     steps: list[str] = []
     if flavor in WORDPRESS_FLAVORS:
         steps.append(f"sign in at https://{domain}/wp-admin")
-    if flavor in {"wpfc", "wpsc", "wprocket", "wpce"}:
-        steps.append("install and activate the matching cache plugin in WordPress")
-    if flavor == "wpredis":
-        steps.append("install and activate a Redis cache plugin, then enable object cache in WordPress")
+    if page_cache in {"wp-rocket", "flying-press"}:
+        plugin_dir = app_dir(domain) / "wp-content" / "plugins"
+        steps.append(
+            f"upload and extract the licensed {page_cache} zip under {plugin_dir}; "
+            "wpfy server-side cache rules are already staged"
+        )
+    if object_cache == "redis":
+        steps.append("Redis object cache is wired to this site's private redis service")
     return steps
 
 
@@ -179,6 +218,9 @@ def _format_site_create_result(
     wordpress_admin_user: str | None = None,
     generated_password: str | None = None,
     preflight_message: str | None = None,
+    page_cache: str = "none",
+    object_cache: str = "none",
+    cache_message: str | None = None,
     created: bool = True,
 ) -> str:
     heading = "Site created" if created else "Site already up to date"
@@ -191,13 +233,15 @@ def _format_site_create_result(
     ]
     if preflight_message:
         lines.append(f"preflight: {preflight_message}")
+    if cache_message:
+        lines.append(f"cache: {cache_message}")
     if wordpress_message:
         lines.append(f"wordpress: {wordpress_message}")
     if wordpress_admin_user:
         lines.append(f"admin user: {wordpress_admin_user}")
     if generated_password:
         lines.append(f"generated password: {generated_password}")
-    next_steps = _site_create_next_steps(domain, flavor)
+    next_steps = _site_create_next_steps(domain, flavor, page_cache, object_cache)
     for step in next_steps:
         lines.append(f"next: {step}")
     return _render_summary(heading, lines)
@@ -238,6 +282,8 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command")
 
     add_site_parser(subparsers)
+    add_db_parser(subparsers)
+    add_cache_parser(subparsers)
     add_run_parser(subparsers)
     add_backup_parser(subparsers)
     add_backup_prune_parser(subparsers)
@@ -246,6 +292,7 @@ def build_parser() -> argparse.ArgumentParser:
     add_backup_storage_parser(subparsers)
     add_backup_schedule_parser(subparsers)
     add_cron_parser(subparsers)
+    add_metrics_parser(subparsers)
     add_smtp_parser(subparsers)
     add_dns_parser(subparsers)
     add_restore_parser(subparsers)
@@ -265,6 +312,7 @@ def build_parser() -> argparse.ArgumentParser:
     add_healthcheck_parser(subparsers)
     add_motd_parser(subparsers)
     add_panel_parser(subparsers)
+    add_telemetry_parser(subparsers)
     add_utility_parser(subparsers)
     add_stack_parser(subparsers)
     add_sftp_parser(subparsers)
@@ -459,6 +507,81 @@ def handle_info(args: argparse.Namespace) -> CommandResult:
         lines.append("\n.env: not found")
 
     return CommandResult("\n".join(lines))
+
+
+def _cache_configuration_result(result: site_cache.CacheConfigurationResult, title: str) -> CommandResult:
+    lines = [
+        _section(title),
+        f"domain: {result.definition.domain}",
+        f"page cache: {result.definition.page_cache}",
+        f"object cache: {result.definition.object_cache}",
+        f"scaffold: {_site_count_summary(list(result.touched))}",
+    ]
+    for action in result.actions:
+        lines.append(f"{action.status}: {action.message}")
+    return CommandResult("\n".join(lines), exit_code=result.exit_code)
+
+
+def handle_cache(args: argparse.Namespace) -> CommandResult:
+    domain = args.domain
+    try:
+        if args.cache_command == "show":
+            definition, error = _site_definition_from_env(domain)
+            if error:
+                return error
+            if definition is None:
+                return CommandResult("cache config could not be loaded", exit_code=2)
+            return CommandResult(_render_summary(
+                "site cache",
+                [
+                    f"domain: {domain}",
+                    f"page cache: {definition.page_cache}",
+                    f"object cache: {definition.object_cache}",
+                    f"nginx rules: {nginx_dir(domain) / 'extra' / 'wpfy-cache.conf'}",
+                ],
+            ))
+        if args.cache_command == "set":
+            return _cache_configuration_result(
+                site_cache.set_page_cache(domain, args.plugin),
+                "page cache",
+            )
+        if args.cache_command == "object":
+            return _cache_configuration_result(
+                site_cache.set_object_cache(domain, args.backend),
+                "object cache",
+            )
+        if args.cache_command == "purge":
+            result = site_cache.purge_site_cache(domain)
+            lines = [_section("cache purge"), f"domain: {domain}"]
+            lines.extend(f"{outcome.cache}: {outcome.status} {outcome.message}" for outcome in result.outcomes)
+            return CommandResult("\n".join(lines), exit_code=result.exit_code)
+    except (FileNotFoundError, ValueError, OSError) as exc:
+        return CommandResult(str(exc), exit_code=2)
+    return CommandResult("cache command required", exit_code=2)
+
+
+def add_cache_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+    parser = _add_parser(
+        subparsers,
+        "cache",
+        help="Configure and purge native WordPress cache integrations.",
+    )
+    parser.add_argument("domain")
+    commands = parser.add_subparsers(dest="cache_command")
+
+    _add_parser(commands, "show", help="Show page and object cache selection.").set_defaults(handler=handle_cache)
+
+    set_parser = _add_parser(commands, "set", help="Set the WordPress page-cache integration.")
+    set_parser.add_argument("plugin", choices=sorted(PAGE_CACHE_OPTIONS))
+    set_parser.set_defaults(handler=handle_cache)
+
+    object_parser = _add_parser(commands, "object", help="Set the WordPress object-cache backend.")
+    object_parser.add_argument("backend", choices=("redis", "none"))
+    object_parser.set_defaults(handler=handle_cache)
+
+    _add_parser(commands, "purge", help="Purge plugin, Nginx, and Redis cache layers.").set_defaults(
+        handler=handle_cache,
+    )
 
 
 def add_clean_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
@@ -740,6 +863,9 @@ def _add_site_create_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--wpsc", action="store_true")
     parser.add_argument("--wprocket", action="store_true")
     parser.add_argument("--wpce", action="store_true")
+    parser.add_argument("--w3tc", action="store_true")
+    parser.add_argument("--wpfastest", action="store_true")
+    parser.add_argument("--flyingpress", action="store_true")
     parser.add_argument("--wpsubdir", action="store_true")
     parser.add_argument("--wpsubdomain", action="store_true")
     parser.add_argument("-le", "--letsencrypt", nargs="?", const="default")
@@ -948,6 +1074,26 @@ def add_cron_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentPars
 
     disable = cron_subparsers.add_parser("disable", help="disable cron timers")
     disable.set_defaults(handler=handle_cron)
+
+
+def add_metrics_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+    parser = _add_parser(
+        subparsers,
+        "metrics",
+        help="Sample, query, or prune host and per-site metrics.",
+    )
+    metrics_subparsers = parser.add_subparsers(dest="metrics_command")
+
+    sample = metrics_subparsers.add_parser("sample", help="record one host and per-site sample")
+    sample.set_defaults(handler=handle_metrics)
+
+    show = metrics_subparsers.add_parser("show", help="show samples for one scope and range")
+    show.add_argument("--scope", default=metrics.HOST_SCOPE, help="host or a managed domain")
+    show.add_argument("--range", dest="range_key", choices=metrics.RANGES, default="1h")
+    show.set_defaults(handler=handle_metrics)
+
+    prune_parser = metrics_subparsers.add_parser("prune", help="delete samples older than retention")
+    prune_parser.set_defaults(handler=handle_metrics)
 
 
 def add_smtp_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
@@ -1276,8 +1422,14 @@ def _refresh_site_scaffold(domain: str) -> tuple[list[str], CommandResult | None
     if definition is None:
         return [], CommandResult("config could not be loaded", exit_code=2)
     try:
-        return ensure_site_scaffold(definition), None
-    except ValueError as exc:
+        touched = ensure_site_scaffold(definition)
+        if definition.flavor not in WORDPRESS_FLAVORS:
+            return touched, None
+        cache_result = site_cache.render_cache_nginx(domain)
+        if cache_result.exit_code != 0:
+            return touched, CommandResult(cache_result.message, exit_code=cache_result.exit_code)
+        return touched, None
+    except (OSError, ValueError) as exc:
         return [], CommandResult(str(exc), exit_code=2)
 
 
@@ -1318,6 +1470,8 @@ def _site_update_command_result(
     ]
     if result.preflight_message:
         lines.append(f"preflight: {result.preflight_message}")
+    if result.cache_message:
+        lines.append(f"cache: {result.cache_message}")
     if result.password_summary:
         lines.append(f"password: {result.password_summary}")
     lines.append(_step_line("runtime", result.runtime))
@@ -1333,6 +1487,12 @@ def add_config_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentPa
     )
     parser.add_argument("domain")
     parser.add_argument("--php", choices=SUPPORTED_PHP_VERSIONS)
+    parser.add_argument("--memory-limit", dest="php_memory_limit")
+    parser.add_argument("--max-execution-time", dest="php_max_execution_time")
+    parser.add_argument("--max-input-time", dest="php_max_input_time")
+    parser.add_argument("--max-input-vars", dest="php_max_input_vars")
+    parser.add_argument("--upload-size", dest="php_upload_max_size")
+    parser.add_argument("--reset-php", action="store_true")
     parser.add_argument("--wpfc", action="store_true")
     parser.add_argument("--wpredis", action="store_true")
     parser.add_argument("--wpsubdir", action="store_true")
@@ -1389,6 +1549,10 @@ def _config_password(args: argparse.Namespace) -> tuple[str | None, CommandResul
 
 
 def _has_config_mutation(args: argparse.Namespace) -> bool:
+    return _has_php_config_mutation(args) or _has_non_php_config_mutation(args)
+
+
+def _has_non_php_config_mutation(args: argparse.Namespace) -> bool:
     return any((
         args.php is not None,
         args.wpfc,
@@ -1402,10 +1566,51 @@ def _has_config_mutation(args: argparse.Namespace) -> bool:
     ))
 
 
+def _has_php_config_mutation(args: argparse.Namespace) -> bool:
+    return any((
+        args.php_memory_limit is not None,
+        args.php_max_execution_time is not None,
+        args.php_max_input_time is not None,
+        args.php_max_input_vars is not None,
+        args.php_upload_max_size is not None,
+        args.reset_php,
+    ))
+
+
+def _php_config_command_result(result: site_configuration.ConfigurationResult) -> CommandResult:
+    change_text = ", ".join(result.changes) if result.changes else "no changes detected"
+    lines = [_section("PHP settings"), f"changes: {change_text}"]
+    lines.append(_step_line("runtime", result.runtime))
+    if result.message and result.exit_code != 0:
+        lines.append(f"details: {result.message}")
+    return CommandResult("\n".join(lines), exit_code=result.exit_code)
+
+
 def handle_config(args: argparse.Namespace) -> CommandResult:
     site_error = _require_existing_site(args.domain)
     if site_error:
         return site_error
+
+    if _has_php_config_mutation(args) and _has_non_php_config_mutation(args):
+        return CommandResult(
+            "PHP ini settings cannot be combined with PHP version, flavor, SSL, or password changes",
+            exit_code=2,
+        )
+
+    if _has_php_config_mutation(args):
+        try:
+            result = site_configuration.update_php_settings(
+                args.domain,
+                php_memory_limit=args.php_memory_limit,
+                php_max_execution_time=args.php_max_execution_time,
+                php_max_input_time=args.php_max_input_time,
+                php_max_input_vars=args.php_max_input_vars,
+                php_upload_max_size=args.php_upload_max_size,
+                reset=args.reset_php,
+            )
+        except ValueError as exc:
+            return CommandResult(str(exc), exit_code=2)
+        return _php_config_command_result(result)
 
     if not _has_config_mutation(args):
         definition, error = _site_definition_from_env(args.domain)
@@ -1420,7 +1625,14 @@ def handle_config(args: argparse.Namespace) -> CommandResult:
                 [
                     f"domain: {args.domain}",
                     f"flavor: {definition.flavor}",
+                    f"page cache: {definition.page_cache}",
+                    f"object cache: {definition.object_cache}",
                     f"php: {definition.php_version}",
+                    f"memory limit: {definition.php_memory_limit}",
+                    f"max execution time: {definition.php_max_execution_time}",
+                    f"max input time: {definition.php_max_input_time}",
+                    f"max input vars: {definition.php_max_input_vars}",
+                    f"upload size: {definition.php_upload_max_size}",
                     f"mysql: {_enabled_text(definition.use_mysql)}",
                     f"redis: {_enabled_text(definition.use_redis)}",
                     f"ssl: {_enabled_text(definition.ssl_enabled)}",
@@ -1627,7 +1839,6 @@ def _format_bytes(value: int) -> str:
         if size < 1024 or unit == "TiB":
             return f"{size:.1f} {unit}"
         size /= 1024
-    return f"{size:.1f} TiB"
 
 
 def _render_checks(title: str, checks: tuple[operational_inspection.InspectionCheck, ...]) -> tuple[list[str], bool]:
@@ -1701,22 +1912,12 @@ def _healthcheck_system() -> CommandResult:
     return CommandResult("\n".join(lines), exit_code=1 if has_fail else 0)
 
 
-def _app_health_ok(status: str, bootstrap_ready: bool, runtime_ready: bool) -> bool | None:
-    if not bootstrap_ready:
-        return False
-    if runtime_ready or status == "ready":
-        return True
-    if status == "down":
-        return False
-    return None
-
-
 def _healthcheck_app_domain(domain: str) -> CommandResult:
     site_error = _require_existing_site(domain)
     if site_error:
         return site_error
     health = site_health(domain)
-    ok = _app_health_ok(health.status, health.bootstrap_ready, health.runtime_ready)
+    ok = app_health_ok(health.status, health.bootstrap_ready, health.runtime_ready)
     line = f"{domain}: {_label(ok)} {health.status} - {health.message}"
     return CommandResult(line, exit_code=1 if ok is False else 0)
 
@@ -1840,25 +2041,233 @@ def handle_motd(args: argparse.Namespace) -> CommandResult:
     return CommandResult("\n".join(lines))
 
 
+def add_telemetry_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+    parser = _add_parser(subparsers, "telemetry", help="Inspect or control anonymous usage telemetry.")
+    commands = parser.add_subparsers(dest="telemetry_command")
+    for command in ("status", "enable", "disable"):
+        _add_parser(commands, command, help=f"{command.title()} anonymous usage telemetry.").set_defaults(
+            handler=handle_telemetry,
+        )
+
+
+def handle_telemetry(args: argparse.Namespace) -> CommandResult:
+    command = args.telemetry_command
+    if command == "enable":
+        telemetry.set_enabled(True)
+        return CommandResult("anonymous usage telemetry enabled")
+    if command == "disable":
+        telemetry.set_enabled(False)
+        return CommandResult("anonymous usage telemetry disabled")
+    if command == "status":
+        current = telemetry.status()
+        lines = [
+            _section("telemetry status"),
+            f"stored: {'enabled' if current['stored_enabled'] else 'disabled'}",
+            f"environment override: {'disabled' if current['environment_override'] else 'none'}",
+            f"effective: {'enabled' if current['effective_enabled'] else 'disabled'}",
+            f"endpoint: {'configured' if current['endpoint_configured'] else 'not configured (nothing is sent)'}",
+            f"last sent: {current['last_sent_at'] or 'never'}",
+            "payload:",
+            json.dumps(current["payload"], indent=2, sort_keys=True),
+        ]
+        return CommandResult("\n".join(lines))
+    return CommandResult("telemetry command required", exit_code=2)
+
+
 def add_panel_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
     parser = _add_parser(
         subparsers,
         "panel",
-        help="Serve the local browser control panel (loopback only).",
+        help="Serve or administer the local browser control panel.",
         epilog=(
-            "The panel binds to a loopback address and requires the printed token.\n"
+            "The panel binds to a loopback address.\n"
             "Remote access: ssh -L 8642:127.0.0.1:8642 <server>, then open the URL locally.\n"
         ),
     )
     parser.add_argument("--host", default="127.0.0.1", help="loopback address to bind")
     parser.add_argument("--port", type=int, default=panel.DEFAULT_PANEL_PORT, help="port to listen on")
-    parser.add_argument("--token", help="access token (default: generate a fresh one per run)")
+    parser.add_argument("--token", help="access token used only while no panel users exist")
+    parser.add_argument("--edge-service", action="store_true", help=argparse.SUPPRESS)
+    commands = parser.add_subparsers(dest="panel_command")
+
+    expose = _add_parser(commands, "expose", help="Publish or disable the panel through Traefik.")
+    exposure_action = expose.add_mutually_exclusive_group(required=True)
+    exposure_action.add_argument("--domain")
+    exposure_action.add_argument("--disable", action="store_true")
+    exposure_action.add_argument("--status", action="store_true")
+    expose.add_argument("--confirm", help="typed confirmation; must exactly match --domain")
+    expose.add_argument("--port", type=int, default=panel.DEFAULT_PANEL_PORT)
+    expose.set_defaults(handler=handle_panel_exposure)
+
+    service = _add_parser(commands, "service", help="Manage the edge-bound panel systemd service.")
+    service_commands = service.add_subparsers(dest="panel_service_command")
+    install = _add_parser(service_commands, "install", help="Install and start the panel service.")
+    install.add_argument("--port", type=int, default=panel.DEFAULT_PANEL_PORT)
+    install.set_defaults(handler=handle_panel_exposure)
+    _add_parser(service_commands, "remove", help="Stop and remove the panel service.").set_defaults(
+        handler=handle_panel_exposure,
+    )
+
+    users = _add_parser(commands, "user", help="Manage panel users and site assignments.")
+    user_commands = users.add_subparsers(dest="panel_user_command")
+
+    add = _add_parser(user_commands, "add", help="Add a panel user.")
+    add.add_argument("username")
+    add.add_argument("--role", required=True, choices=sorted(panel_auth.ROLES))
+    add.add_argument("--site", action="append", default=[], dest="sites")
+    add.add_argument("--password-stdin", action="store_true")
+    add.set_defaults(handler=handle_panel_auth)
+
+    remove = _add_parser(user_commands, "remove", help="Remove a panel user.")
+    remove.add_argument("username")
+    remove.set_defaults(handler=handle_panel_auth)
+
+    _add_parser(user_commands, "list", help="List panel users.").set_defaults(handler=handle_panel_auth)
+
+    password = _add_parser(user_commands, "set-password", help="Set a panel user password.")
+    password.add_argument("username")
+    password.add_argument("--password-stdin", action="store_true")
+    password.set_defaults(handler=handle_panel_auth)
+
+    role = _add_parser(user_commands, "set-role", help="Set a panel user role.")
+    role.add_argument("username")
+    role.add_argument("role", choices=sorted(panel_auth.ROLES))
+    role.set_defaults(handler=handle_panel_auth)
+
+    assign = _add_parser(user_commands, "assign-site", help="Assign a site to a panel user.")
+    assign.add_argument("username")
+    assign.add_argument("domain")
+    assign.set_defaults(handler=handle_panel_auth)
+
+    revoke = _add_parser(user_commands, "revoke-site", help="Revoke a panel user's site assignment.")
+    revoke.add_argument("username")
+    revoke.add_argument("domain")
+    revoke.set_defaults(handler=handle_panel_auth)
+
+    totp = _add_parser(commands, "totp", help="Manage a panel user's TOTP factor.")
+    totp_commands = totp.add_subparsers(dest="panel_totp_command")
+    for action in ("enable", "disable"):
+        child = _add_parser(totp_commands, action, help=f"{action.title()} TOTP for a panel user.")
+        child.add_argument("username")
+        child.set_defaults(handler=handle_panel_auth)
+
     parser.set_defaults(handler=handle_panel)
+
+
+def _panel_user_password(args: argparse.Namespace) -> tuple[str | None, CommandResult | None]:
+    return _required_secret(
+        getattr(args, "password_stdin", False),
+        prompt="Panel password: ",
+        stdin_error="panel password required on stdin",
+        tty_error="panel password prompt requires a TTY; use --password-stdin for scripts",
+        empty_error="panel password cannot be empty",
+    )
+
+
+def handle_panel_auth(args: argparse.Namespace) -> CommandResult:
+    try:
+        if args.panel_command == "user":
+            command = args.panel_user_command
+            if command == "list":
+                users = panel_auth.list_users()
+                if not users:
+                    return CommandResult("no panel users configured")
+                lines = [_section("panel users")]
+                for user in users:
+                    sites = ", ".join(user["sites"]) or "none"
+                    totp = "enabled" if user["totp_enabled"] else "disabled"
+                    lines.append(f"{user['username']}\trole={user['role']}\tsites={sites}\ttotp={totp}")
+                return CommandResult("\n".join(lines))
+            if command in {"add", "set-password"}:
+                password, error = _panel_user_password(args)
+                if error:
+                    return error
+                if command == "add":
+                    panel_auth.add_user(args.username, password, role=args.role, sites=args.sites)
+                    return CommandResult(f"panel user added: {args.username}")
+                panel_auth.set_password(args.username, password)
+                return CommandResult(f"panel password updated: {args.username}")
+            if command == "remove":
+                panel_auth.remove_user(args.username)
+                return CommandResult(f"panel user removed: {args.username}")
+            if command == "set-role":
+                panel_auth.set_role(args.username, args.role)
+                return CommandResult(f"panel role updated: {args.username} -> {args.role}")
+            if command == "assign-site":
+                panel_auth.assign_site(args.username, args.domain)
+                return CommandResult(f"panel site assigned: {args.username} -> {args.domain}")
+            if command == "revoke-site":
+                panel_auth.revoke_site(args.username, args.domain)
+                return CommandResult(f"panel site revoked: {args.username} -> {args.domain}")
+            return CommandResult("panel user command required", exit_code=2)
+        if args.panel_command == "totp":
+            if args.panel_totp_command == "enable":
+                if not sys.stdin.isatty():
+                    return CommandResult(
+                        "TOTP enrollment requires the browser setup/account panel or an interactive TTY",
+                        exit_code=2,
+                    )
+                secret, uri = panel_auth.begin_totp_enrollment(args.username)
+                print(_render_summary(
+                    "panel TOTP enrollment",
+                    [f"username: {args.username}", f"secret (shown once): {secret}", f"uri: {uri}"],
+                ))
+                code = input("Authenticator code: ").strip()
+                panel_auth.complete_totp_enrollment(args.username, code)
+                return CommandResult(f"panel TOTP enabled: {args.username}")
+            if args.panel_totp_command == "disable":
+                panel_auth.disable_totp(args.username)
+                return CommandResult(f"panel TOTP disabled: {args.username}")
+            return CommandResult("panel TOTP command required", exit_code=2)
+    except (OSError, ValueError) as exc:
+        return CommandResult(str(exc), exit_code=2)
+    return CommandResult("panel command required", exit_code=2)
+
+
+def handle_panel_exposure(args: argparse.Namespace) -> CommandResult:
+    try:
+        if args.panel_command == "expose":
+            if args.status:
+                status = panel_exposure.exposure_status()
+                lines = [
+                    _section("panel exposure status"),
+                    f"router: {'configured' if status['router_present'] else 'disabled'}",
+                    f"recognised: {_bool_text(status['recognised'])}",
+                    f"domain: {status['domain'] or 'unknown'}",
+                    f"service: {'installed' if status['service_installed'] else 'not installed'}",
+                ]
+                if status["router_present"] and not status["service_installed"]:
+                    lines.append("next: wpfy panel service install is required before the public panel is ready")
+                return CommandResult("\n".join(lines))
+            if args.disable:
+                result = panel_exposure.disable()
+            else:
+                confirmation = args.confirm
+                if confirmation is None:
+                    if not sys.stdin.isatty():
+                        return CommandResult(
+                            "typed confirmation required; pass --confirm with the exact panel domain",
+                            exit_code=2,
+                        )
+                    confirmation = input(f"Type {args.domain} to expose the panel: ")
+                result = panel_exposure.expose(args.domain, confirm=confirmation, port=args.port)
+        elif args.panel_command == "service":
+            if args.panel_service_command == "install":
+                result = panel_exposure.install_service(panel_exposure.edge_bind_address(), args.port)
+            elif args.panel_service_command == "remove":
+                result = panel_exposure.remove_service()
+            else:
+                return CommandResult("panel service command required", exit_code=2)
+        else:
+            return CommandResult("panel exposure command required", exit_code=2)
+    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+        return CommandResult(str(exc), exit_code=2)
+    return CommandResult(result.message, exit_code=result.exit_code)
 
 
 def handle_panel(args: argparse.Namespace) -> CommandResult:
     token = args.token or panel.generate_panel_token()
-    config = panel.PanelConfig(host=args.host, port=args.port, token=token)
+    config = panel.PanelConfig(host=args.host, port=args.port, token=token, edge_bind=args.edge_service)
     try:
         server = panel.make_panel_server(config)
     except ValueError as exc:
@@ -1867,14 +2276,25 @@ def handle_panel(args: argparse.Namespace) -> CommandResult:
         return CommandResult(f"panel could not bind {args.host}:{args.port}: {exc}", exit_code=2)
 
     actual_port = server.server_address[1]
-    print(
-        _render_summary("wpfy panel", [
+    if args.edge_service:
+        domain = panel_exposure.exposure_status().get("domain") or "configured panel domain"
+        summary = [
+            f"listening: http://{args.host}:{actual_port}/",
+            f"open: https://{domain}/",
+            "sign in with a configured panel user; press Ctrl+C to stop",
+        ]
+    else:
+        access = (
+            "sign in with a configured panel user; press Ctrl+C to stop"
+            if panel_auth.login_required()
+            else "the URL carries a one-time access token; press Ctrl+C to stop"
+        )
+        summary = [
             f"listening: http://{args.host}:{actual_port}/",
             f"open: {panel.panel_url(config, actual_port)}",
-            "the URL carries a one-time access token; press Ctrl+C to stop",
-        ]),
-        flush=True,
-    )
+            access,
+        ]
+    print(_render_summary("wpfy panel", summary), flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -1884,7 +2304,6 @@ def handle_panel(args: argparse.Namespace) -> CommandResult:
     return CommandResult("panel stopped")
 
 
-SAFE_USERNAME_RE: Final = re.compile(r"^[A-Za-z0-9_.@-]+$")
 PASSWORD_SYMBOLS: Final = "!#$%&()*+,-./:;<=>?@[]^_{|}~"
 
 
@@ -1964,18 +2383,9 @@ def handle_utility_uid(args: argparse.Namespace) -> CommandResult:
     )
 
 
-def _safe_htpasswd_username(value: str) -> bool:
-    return bool(SAFE_USERNAME_RE.fullmatch(value))
-
-
-def _htpasswd_sha(password: str) -> str:
-    digest = hashlib.sha1(password.encode("utf-8")).digest()
-    return "{SHA}" + base64.b64encode(digest).decode("ascii")
-
-
 def handle_utility_htpasswd(args: argparse.Namespace) -> CommandResult:
     username = args.username.strip()
-    if not username or not _safe_htpasswd_username(username):
+    if not username or not site_security._safe_htpasswd_username(username):
         return CommandResult("invalid username: use letters, digits, '_', '.', '@', or '-'", exit_code=2)
     generated = not args.password_stdin
     if generated:
@@ -1984,10 +2394,384 @@ def handle_utility_htpasswd(args: argparse.Namespace) -> CommandResult:
         password = sys.stdin.readline().rstrip("\r\n")
         if not password:
             return CommandResult("password required on stdin", exit_code=2)
-    htpasswd = f"{username}:{_htpasswd_sha(password)}"
+    htpasswd = f"{username}:{site_security._htpasswd_sha(password)}"
     if generated:
         return CommandResult("\n".join([f"username: {username}", f"password: {password}", f"htpasswd: {htpasswd}"]))
     return CommandResult(f"htpasswd: {htpasswd}")
+
+
+def _database_command_result(result: site_database.DatabaseResult) -> CommandResult:
+    lines = [result.message] if result.message else []
+    if result.one_time_password:
+        lines.append(f"generated password (shown once): {result.one_time_password}")
+    return CommandResult("\n".join(lines), exit_code=result.exit_code)
+
+
+def _db_password_argument(value: str | None) -> tuple[str | None, CommandResult | None]:
+    if value is None:
+        return None, None
+    if value == "-":
+        password = sys.stdin.readline().rstrip("\r\n")
+        if not password:
+            return None, CommandResult("database password required on stdin", exit_code=2)
+        return password, None
+    if value == "prompt":
+        if not sys.stdin.isatty():
+            return None, CommandResult("database password prompt requires a TTY; use --password -", exit_code=2)
+        password = getpass.getpass("Database password: ")
+        if not password:
+            return None, CommandResult("database password cannot be empty", exit_code=2)
+        return password, None
+    return None, CommandResult("use --password - or --password prompt; raw passwords are not accepted", exit_code=2)
+
+
+def handle_db(args: argparse.Namespace) -> CommandResult:
+    domain = args.domain
+    command = args.db_command
+    try:
+        if command == "list":
+            return _database_command_result(site_database.list_databases(domain))
+        if command == "users":
+            return _database_command_result(site_database.list_users(domain))
+        if command == "create":
+            return _database_command_result(site_database.create_database(domain, args.name))
+        if command == "drop":
+            return _database_command_result(site_database.drop_database(domain, args.name))
+        if command == "user-drop":
+            return _database_command_result(site_database.drop_user(domain, args.user))
+        if command == "grant":
+            return _database_command_result(site_database.grant(domain, args.user, args.database))
+        if command == "user-add":
+            password, error = _db_password_argument(args.password)
+            if error:
+                return error
+            return _database_command_result(
+                site_database.create_user(domain, args.user, password=password, grants=args.database),
+            )
+        if command == "user-password":
+            password, error = _db_password_argument(args.password)
+            if error:
+                return error
+            return _database_command_result(site_database.set_user_password(domain, args.user, password=password))
+        if command == "adminer":
+            result = site_configuration.configure_adminer(
+                domain,
+                enabled=args.adminer_action == "on",
+                port=args.port,
+            )
+            return CommandResult(result.message, exit_code=result.exit_code)
+    except (ValueError, FileNotFoundError) as exc:
+        return CommandResult(str(exc), exit_code=2)
+    return CommandResult("database command required", exit_code=2)
+
+
+def add_db_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+    parser = _add_parser(subparsers, "db", help="Manage per-site databases and database users.")
+    parser.add_argument("domain")
+    commands = parser.add_subparsers(dest="db_command")
+    _add_parser(commands, "list", help="List non-system databases.").set_defaults(handler=handle_db)
+    _add_parser(commands, "users", help="List scoped database users.").set_defaults(handler=handle_db)
+
+    for name, help_text in (("create", "Create a database."), ("drop", "Drop a database.")):
+        child = _add_parser(commands, name, help=help_text)
+        child.add_argument("name")
+        child.set_defaults(handler=handle_db)
+
+    user_add = _add_parser(commands, "user-add", help="Create a scoped database user.")
+    user_add.add_argument("user")
+    user_add.add_argument("--password", nargs="?", const="prompt", help="password, '-' for stdin, or prompt")
+    user_add.add_argument("--database")
+    user_add.set_defaults(handler=handle_db)
+
+    user_drop = _add_parser(commands, "user-drop", help="Drop a database user.")
+    user_drop.add_argument("user")
+    user_drop.set_defaults(handler=handle_db)
+
+    user_password = _add_parser(commands, "user-password", help="Set a database user password.")
+    user_password.add_argument("user")
+    user_password.add_argument("--password", nargs="?", const="prompt", help="password, '-' for stdin, or prompt")
+    user_password.set_defaults(handler=handle_db)
+
+    grant_parser = _add_parser(commands, "grant", help="Grant a user access to one database.")
+    grant_parser.add_argument("user")
+    grant_parser.add_argument("database")
+    grant_parser.set_defaults(handler=handle_db)
+
+    adminer = _add_parser(commands, "adminer", help="Enable or disable the loopback-only Adminer service.")
+    adminer.add_argument("adminer_action", choices=("on", "off"))
+    adminer.add_argument("--port", type=int)
+    adminer.set_defaults(handler=handle_db)
+
+
+def handle_site_security(args: argparse.Namespace) -> CommandResult:
+    try:
+        if args.security_command == "show":
+            return CommandResult(json.dumps(site_security.load_security(args.domain), indent=2, sort_keys=True))
+        if args.security_command == "deny-ip":
+            operation = (
+                site_security.add_deny_ip
+                if args.security_action == "add"
+                else site_security.remove_deny_ip
+            )
+            result = operation(args.domain, args.cidr)
+        elif args.security_command == "ua-block":
+            operation = (
+                site_security.add_ua_block
+                if args.security_action == "add"
+                else site_security.remove_ua_block
+            )
+            result = operation(args.domain, args.pattern)
+        elif args.security_command == "basic-auth":
+            enabled = args.security_action == "on"
+            password = None
+            if enabled and args.password_stdin:
+                password = sys.stdin.readline().rstrip("\r\n")
+                if not password:
+                    return CommandResult("basic-auth password required on stdin", exit_code=2)
+            elif enabled and sys.stdin.isatty():
+                password = getpass.getpass("Basic-auth password (leave empty to generate): ")
+                password = password or None
+            result = site_security.set_basic_auth(
+                args.domain,
+                enabled=enabled,
+                username=args.username,
+                password=password,
+            )
+        elif args.security_command == "login-rate-limit":
+            result = site_security.set_login_rate_limit(args.domain, args.security_action == "on")
+        elif args.security_command == "fail2ban":
+            result = site_security.set_fail2ban(args.domain, args.security_action == "on")
+        elif args.security_command == "cf-only":
+            enabled = args.security_action == "on"
+            if enabled:
+                preflight = site_security.security_preflight(args.domain, {"cloudflare_only": True})
+                if preflight.warnings and not args.force:
+                    return CommandResult(
+                        "\n".join(["WARNING: " + warning for warning in preflight.warnings])
+                        + "\nre-run with --force to proceed",
+                        exit_code=2,
+                    )
+                warning_prefix = "\n".join("WARNING: " + warning for warning in preflight.warnings)
+            else:
+                warning_prefix = ""
+            result = site_security.set_cloudflare_only(args.domain, enabled)
+            if warning_prefix:
+                result = site_security.SecurityResult(
+                    result.exit_code,
+                    warning_prefix + "\n" + result.message,
+                    result.changed,
+                    result.one_time_password,
+                )
+        else:
+            return CommandResult("security command required", exit_code=2)
+    except (ValueError, TypeError, FileNotFoundError, OSError, RuntimeError) as exc:
+        return CommandResult(str(exc), exit_code=2)
+    message = result.message
+    if result.one_time_password:
+        message += f"\ngenerated password (shown once): {result.one_time_password}"
+    return CommandResult(message, exit_code=result.exit_code)
+
+
+def add_site_security_parser(site_subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+    parser = _add_parser(site_subparsers, "security", help="Manage per-site nginx access controls.")
+    parser.add_argument("domain")
+    commands = parser.add_subparsers(dest="security_command")
+    _add_parser(commands, "show", help="Show the persisted per-site security state.").set_defaults(
+        handler=handle_site_security,
+    )
+
+    deny = _add_parser(commands, "deny-ip", help="Add or remove a denied client CIDR.")
+    deny_actions = deny.add_subparsers(dest="security_action")
+    for action in ("add", "remove"):
+        child = _add_parser(deny_actions, action, help=f"{action.title()} a denied client CIDR.")
+        child.add_argument("cidr")
+        child.set_defaults(handler=handle_site_security)
+
+    user_agent = _add_parser(commands, "ua-block", help="Add or remove a blocked user-agent pattern.")
+    user_agent_actions = user_agent.add_subparsers(dest="security_action")
+    for action in ("add", "remove"):
+        child = _add_parser(user_agent_actions, action, help=f"{action.title()} a user-agent pattern.")
+        child.add_argument("pattern")
+        child.set_defaults(handler=handle_site_security)
+
+    basic_auth = _add_parser(commands, "basic-auth", help="Enable or disable per-site HTTP basic auth.")
+    basic_auth_actions = basic_auth.add_subparsers(dest="security_action")
+    basic_on = _add_parser(basic_auth_actions, "on", help="Enable basic auth; prompt or read the password.")
+    basic_on.add_argument("--username", required=True)
+    basic_on.add_argument("--password-stdin", action="store_true", help="read the password from stdin")
+    basic_on.set_defaults(handler=handle_site_security)
+    basic_off = _add_parser(basic_auth_actions, "off", help="Disable basic auth and revoke the stored hash.")
+    basic_off.set_defaults(handler=handle_site_security, username=None, password_stdin=False)
+
+    login_rate_limit = _add_parser(
+        commands, "login-rate-limit", help="Enable or disable WordPress wp-login.php rate limiting.",
+    )
+    login_rate_limit_actions = login_rate_limit.add_subparsers(dest="security_action")
+    for action in ("on", "off"):
+        child = _add_parser(login_rate_limit_actions, action, help=f"Turn WordPress login rate limiting {action}.")
+        child.set_defaults(handler=handle_site_security)
+
+    fail2ban = _add_parser(commands, "fail2ban", help="Enable or disable WordPress fail2ban protection.")
+    fail2ban_actions = fail2ban.add_subparsers(dest="security_action")
+    for action in ("on", "off"):
+        child = _add_parser(fail2ban_actions, action, help=f"Turn WordPress fail2ban protection {action}.")
+        child.set_defaults(handler=handle_site_security)
+
+    cf_only = _add_parser(commands, "cf-only", help="Enforce Cloudflare-only access at Traefik.")
+    cf_actions = cf_only.add_subparsers(dest="security_action")
+    cf_on = _add_parser(cf_actions, "on", help="Enable the Cloudflare edge allow list.")
+    cf_on.add_argument("--force", action="store_true", help="proceed despite lockout preflight warnings")
+    cf_on.set_defaults(handler=handle_site_security)
+    cf_off = _add_parser(cf_actions, "off", help="Remove the Cloudflare edge allow list.")
+    cf_off.set_defaults(handler=handle_site_security, force=False)
+
+
+def handle_site_nginx(args: argparse.Namespace) -> CommandResult:
+    try:
+        if args.nginx_command == "show":
+            result = get_nginx_custom(args.domain)
+        elif args.nginx_command == "validate":
+            result = validate_nginx_custom(args.domain)
+        elif args.nginx_command == "reset":
+            result = set_nginx_custom(args.domain, "")
+        elif args.nginx_command == "set":
+            if not args.stdin:
+                return CommandResult("nginx set requires --stdin", exit_code=2)
+            result = set_nginx_custom(args.domain, sys.stdin.read())
+        else:
+            return CommandResult("nginx command required", exit_code=2)
+    except (ValueError, FileNotFoundError) as exc:
+        return CommandResult(str(exc), exit_code=2)
+    return CommandResult(result.message, exit_code=result.exit_code)
+
+
+def add_site_nginx_parser(site_subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+    parser = _add_parser(site_subparsers, "nginx", help="Inspect or safely update the generated vhost include.")
+    parser.add_argument("domain")
+    commands = parser.add_subparsers(dest="nginx_command")
+    commands_info = (
+        ("show", "Show the operator-owned nginx snippet."),
+        ("validate", "Validate the current snippet."),
+        ("reset", "Replace the snippet with an empty validated file."),
+    )
+    for name, help_text in commands_info:
+        child = _add_parser(commands, name, help=help_text)
+        child.set_defaults(handler=handle_site_nginx)
+    set_parser = _add_parser(commands, "set", help="Read a snippet from stdin and validate it before install.")
+    set_parser.add_argument("--stdin", action="store_true")
+    set_parser.set_defaults(handler=handle_site_nginx)
+
+
+def handle_site_files(args: argparse.Namespace) -> CommandResult:
+    try:
+        if args.site_files_command == "ls":
+            result = files.list_files(args.domain, args.path)
+            lines = [
+                f"{entry['mode']}\t{entry['type']}\t{entry['size']}\t{entry['modified']}\t{ascii(entry['name'])[1:-1]}"
+                for entry in result["entries"]
+            ]
+            return CommandResult("\n".join(lines))
+        if args.site_files_command == "cat":
+            return CommandResult(files.read_file(args.domain, args.path)["content"], raw_output=True)
+        if args.site_files_command == "put":
+            source = Path(args.content_file)
+            with source.open("rb") as stream:
+                result = files.upload_file(args.domain, args.path, stream, os.fstat(stream.fileno()).st_size)
+            return CommandResult(f"file written: {result['path']}")
+        if args.site_files_command == "rm":
+            result = files.delete_path(args.domain, args.path, confirm=args.confirm)
+            return CommandResult(f"file removed: {result['path']}")
+    except (OSError, TypeError, ValueError) as exc:
+        return CommandResult(str(exc), exit_code=2)
+    return CommandResult("site files command required", exit_code=2)
+
+
+def add_site_files_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+    parser = _add_parser(subparsers, "files", help="Manage files inside the site's app directory.")
+    parser.add_argument("domain")
+    commands = parser.add_subparsers(dest="site_files_command")
+
+    list_parser = _add_parser(commands, "ls", help="List files in the app directory.")
+    list_parser.add_argument("path", nargs="?", default="")
+    list_parser.set_defaults(handler=handle_site_files)
+
+    cat_parser = _add_parser(commands, "cat", help="Read a text file within the editor size limit.")
+    cat_parser.add_argument("path")
+    cat_parser.set_defaults(handler=handle_site_files)
+
+    put_parser = _add_parser(commands, "put", help="Write a host file into the app directory.")
+    put_parser.add_argument("path")
+    put_parser.add_argument("--content-file", required=True)
+    put_parser.set_defaults(handler=handle_site_files)
+
+    remove_parser = _add_parser(commands, "rm", help="Remove a file or directory from the app directory.")
+    remove_parser.add_argument("path")
+    remove_parser.add_argument("--confirm")
+    remove_parser.set_defaults(handler=handle_site_files)
+
+
+def handle_site_cron(args: argparse.Namespace) -> CommandResult:
+    try:
+        if args.site_cron_command == "list":
+            jobs = site_cron.load_cron(args.domain)
+            if not jobs:
+                return CommandResult(_render_summary(f"site cron: {args.domain}", ["no cron jobs configured"]))
+            lines = []
+            for job in jobs:
+                state = "enabled" if job["enabled"] else "disabled"
+                lines.append(
+                    f"{job['id']}\t{state}\t{job['schedule']}\tservice={job['service']}\t"
+                    f"timeout={job['timeout']}\t{job['command']}"
+                )
+            return CommandResult(_render_summary(f"site cron: {args.domain}", lines))
+        if args.site_cron_command == "add":
+            job = site_cron.add_job(
+                args.domain,
+                schedule=args.schedule,
+                command=args.command,
+                service=args.service,
+                timeout=args.timeout,
+            )
+            return CommandResult(f"cron job added: {job['id']}")
+        if args.site_cron_command == "remove":
+            site_cron.remove_job(args.domain, args.id)
+            return CommandResult(f"cron job removed: {args.id}")
+        if args.site_cron_command in {"enable", "disable"}:
+            enabled = args.site_cron_command == "enable"
+            site_cron.set_enabled(args.domain, args.id, enabled)
+            return CommandResult(f"cron job {'enabled' if enabled else 'disabled'}: {args.id}")
+        if args.site_cron_command == "run":
+            result = site_cron.run_job(args.domain, args.id)
+            line = f"cron job {args.id}: {result.outcome.upper()} duration={result.duration:.3f}s"
+            return CommandResult(line, exit_code=result.exit_code)
+    except (OSError, TypeError, ValueError) as exc:
+        return CommandResult(str(exc), exit_code=2)
+    return CommandResult("site cron command required", exit_code=2)
+
+
+def add_site_cron_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+    parser = _add_parser(
+        subparsers,
+        "cron",
+        help="Manage scheduled commands inside this site's containers.",
+    )
+    parser.add_argument("domain")
+    commands = parser.add_subparsers(dest="site_cron_command")
+
+    list_parser = _add_parser(commands, "list", help="List the site's cron jobs.")
+    list_parser.set_defaults(handler=handle_site_cron)
+
+    add_parser = _add_parser(commands, "add", help="Add a scheduled container command.")
+    add_parser.add_argument("--schedule", required=True)
+    add_parser.add_argument("--command", required=True)
+    add_parser.add_argument("--service", default="app")
+    add_parser.add_argument("--timeout", type=int, default=site_cron.DEFAULT_TIMEOUT)
+    add_parser.set_defaults(handler=handle_site_cron)
+
+    for name in ("remove", "enable", "disable", "run"):
+        child = _add_parser(commands, name, help=f"{name.capitalize()} one cron job.")
+        child.add_argument("id")
+        child.set_defaults(handler=handle_site_cron)
 
 
 def add_site_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
@@ -2085,6 +2869,11 @@ def add_site_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentPars
     wp.add_argument("wp_args", nargs=argparse.REMAINDER)
     wp.set_defaults(handler=handle_site_wp)
 
+    add_site_files_parser(site_subparsers)
+    add_site_cron_parser(site_subparsers)
+    add_site_nginx_parser(site_subparsers)
+    add_site_security_parser(site_subparsers)
+
     site_action_names = ("delete", "list", "info", "show", "status")
     for name in site_action_names:
         help_text = {
@@ -2110,6 +2899,12 @@ def add_site_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentPars
     update.add_argument("domain")
     update.add_argument("--php", choices=SUPPORTED_PHP_VERSIONS)
     update.add_argument("--wpfc", action="store_true")
+    update.add_argument("--wpsc", action="store_true")
+    update.add_argument("--wprocket", action="store_true")
+    update.add_argument("--wpce", action="store_true")
+    update.add_argument("--w3tc", action="store_true")
+    update.add_argument("--wpfastest", action="store_true")
+    update.add_argument("--flyingpress", action="store_true")
     update.add_argument("--wpredis", action="store_true")
     update.add_argument("-le", "--letsencrypt", nargs="?", const="default", default=None)
     update.add_argument(
@@ -2257,6 +3052,15 @@ def add_log_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParse
     log_cron.add_argument("--lines", type=int, default=100)
     log_cron.set_defaults(handler=handle_log_cron)
 
+    log_events = _add_parser(
+        log_subparsers,
+        "events",
+        help="Show recent wpfy operation events.",
+    )
+    log_events.add_argument("--domain")
+    log_events.add_argument("--limit", type=int, default=200)
+    log_events.set_defaults(handler=handle_log_events)
+
 
 def handle_log_show(args: argparse.Namespace) -> CommandResult:
     domain = args.domain
@@ -2285,6 +3089,11 @@ def handle_log_show(args: argparse.Namespace) -> CommandResult:
 def handle_log_cron(args: argparse.Namespace) -> CommandResult:
     result = cron.read_cron_log(args.lines)
     return CommandResult(result.message, exit_code=result.exit_code)
+
+
+def handle_log_events(args: argparse.Namespace) -> CommandResult:
+    rows = events.list_events(limit=args.limit, domain=args.domain)
+    return CommandResult("\n".join(json.dumps(row, sort_keys=True) for row in rows))
 
 
 def handle_log_reset(args: argparse.Namespace) -> CommandResult:
@@ -2334,9 +3143,10 @@ def make_site_handler(name: str):
                 return CommandResult(_render_summary("managed sites", ["no managed sites found"]))
             lines = [_section(f"managed sites ({len(sites)})")]
             for site in sites:
+                ssl_status, _certificate = _site_ssl_observation(site)
                 lines.append(
                     f"{site.get('domain', '?')}\t{site.get('flavor', '?')}\t"
-                    f"ssl={_enabled_text(site.get('ssl_enabled', site.get('ssl', 'disabled')))}\t"
+                    f"ssl={ssl_status}\t"
                     f"cache={site.get('cache_type', 'basic')}"
                 )
             return CommandResult("\n".join(lines))
@@ -2348,6 +3158,12 @@ def make_site_handler(name: str):
                 info = site_info(domain)
             except (FileNotFoundError, ValueError) as exc:
                 return CommandResult(str(exc), exit_code=2)
+            ssl_status, certificate = _site_ssl_observation(info)
+            certificate_status = certificate.get("status", "unknown")
+            issuer = certificate.get("issuer") or "unknown"
+            certificate_line = f"certificate: {certificate_status}"
+            if certificate_status == "issued":
+                certificate_line += f"; issuer={issuer}"
             lines = [
                 _section(f"site info: {info['domain']}"),
                 f"domain: {info['domain']}",
@@ -2355,7 +3171,8 @@ def make_site_handler(name: str):
                 f"path: {info['path']}",
                 f"compose: {info['compose']}",
                 f"env: {info['env']}",
-                f"ssl: {_enabled_text(info.get('ssl', 'disabled'))}",
+                f"ssl: {ssl_status}",
+                certificate_line,
                 f"redis: {_enabled_text(info.get('redis', '0'))}",
             ]
             meta = registry.get_site(domain)
@@ -2383,12 +3200,16 @@ def make_site_handler(name: str):
             except (FileNotFoundError, ValueError) as exc:
                 return CommandResult(str(exc), exit_code=2)
             health = site_health(domain)
+            ssl_status, certificate = _site_ssl_observation(info)
+            certificate_status = certificate.get("status", "unknown")
             lines = [
                 _section(f"site status: {info['domain']}"),
                 f"domain: {info['domain']}",
                 f"flavor: {info.get('flavor', 'unknown')}",
                 f"path: {info['path']}",
                 f"compose: {info['compose']}",
+                f"ssl: {ssl_status}",
+                f"certificate: {certificate_status}",
                 f"status: {health.status}",
                 f"scaffold: {_bool_text(health.scaffold_ready)}",
                 f"bootstrap: {_bool_text(health.bootstrap_ready)}",
@@ -2414,43 +3235,41 @@ def make_site_handler(name: str):
                 if answer.strip().lower() not in ("y", "yes"):
                     return CommandResult(f"delete aborted")
             try:
-                backup_result = backup_site(domain, require_database=True)
-                if backup_result.exit_code != 0 or backup_result.skipped:
-                    return CommandResult(
-                        _render_summary(
-                            "site delete",
-                            [
-                                f"domain: {domain}",
-                                _step_line("backup", backup_result),
-                                "runtime: SKIP blocked by backup failure",
-                                "files: kept",
-                            ],
-                        ),
-                        exit_code=backup_result.exit_code or 1,
-                    )
-                stop_result = stop_site_runtime(domain, remove_volumes=True)
-                if stop_result.exit_code != 0 or stop_result.skipped:
-                    return CommandResult(
-                        _render_summary(
-                            "site delete",
-                            [
-                                f"domain: {domain}",
-                                _step_line("backup", backup_result),
-                                _step_line("runtime", stop_result),
-                                "files: kept",
-                            ],
-                        ),
-                        exit_code=stop_result.exit_code or 1,
-                    )
-                removed = remove_site_scaffold(domain)
-            except (FileNotFoundError, ValueError) as exc:
-                return CommandResult(str(exc), exit_code=2)
-            if removed:
+                result = site_lifecycle.delete_site(site_lifecycle.DeleteSiteRequest(domain=domain, force=force))
+            except site_lifecycle.SiteLifecycleError as exc:
+                return CommandResult(str(exc), exit_code=exc.exit_code)
+            if result.backup.exit_code != 0 or result.backup.skipped:
+                return CommandResult(
+                    _render_summary(
+                        "site delete",
+                        [
+                            f"domain: {domain}",
+                            _step_line("backup", result.backup),
+                            "runtime: SKIP blocked by backup failure",
+                            "files: kept",
+                        ],
+                    ),
+                    exit_code=result.exit_code,
+                )
+            if result.runtime.exit_code != 0 or result.runtime.skipped:
+                return CommandResult(
+                    _render_summary(
+                        "site delete",
+                        [
+                            f"domain: {domain}",
+                            _step_line("backup", result.backup),
+                            _step_line("runtime", result.runtime),
+                            "files: kept",
+                        ],
+                    ),
+                    exit_code=result.exit_code,
+                )
+            if result.removed:
                 lines = [
                     _section("site deleted"),
                     f"domain: {domain}",
-                    _step_line("backup", backup_result),
-                    _step_line("runtime", stop_result),
+                    _step_line("backup", result.backup),
+                    _step_line("runtime", result.runtime),
                     "files: removed",
                 ]
                 return CommandResult("\n".join(lines))
@@ -2550,12 +3369,43 @@ def handle_stack_migrate(args: argparse.Namespace) -> CommandResult:
     return CommandResult(_render_summary("stack migrate", ["not implemented for Docker-first wpfy in v1"]))
 
 
+def _site_cache_selection(args: argparse.Namespace) -> tuple[str, str, str] | CommandResult:
+    base_flags = [
+        flag for flag in ("html", "mysql", "wp", "wpsubdir", "wpsubdomain")
+        if getattr(args, flag, False)
+    ]
+    page_flags = {
+        "wpfc": "wpfc",
+        "wpsc": "wp-super-cache",
+        "wprocket": "wp-rocket",
+        "wpce": "cache-enabler",
+        "w3tc": "w3-total-cache",
+        "wpfastest": "wp-fastest-cache",
+        "flyingpress": "flying-press",
+    }
+    selected_page = [plugin for flag, plugin in page_flags.items() if getattr(args, flag, False)]
+    if len(base_flags) > 1:
+        return CommandResult("site type flags are mutually exclusive", exit_code=2)
+    if len(selected_page) > 1:
+        return CommandResult("page-cache flags are mutually exclusive", exit_code=2)
+    if selected_page and base_flags and base_flags[0] in {"html", "mysql"}:
+        return CommandResult("page-cache flags require a WordPress site", exit_code=2)
+    page_cache = selected_page[0] if selected_page else "none"
+    object_cache = "redis" if getattr(args, "wpredis", False) else "none"
+    flavor = base_flags[0] if base_flags else "wp" if selected_page or object_cache == "redis" else "site"
+    return flavor, page_cache, object_cache
+
+
 def handle_site_create(args: argparse.Namespace) -> CommandResult:
-    flavor_flags = [flag for flag in ("html", "mysql", "wp", "wpfc", "wpredis", "wpsc", "wprocket", "wpce", "wpsubdir", "wpsubdomain") if getattr(args, flag)]
-    flavor = flavor_flags[0] if flavor_flags else "site"
+    selection = _site_cache_selection(args)
+    if isinstance(selection, CommandResult):
+        return selection
+    flavor, page_cache, object_cache = selection
     request = site_lifecycle.CreateSiteRequest(
         domain=args.domain,
         flavor=flavor,
+        page_cache=page_cache,
+        object_cache=object_cache,
         php_version=getattr(args, "php", DEFAULT_PHP_VERSION),
         letsencrypt=getattr(args, "letsencrypt", None),
         dns_provider=getattr(args, "dns", None),
@@ -2603,6 +3453,9 @@ def handle_site_create(args: argparse.Namespace) -> CommandResult:
             wordpress_admin_user=result.wordpress_admin_user,
             generated_password=result.generated_password,
             preflight_message=result.preflight_message,
+            page_cache=page_cache,
+            object_cache=object_cache,
+            cache_message=result.cache_message,
             created=result.created,
         ),
         exit_code=result.exit_code,
@@ -2611,10 +3464,23 @@ def handle_site_create(args: argparse.Namespace) -> CommandResult:
 
 def handle_site_update(args: argparse.Namespace) -> CommandResult:
     domain = args.domain
+    page_flags = {
+        "wpfc": "wpfc",
+        "wpsc": "wp-super-cache",
+        "wprocket": "wp-rocket",
+        "wpce": "cache-enabler",
+        "w3tc": "w3-total-cache",
+        "wpfastest": "wp-fastest-cache",
+        "flyingpress": "flying-press",
+    }
+    selected_page = [plugin for flag, plugin in page_flags.items() if getattr(args, flag, False)]
+    if len(selected_page) > 1:
+        return CommandResult("page-cache flags are mutually exclusive", exit_code=2)
     request = site_lifecycle.UpdateSiteRequest(
         domain=domain,
         php_version=args.php,
-        wpfc=args.wpfc,
+        page_cache=selected_page[0] if selected_page else None,
+        object_cache="redis" if args.wpredis else None,
         wpredis=args.wpredis,
         wpsubdir=args.wpsubdir,
         wpsubdomain=args.wpsubdomain,
@@ -2707,11 +3573,12 @@ def handle_site_ssl(args: argparse.Namespace) -> CommandResult:
         return CommandResult(str(exc), exit_code=exc.exit_code)
 
     lines = [
-        _section("ssl enabled"),
+        _section("ssl requested"),
         f"domain: {domain}",
         f"preflight: {result.preflight_message}",
         f"scaffold: {_site_count_summary(list(result.touched))}",
         _step_line("runtime", result.runtime),
+        "certificate: requested; not yet verified",
     ]
     if result.wordpress_message:
         lines.append(f"wordpress: {result.wordpress_message}")
@@ -3026,6 +3893,36 @@ def handle_cron(args: argparse.Namespace) -> CommandResult:
     return CommandResult("cron command required", exit_code=2)
 
 
+def _metrics_sample_line(sample: metrics.Sample) -> str:
+    return (
+        f"{sample.timestamp} scope={sample.scope} cpu={sample.cpu_percent:.2f}% "
+        f"memory={sample.memory_used}/{sample.memory_total} "
+        f"disk={sample.disk_used}/{sample.disk_total} load1={sample.load1:.2f}"
+    )
+
+
+def handle_metrics(args: argparse.Namespace) -> CommandResult:
+    try:
+        if args.metrics_command == "sample":
+            result = metrics.sample_once()
+            lines = [_metrics_sample_line(sample) for sample in result.samples]
+            lines.extend(f"WARN {warning}" for warning in result.warnings)
+            return CommandResult(_render_summary("metrics sample", lines))
+        if args.metrics_command == "show":
+            samples = metrics.read_samples(args.scope, args.range_key)
+            lines = [f"scope={args.scope} range={args.range_key}"]
+            lines.extend(_metrics_sample_line(sample) for sample in samples)
+            if not samples:
+                lines.append("no samples")
+            return CommandResult(_render_summary("metrics", lines))
+        if args.metrics_command == "prune":
+            deleted = metrics.prune()
+            return CommandResult(f"metrics prune: deleted {deleted} row(s)")
+    except Exception as exc:
+        return CommandResult(f"metrics {args.metrics_command or 'command'} failed: {exc}", exit_code=1)
+    return CommandResult("metrics command required", exit_code=2)
+
+
 def _smtp_password_from_args(args: argparse.Namespace) -> tuple[str | None, CommandResult | None]:
     return _required_secret(
         getattr(args, "password_stdin", False),
@@ -3260,8 +4157,13 @@ def run(argv: Iterable[str] | None = None) -> int:
         parser.print_help()
         return 0
 
+    if getattr(args, "command", None) != "telemetry":
+        telemetry.maybe_send_async()
     result = args.handler(args)
-    print(result.message)
+    if result.raw_output:
+        sys.stdout.write(result.message)
+    else:
+        print(result.message)
     return result.exit_code
 
 

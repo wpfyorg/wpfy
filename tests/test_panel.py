@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import importlib
+from io import BytesIO
 import json
+import socket
 import threading
 import urllib.error
 import urllib.request
@@ -21,10 +23,12 @@ def _seed_site(paths, domain: str = "example.com") -> Path:
         "SITE_FLAVOR=wp\n"
         "PHP_VERSION=8.4\n"
         "LETSENCRYPT_MODE=disabled\n"
+        "SITE_UID=1806\n"
         f"MARIADB_PASSWORD={SECRET_MARKER}\n",
         encoding="utf-8",
     )
     (site / "compose.yaml").write_text("services: {}\n", encoding="utf-8")
+    (site / "app").mkdir(exist_ok=True)
     return site
 
 
@@ -66,6 +70,38 @@ def _request(base_url: str, path: str, *, token: str | None = TEST_TOKEN, method
         return exc.code, exc.read().decode("utf-8"), exc.headers
 
 
+def _raw_request(base_url: str, path: str, *, method: str = "GET", raw: bytes | None = None):
+    request = urllib.request.Request(f"{base_url}{path}", method=method)
+    request.add_header("Authorization", f"Bearer {TEST_TOKEN}")
+    if raw is not None:
+        request.add_header("Content-Type", "application/octet-stream")
+    try:
+        with urllib.request.urlopen(request, data=raw, timeout=10) as response:
+            return response.status, response.read(), response.headers
+    except urllib.error.HTTPError as exc:
+        return exc.code, exc.read(), exc.headers
+
+
+def test_run_token_principal_supports_identity_and_totp_routes(panel_server):
+    base_url, _ = panel_server
+
+    status, body, _ = _request(base_url, "/api/auth/me")
+    assert status == 200
+    assert json.loads(body) == {
+        "username": "run-token-admin",
+        "role": "admin",
+        "sites": [],
+    }
+
+    status, body, _ = _request(base_url, "/api/auth/totp", method="POST", body={})
+    assert status == 409
+    assert "panel user not found" in body
+
+    status, body, _ = _request(base_url, "/api/auth/totp", method="DELETE")
+    assert status == 400
+    assert "panel user not found" in body
+
+
 def test_api_requires_token(panel_server):
     base_url, _ = panel_server
     status, body, _ = _request(base_url, "/api/overview", token=None)
@@ -86,6 +122,31 @@ def test_overview_reports_state(panel_server):
     payload = json.loads(body)
     assert payload["site_count"] == 1
     assert payload["version"]
+
+
+def test_unhandled_api_exception_returns_safe_500(panel_server, monkeypatch, caplog):
+    import wpfy.panel as panel
+
+    def explode(*args):
+        raise TypeError("private failure detail")
+
+    routes = tuple(
+        panel.Route(route.method, route.pattern, explode, route.meta)
+        if route.meta.action == "system.overview" else route
+        for route in panel._ROUTES
+    )
+    monkeypatch.setattr(panel, "_ROUTES", routes)
+    caplog.set_level("ERROR", logger="wpfy.panel")
+
+    status, raw_body, headers = _raw_request(panel_server[0], "/api/overview", raw=b"unread")
+    body = raw_body.decode("utf-8")
+
+    assert status == 500
+    assert json.loads(body) == {"error": "internal server error"}
+    assert "private failure detail" not in body
+    assert headers["Connection"] == "close"
+    assert "unhandled panel API error" in caplog.text
+    assert "private failure detail" in caplog.text
 
 
 def test_sites_list_and_detail(panel_server):
@@ -124,15 +185,86 @@ def test_site_health_offline(panel_server):
     assert health["runtime_ready"] is False
 
 
-def test_runtime_action_skips_offline(panel_server):
+def test_phase2_operational_status_codes(panel_server, monkeypatch):
+    base_url, paths = panel_server
+    _seed_site(paths)
+
+    status, body, _ = _request(base_url, "/api/sites/example.com/databases")
+    assert status == 503
+    assert json.loads(body) == {
+        "ok": False,
+        "exit_code": 3,
+        "databases": [],
+        "message": "database operation refused: Docker runtime unavailable",
+    }
+
+    status, body, _ = _request(
+        base_url, "/api/sites/example.com/databases", method="POST", body={"name": "bad-name"},
+    )
+    assert status == 400
+    assert "invalid database name" in json.loads(body)["error"]
+
+    status, body, _ = _request(base_url, "/api/sites/missing.example/databases")
+    assert status == 404
+    assert "site not found" in json.loads(body)["error"]
+
+    import wpfy.panel
+    from wpfy.site_runtime import RuntimeResult
+
+    nginx_failure = (
+        'nginx: [emerg] unknown directive "broken" in /etc/nginx/wpfy-extra/custom.conf:1\n'
+        "nginx: configuration file /etc/nginx/nginx.conf test failed"
+    )
+    monkeypatch.setattr(
+        wpfy.panel,
+        "set_nginx_custom",
+        lambda domain, content: RuntimeResult(1, nginx_failure, ran=True),
+    )
+    status, body, _ = _request(
+        base_url, "/api/sites/example.com/nginx-custom", method="PUT", body={"content": "broken on;\n"},
+    )
+    assert status == 422
+    assert json.loads(body) == {"ok": False, "exit_code": 1, "nginx_test_output": nginx_failure}
+
+    runtime_failure = "nginx custom config refused: Docker runtime unavailable for validation"
+    monkeypatch.setattr(
+        wpfy.panel,
+        "set_nginx_custom",
+        lambda domain, content: RuntimeResult(3, runtime_failure, skipped=True),
+    )
+    status, body, _ = _request(
+        base_url, "/api/sites/example.com/nginx-custom", method="PUT", body={"content": "location / {}\n"},
+    )
+    assert status == 503
+    assert json.loads(body) == {"ok": False, "exit_code": 3, "nginx_test_output": runtime_failure}
+
+    monkeypatch.setattr(
+        wpfy.panel,
+        "set_nginx_custom",
+        lambda domain, content: RuntimeResult(3, "nginx custom command failed: permission denied", ran=True),
+    )
+    status, body, _ = _request(
+        base_url, "/api/sites/example.com/nginx-custom", method="PUT", body={"content": "location / {}\n"},
+    )
+    assert status == 500
+    assert "permission denied" in json.loads(body)["nginx_test_output"]
+
+
+def test_runtime_action_reports_unavailable_when_it_skips(panel_server):
+    """A runtime action that skipped started nothing, so it must not answer 2xx.
+
+    The operation layer reports "Docker is unavailable, so I did nothing" as exit 0.
+    Passing that through as 200 told the operator their site was started when no
+    container moved. Only pure-runtime actions get this treatment: an sftp rotate that
+    skips has already written the new password, so it stays 2xx (gate G2 pins that).
+    """
     base_url, paths = panel_server
     _seed_site(paths)
     status, body, _ = _request(
         base_url, "/api/sites/example.com/runtime", method="POST", body={"action": "start"},
     )
-    assert status == 200
+    assert status == 503
     payload = json.loads(body)
-    assert payload["ok"] is True
     assert payload["skipped"] is True
 
     status, _, _ = _request(
@@ -226,17 +358,116 @@ def test_wp_api_rejects_unrun_runtime_result(monkeypatch):
         raise AssertionError("unrun WP result returned HTTP success")
 
 
+def test_file_upload_bypasses_json_body_cap(panel_server, monkeypatch):
+    base_url, paths = panel_server
+    monkeypatch.setenv("WPFY_SKIP_CHOWN", "1")
+    site = _seed_site(paths)
+    payload = b"plugin" * 20000
+
+    status, body, headers = _raw_request(
+        base_url, "/api/sites/example.com/files/upload?path=plugin.zip", method="POST", raw=payload,
+    )
+
+    assert status == 201
+    assert headers["Content-Type"].startswith("application/json")
+    assert json.loads(body)["size"] == len(payload)
+    assert (site / "app" / "plugin.zip").read_bytes() == payload
+
+
+def test_rejected_raw_upload_closes_connection_before_reading_declared_body(panel_server):
+    base_url, paths = panel_server
+    _seed_site(paths)
+    host, port = base_url.removeprefix("http://").split(":")
+    request = (
+        b"POST /api/sites/example.com/files/upload?path=../escape.txt HTTP/1.1\r\n"
+        + f"Host: {host}\r\nAuthorization: Bearer {TEST_TOKEN}\r\n".encode("ascii")
+        + b"Content-Length: 524288\r\nConnection: keep-alive\r\n\r\n"
+    )
+
+    with socket.create_connection((host, int(port)), timeout=10) as connection:
+        connection.sendall(request)
+        connection.shutdown(socket.SHUT_WR)
+        response = b""
+        while chunk := connection.recv(64 * 1024):
+            response += chunk
+
+    assert b"HTTP/1.1 400" in response
+    assert b"Connection: close" in response
+
+
+def test_file_download_forces_safe_attachment_headers(panel_server):
+    base_url, paths = panel_server
+    site = _seed_site(paths)
+    payload = b"<script>alert(1)</script>\n"
+    (site / "app" / "evil.html").write_bytes(payload)
+
+    status, body, headers = _raw_request(
+        base_url, "/api/sites/example.com/files/download?path=evil.html",
+    )
+
+    assert status == 200
+    assert body == payload
+    assert headers["Content-Type"] == "application/octet-stream"
+    assert headers["Content-Disposition"].startswith('attachment; filename="evil.html"')
+    assert "filename*=UTF-8''evil.html" in headers["Content-Disposition"]
+    assert headers["X-Content-Type-Options"] == "nosniff"
+
+
+def test_file_download_streams_only_the_advertised_size(panel_server, monkeypatch):
+    base_url, paths = panel_server
+    _seed_site(paths)
+    import wpfy.files
+
+    monkeypatch.setattr(
+        wpfy.files,
+        "open_download",
+        lambda domain, path: wpfy.files.Download("growing.bin", 3, BytesIO(b"abcdef")),
+    )
+    status, body, headers = _raw_request(
+        base_url, "/api/sites/example.com/files/download?path=growing.bin",
+    )
+    assert status == 200
+    assert headers["Content-Length"] == "3"
+    assert body == b"abc"
+
+
+def test_file_editor_body_limit_covers_worst_case_json_escaping():
+    import wpfy.files
+    import wpfy.panel
+
+    route = next(item for item in wpfy.panel._ROUTES if item.meta.action == "site.files.write")
+    assert route.meta.max_body >= 6 * wpfy.files.MAX_EDIT_BYTES + 6 * 4096 + 4096
+
+
 def test_static_ui_served_without_token(panel_server):
     base_url, _ = panel_server
     status, body, headers = _request(base_url, "/", token=None)
     assert status == 200
     assert headers["Content-Type"].startswith("text/html")
     assert "wpfy" in body
+    assert 'data-tab="files"' in body
+    assert 'id="file-upload-input"' in body
     assert "Content-Security-Policy" in headers
 
-    status, _, headers = _request(base_url, "/panel.js", token=None)
+    status, script, headers = _request(base_url, "/panel.js", token=None)
     assert status == 200
     assert headers["Content-Type"].startswith("application/javascript")
+    assert "async function apiUpload" in script
+    assert 'result.path.split("/").pop() !== "wp-config.php"' in script
+    assert "detailRequest !== detailRequestId || fileRequest !== fileRequestId" in script
+
+
+def test_dry_run_previews_use_neutral_plan_badges(panel_server):
+    base_url, _ = panel_server
+
+    status, script, _ = _request(base_url, "/panel.js", token=None)
+    assert status == 200
+    assert 'state: operation.status === "planned" ? "plan"' in script
+    assert 'checkItem({ name: "change", state: "plan", message: change })' in script
+
+    status, stylesheet, _ = _request(base_url, "/panel.css", token=None)
+    assert status == 200
+    assert ".check-plan" in stylesheet
 
 
 def test_static_traversal_and_unknown_paths_rejected(panel_server):
@@ -275,6 +506,30 @@ def test_panel_url_puts_token_in_fragment():
 
     config = wpfy.panel.PanelConfig(host="127.0.0.1", port=1234, token="abc")
     assert wpfy.panel.panel_url(config) == "http://127.0.0.1:1234/#token=abc"
+
+
+def test_create_rejects_unknown_flavor(panel_server):
+    base_url, _ = panel_server
+    status, body, _ = _request(
+        base_url, "/api/sites", method="POST", body={"domain": "bad.example", "flavor": "node"},
+    )
+    assert status == 400
+    assert "unknown site flavor" in body
+
+
+def test_config_dry_run_does_not_apply(panel_server):
+    base_url, paths = panel_server
+    site = _seed_site(paths)
+    before = (site / ".env").read_bytes()
+
+    status, body, _ = _request(
+        base_url, "/api/sites/example.com/config", method="POST",
+        body={"php_version": "8.3", "dry_run": True},
+    )
+
+    assert status == 200
+    assert json.loads(body)["changes"] == ["php 8.4→8.3"]
+    assert (site / ".env").read_bytes() == before
 
 
 def test_cli_panel_parser_defaults():

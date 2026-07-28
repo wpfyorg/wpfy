@@ -6,15 +6,68 @@
 <meta name="robots" content="noindex">
 <title>wpfy panel</title>
 <link rel="stylesheet" href="/panel.css">
+<link rel="icon" href="data:,">
 </head>
 <body>
+<div id="setup" class="gate hidden">
+  <main class="setup-shell" aria-labelledby="setup-title">
+    <div class="wordmark">wpfy <span class="mono-label">first-run setup</span></div>
+    <div class="setup-progress" aria-label="Setup progress"><span id="setup-step-one" class="setup-step active">1 Account</span><span id="setup-step-two" class="setup-step">2 Two-factor authentication</span></div>
+    <section id="setup-account" class="panel setup-panel">
+      <h1 id="setup-title">Create the panel administrator</h1>
+      <p class="hint">This is the only browser setup window. Use the run token printed by <code>wpfy panel</code>; once the account exists, setup closes permanently.</p>
+      <form id="setup-account-form">
+        <div class="form-grid compact-grid">
+          <label>First name<input id="setup-first-name" type="text" autocomplete="given-name" required></label>
+          <label>Last name<input id="setup-last-name" type="text" autocomplete="family-name" required></label>
+          <label>Username<input id="setup-username" type="text" autocomplete="username" required></label>
+          <label>Email<input id="setup-email" type="email" autocomplete="email" required></label>
+          <label>Password<input id="setup-password" type="password" autocomplete="new-password" required></label>
+          <label>Confirm password<input id="setup-confirm-password" type="password" autocomplete="new-password" required></label>
+        </div>
+        <label class="check-row"><input id="setup-license" type="checkbox" required><span>I accept the repository <code>LICENSE</code> and understand this software is provided without warranty.</span></label>
+        <label class="check-row"><input id="setup-telemetry" type="checkbox" checked><span>Share anonymous usage statistics (optional; you can disable this later).</span></label>
+        <button class="btn btn-primary" type="submit">Create administrator</button>
+        <p id="setup-account-error" class="error hidden" role="alert"></p>
+      </form>
+    </section>
+    <section id="setup-totp" class="panel setup-panel hidden" aria-labelledby="setup-totp-title">
+      <h1 id="setup-totp-title">Add a second factor</h1>
+      <p class="hint">Scan this QR code with an authenticator, or enter the secret manually. The factor is stored only after one valid code is checked.</p>
+      <div class="totp-setup-grid">
+        <div id="setup-qr" class="setup-qr" aria-label="TOTP QR code"></div>
+        <div>
+          <label>Secret<input id="setup-totp-secret" class="mono-input" type="text" readonly></label>
+          <label>Authenticator code<input id="setup-totp-code" type="text" inputmode="numeric" autocomplete="one-time-code" maxlength="6" pattern="[0-9]{6}"></label>
+        </div>
+      </div>
+      <div class="row">
+        <button class="btn btn-primary" id="btn-setup-totp-verify" type="button">Verify and enable</button>
+        <button class="btn btn-ghost" id="btn-setup-totp-skip" type="button">Skip for now</button>
+      </div>
+      <p id="setup-totp-warning" class="warning hidden" role="alert">Without a second factor you cannot publish this panel to the internet. <code>wpfy panel expose</code> will refuse until a factor is enrolled.</p>
+      <button class="btn btn-primary hidden" id="btn-setup-totp-confirm-skip" type="button">I understand — skip TOTP</button>
+      <p id="setup-totp-status" class="hint" role="status"></p>
+    </section>
+  </main>
+</div>
 <div id="gate" class="gate hidden">
-  <form id="gate-form" class="gate-card">
+  <form id="login-form" class="gate-card">
     <div class="wordmark">wpfy <span class="mono-label">control panel</span></div>
-    <p>Paste the access token printed by <code>wpfy panel</code>.</p>
-    <input id="gate-token" type="password" placeholder="access token" autocomplete="off" required>
-    <button type="submit" class="btn btn-primary">Unlock</button>
-    <p id="gate-error" class="error hidden">That token was rejected.</p>
+    <h1>Sign in</h1>
+    <p>Use the account configured on this server.</p>
+    <label class="login-field">Username
+      <input id="login-username" type="text" autocomplete="username" required>
+    </label>
+    <label class="login-field">Password
+      <input id="login-password" type="password" autocomplete="current-password" required>
+    </label>
+    <label class="login-field">TOTP code
+      <input id="login-totp" type="text" inputmode="numeric" autocomplete="one-time-code" maxlength="8">
+    </label>
+    <button type="submit" class="btn btn-primary">Sign in</button>
+    <p id="login-status" class="hint" role="status"></p>
+    <p id="login-error" class="error hidden" role="alert">Sign-in failed. Check your details and try again.</p>
   </form>
 </div>
 
@@ -26,19 +79,174 @@
       <span class="chip" id="chip-docker">docker: –</span>
       <span class="chip" id="chip-traefik">traefik: –</span>
       <span class="chip" id="chip-warnings">warnings: –</span>
+      <span class="chip" id="chip-principal">signed out</span>
+      <button class="btn btn-ghost hidden" id="btn-users" type="button" aria-expanded="false" aria-controls="users-panel">Users</button>
       <button class="btn btn-ghost" id="btn-refresh">Refresh</button>
-      <button class="btn btn-ghost" id="btn-lock">Lock</button>
+      <button class="btn btn-ghost" id="btn-lock">Sign out</button>
     </div>
   </header>
 
   <main>
     <section class="stats" id="stats"></section>
 
-    <section class="panel">
+    <section class="panel" id="metrics-panel">
       <div class="panel-head">
-        <h2>Sites</h2>
-        <span class="mono-label" id="sites-count"></span>
+        <div>
+          <h2>System metrics</h2>
+          <p class="hint">Host CPU, memory, disk, and load sampled by the wpfy timer.</p>
+        </div>
+        <label class="range-field">Range
+          <select id="metrics-range" aria-label="Dashboard metrics range"></select>
+        </label>
       </div>
+      <div class="chart-grid" id="host-charts"></div>
+      <p id="host-metrics-empty" class="empty hidden">No samples yet. Install the sampler with <code>wpfy cron install</code>.</p>
+      <details class="chart-data">
+        <summary>Accessible data table</summary>
+        <div class="table-wrap"><table id="host-metrics-table"><thead><tr><th>Time</th><th>CPU %</th><th>Memory</th><th>Disk</th><th>Load</th></tr></thead><tbody></tbody></table></div>
+      </details>
+    </section>
+
+    <section class="panel" id="account-panel">
+      <div class="panel-head">
+        <div>
+          <h2>Your account</h2>
+          <p class="hint">Enroll a time-based one-time password authenticator for this account.</p>
+        </div>
+        <button class="btn" id="btn-totp-enroll" type="button">Enroll TOTP</button>
+      </div>
+      <div id="account-totp-verify" class="row hidden">
+        <label>Authenticator code
+          <input id="account-totp-code" type="text" inputmode="numeric" autocomplete="one-time-code" maxlength="6" pattern="[0-9]{6}">
+        </label>
+        <button class="btn btn-primary" id="btn-account-totp-verify" type="button">Verify and enable</button>
+      </div>
+      <p id="account-status" class="hint" role="status"></p>
+    </section>
+
+    <section class="panel hidden" id="users-panel">
+      <div class="panel-head">
+        <div>
+          <h2>User management</h2>
+          <p class="hint">Accounts control panel access. Role and site changes apply to future requests.</p>
+        </div>
+        <button class="btn btn-ghost" id="btn-users-close" type="button">Close</button>
+      </div>
+      <form id="user-create-form" class="subpanel">
+        <div class="subpanel-head">
+          <div>
+            <h3>Add user</h3>
+            <p class="hint">Assign sites only to a site manager. Separate domains with commas.</p>
+          </div>
+        </div>
+        <div class="form-grid compact-grid">
+          <label>Username
+            <input id="user-create-username" type="text" autocomplete="username" required>
+          </label>
+          <label>Password
+            <input id="user-create-password" type="password" autocomplete="new-password" required>
+          </label>
+          <label>Role
+            <select id="user-create-role"><option value="site-manager">Site manager</option><option value="admin">Admin</option></select>
+          </label>
+          <label>Assigned sites <span class="optional">site manager only</span>
+            <input id="user-create-sites" type="text" autocomplete="off" placeholder="example.com, shop.example.com">
+          </label>
+        </div>
+        <div class="row">
+          <button class="btn btn-primary" id="btn-user-create" type="submit">Create user</button>
+          <span class="mono-label" id="user-create-status" role="status"></span>
+        </div>
+      </form>
+      <div class="table-wrap">
+        <table id="users-table">
+          <thead><tr><th>Username</th><th>Role</th><th>Assigned sites</th><th>TOTP</th><th>Actions</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <p id="users-empty" class="empty hidden">No users found.</p>
+    </section>
+
+    <section class="panel credential-panel hidden" id="one-time-panel">
+      <div class="panel-head">
+        <div>
+          <h2 id="one-time-title">One-time credentials</h2>
+          <p class="credential-warning">Copy this now — it will not be shown again.</p>
+        </div>
+        <button class="btn btn-ghost" id="btn-one-time-dismiss" type="button">Dismiss</button>
+      </div>
+      <dl class="kv" id="one-time-values"></dl>
+      <div class="row">
+        <button class="btn btn-primary" id="btn-one-time-copy" type="button">Copy credentials</button>
+        <span class="mono-label" id="one-time-copy-status" role="status"></span>
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-head sites-head">
+        <div class="panel-title-row">
+          <h2>Sites</h2>
+          <span class="mono-label" id="sites-count"></span>
+        </div>
+        <div class="panel-actions">
+          <label class="search-field" for="sites-search">
+            <span class="hidden-label">Search sites</span>
+            <input id="sites-search" type="search" placeholder="Search domains" autocomplete="off">
+          </label>
+          <button class="btn btn-primary" id="btn-new-site" type="button" aria-expanded="false" aria-controls="new-site-panel">New site</button>
+        </div>
+      </div>
+
+      <form id="new-site-panel" class="subpanel hidden">
+        <div class="subpanel-head">
+          <div>
+            <h3>Create a site</h3>
+            <p class="hint">Provisioning runs as a background job. Keep this page open until it finishes.</p>
+          </div>
+          <button class="btn btn-ghost" id="btn-new-site-close" type="button">Close</button>
+        </div>
+        <div class="form-grid">
+          <label>Domain
+            <input id="new-domain" type="text" inputmode="url" autocomplete="off" placeholder="example.com" required>
+          </label>
+          <label>Site type
+            <select id="new-flavor">
+              <option value="wp">WordPress</option>
+              <option value="wpfc">WordPress + FastCGI cache</option>
+              <option value="wpredis">WordPress + Redis</option>
+              <option value="wpsc">WordPress + Super Cache</option>
+              <option value="wprocket">WordPress + WP Rocket</option>
+              <option value="wpce">WordPress cache-enabled</option>
+              <option value="wpsubdir">WordPress multisite (subdirectories)</option>
+              <option value="wpsubdomain">WordPress multisite (subdomains)</option>
+              <option value="php">PHP site</option>
+              <option value="html">Static HTML</option>
+            </select>
+          </label>
+          <label>PHP version
+            <select id="new-php">
+              <option>7.4</option><option>8.0</option><option>8.1</option>
+              <option>8.2</option><option>8.3</option><option selected>8.4</option>
+            </select>
+          </label>
+          <label class="toggle-field">
+            <input id="new-letsencrypt" type="checkbox">
+            <span>Enable Let’s Encrypt</span>
+          </label>
+          <label class="wp-create-field">Admin user <span class="optional">optional</span>
+            <input id="new-admin-user" type="text" autocomplete="username">
+          </label>
+          <label class="wp-create-field">Admin email <span class="optional">optional</span>
+            <input id="new-admin-email" type="email" autocomplete="email">
+          </label>
+        </div>
+        <div class="row">
+          <button class="btn btn-primary" id="btn-create-site" type="submit">Create site</button>
+          <span class="mono-label" id="create-job-status" role="status"></span>
+        </div>
+        <pre class="output progress-output hidden" id="create-job-progress" aria-live="polite"></pre>
+      </form>
+
       <div class="table-wrap">
         <table id="sites-table">
           <thead>
@@ -47,26 +255,34 @@
           <tbody></tbody>
         </table>
       </div>
-      <p id="sites-empty" class="empty hidden">No managed sites yet. Create one with <code>wpfy run example.com --wp</code>.</p>
+      <p id="sites-empty" class="empty hidden">No managed sites yet. Select <strong>New site</strong> to create one.</p>
     </section>
 
     <section class="panel hidden" id="detail">
-      <div class="panel-head">
+      <div class="panel-head detail-head">
         <h2 id="detail-domain"></h2>
-        <div>
+        <div class="panel-actions">
           <button class="btn btn-ghost" data-runtime="start">Start</button>
           <button class="btn btn-ghost" data-runtime="restart">Restart</button>
           <button class="btn btn-danger-ghost" data-runtime="stop">Stop</button>
           <button class="btn btn-ghost" id="detail-close">Close</button>
         </div>
       </div>
-      <nav class="tabs" id="tabs">
+      <nav class="tabs" id="tabs" aria-label="Site management">
         <button class="tab active" data-tab="overview">Overview</button>
         <button class="tab" data-tab="logs">Logs</button>
         <button class="tab" data-tab="backups">Backups</button>
         <button class="tab" data-tab="sftp">SFTP</button>
         <button class="tab" data-tab="wp">WP-CLI</button>
+        <button class="tab" data-tab="databases">Databases</button>
+        <button class="tab" data-tab="php">PHP Settings</button>
+        <button class="tab" data-tab="vhost">Vhost</button>
+        <button class="tab" data-tab="cache">Cache</button>
+        <button class="tab" data-tab="security">Security</button>
+        <button class="tab" data-tab="cron">Cron</button>
+        <button class="tab" data-tab="files">Files</button>
         <button class="tab" data-tab="config">Config</button>
+        <button class="tab" data-tab="activity">Activity</button>
       </nav>
 
       <div class="tab-body" id="tab-overview">
@@ -77,6 +293,19 @@
         </div>
         <div id="health-result"></div>
         <ul class="checks" id="diag-result"></ul>
+
+        <section class="danger-zone">
+          <h3>Delete site</h3>
+          <p class="hint">wpfy creates and verifies a complete backup before deletion. If that backup fails, deletion is refused.</p>
+          <label class="confirm-field">Type <strong id="delete-domain-label"></strong> to confirm
+            <input id="delete-confirm" type="text" autocomplete="off" spellcheck="false">
+          </label>
+          <div class="row">
+            <button class="btn btn-danger-ghost" id="btn-delete-site" type="button" disabled>Back up and delete site</button>
+            <span class="mono-label" id="delete-job-status" role="status"></span>
+          </div>
+          <pre class="output progress-output hidden" id="delete-job-progress" aria-live="polite"></pre>
+        </section>
       </div>
 
       <div class="tab-body hidden" id="tab-logs">
@@ -114,6 +343,7 @@
       <div class="tab-body hidden" id="tab-sftp">
         <div class="row">
           <button class="btn" id="btn-sftp-enable">Enable SFTP</button>
+          <button class="btn" id="btn-sftp-rotate">Rotate password</button>
           <button class="btn btn-danger-ghost" id="btn-sftp-disable">Disable SFTP</button>
         </div>
         <pre class="output" id="sftp-output">Loading…</pre>
@@ -128,21 +358,531 @@
         <pre class="output" id="wp-output">No command run yet.</pre>
       </div>
 
-      <div class="tab-body hidden" id="tab-config">
-        <div class="row">
-          <label>PHP version
-            <select id="config-php">
-              <option>7.4</option><option>8.0</option><option>8.1</option>
-              <option>8.2</option><option>8.3</option><option>8.4</option>
-            </select>
-          </label>
-          <button class="btn" id="btn-config">Apply</button>
+      <div class="tab-body hidden" id="tab-databases">
+        <p class="hint">Databases and users stay inside this site's isolated MariaDB container.</p>
+
+        <section class="management-section">
+          <div class="section-head">
+            <div>
+              <h3>Databases</h3>
+              <p class="hint">Create application databases or remove them with exact-name confirmation.</p>
+            </div>
+            <span class="mono-label" id="databases-status" role="status"></span>
+          </div>
+          <form class="row" id="database-create-form">
+            <label>Database name
+              <input id="database-name" type="text" autocomplete="off" spellcheck="false" placeholder="analytics" required>
+            </label>
+            <button class="btn btn-primary" id="btn-database-create" type="submit">Add database</button>
+          </form>
+          <div class="table-wrap">
+            <table id="databases-table">
+              <thead><tr><th>Database</th><th>Type exact name to drop</th></tr></thead>
+              <tbody></tbody>
+            </table>
+          </div>
+          <p id="databases-empty" class="empty hidden">No application databases found.</p>
+        </section>
+
+        <section class="management-section">
+          <div class="section-head">
+            <div>
+              <h3>Database users</h3>
+              <p class="hint">Generated passwords appear once after the background job finishes.</p>
+            </div>
+            <span class="mono-label" id="db-users-status" role="status"></span>
+          </div>
+          <form id="db-user-create-form">
+            <div class="form-grid compact-grid">
+              <label>Username
+                <input id="db-user-name" type="text" autocomplete="off" spellcheck="false" placeholder="reporting" required>
+              </label>
+              <label>Grant database <span class="optional">optional</span>
+                <select id="db-user-database">
+                  <option value="">No initial grant</option>
+                </select>
+              </label>
+            </div>
+            <div class="row">
+              <button class="btn btn-primary" id="btn-db-user-create" type="submit">Add user</button>
+              <span class="mono-label" id="db-user-job-status" role="status"></span>
+            </div>
+          </form>
+          <div class="table-wrap">
+            <table id="db-users-table">
+              <thead><tr><th>User</th><th>Password</th><th>Type exact name to drop</th></tr></thead>
+              <tbody></tbody>
+            </table>
+          </div>
+          <p id="db-users-empty" class="empty hidden">No scoped database users found.</p>
+        </section>
+
+        <section class="management-section">
+          <div class="section-head">
+            <div>
+              <h3>Adminer</h3>
+              <p class="hint">Optional database UI, bound to loopback only and never routed through Traefik.</p>
+            </div>
+            <span class="badge off" id="adminer-badge">off</span>
+          </div>
+          <form class="row" id="adminer-form">
+            <label class="toggle-field inline-toggle">
+              <input id="adminer-enabled" type="checkbox">
+              <span>Enable Adminer</span>
+            </label>
+            <label>Loopback port <span class="optional">optional</span>
+              <input id="adminer-port" type="number" min="1" max="65535" placeholder="8081">
+            </label>
+            <button class="btn" id="btn-adminer-save" type="submit">Apply Adminer state</button>
+          </form>
+          <pre class="output output-compact" id="adminer-output">Adminer is disabled.</pre>
+        </section>
+      </div>
+
+      <div class="tab-body hidden" id="tab-php">
+        <form id="php-settings-form">
+          <div class="form-grid">
+            <label>Memory limit
+              <input id="php-memory-limit" type="text" inputmode="text" spellcheck="false" placeholder="256M" required>
+            </label>
+            <label>Max execution time
+              <input id="php-max-execution-time" type="text" inputmode="numeric" spellcheck="false" placeholder="300" required>
+            </label>
+            <label>Max input time
+              <input id="php-max-input-time" type="text" inputmode="numeric" spellcheck="false" placeholder="300" required>
+            </label>
+            <label>Max input vars
+              <input id="php-max-input-vars" type="text" inputmode="numeric" spellcheck="false" placeholder="5000" required>
+            </label>
+            <label>Upload max size
+              <input id="php-upload-max-size" type="text" inputmode="text" spellcheck="false" placeholder="64M" required>
+            </label>
+          </div>
+          <p class="hint">Preview first. Accepted values use an integer with an optional K, M, or G suffix for sizes.</p>
+          <div class="row">
+            <button class="btn" id="btn-php-preview" type="submit">Preview changes</button>
+            <button class="btn btn-primary hidden" id="btn-php-apply" type="button">Apply previewed changes</button>
+          </div>
+        </form>
+        <div id="php-preview" class="preview-box hidden" aria-live="polite">
+          <h3>PHP change preview</h3>
+          <dl class="kv" id="php-preview-summary"></dl>
+          <ul class="checks" id="php-preview-changes"></ul>
         </div>
-        <pre class="output" id="config-output">Changing the PHP version regenerates the site scaffold and restarts its containers.</pre>
+        <pre class="output" id="php-output">Loading current PHP settings…</pre>
+        <p class="operator-note"><code>php/custom.ini</code> is an operator-owned escape hatch that wpfy never overwrites. Edit it directly on the server, not in this panel.</p>
+      </div>
+
+      <div class="tab-body hidden" id="tab-vhost">
+        <section class="management-section first-section">
+          <div class="section-head">
+            <div>
+              <h3>Generated vhost</h3>
+              <p class="hint">wpfy-owned and read-only. Regeneration may replace this file.</p>
+            </div>
+            <span class="badge off">read only</span>
+          </div>
+          <pre class="output readonly-output" id="vhost-generated" aria-label="Generated nginx default configuration">Loading generated nginx/default.conf…</pre>
+        </section>
+
+        <section class="management-section">
+          <div class="section-head">
+            <div>
+              <h3>Operator include</h3>
+              <p class="hint">Saved only after validation inside the site's running Nginx container.</p>
+            </div>
+          </div>
+          <form id="vhost-form">
+            <label class="code-field" for="vhost-custom">nginx/extra/custom.conf</label>
+            <textarea id="vhost-custom" class="code-editor" rows="14" spellcheck="false"></textarea>
+            <div class="row">
+              <button class="btn btn-primary" id="btn-vhost-save" type="submit">Validate and save</button>
+              <span class="mono-label" id="vhost-save-status" role="status"></span>
+            </div>
+          </form>
+          <p id="vhost-result-message" class="validation-message hidden" role="status"></p>
+          <pre class="output" id="vhost-test-output">No validation run yet.</pre>
+        </section>
+      </div>
+
+      <div class="tab-body hidden" id="tab-cache">
+        <section class="management-section first-section">
+          <div class="section-head">
+            <div>
+              <h3>Page cache</h3>
+              <p class="hint">Free plugins are installed automatically. Paid plugins are bring-your-own and are never downloaded by wpfy.</p>
+            </div>
+            <span class="badge off" id="cache-current-badge">Loading</span>
+          </div>
+          <form id="cache-form">
+            <fieldset class="cache-choice-fieldset">
+              <legend>Plugin</legend>
+              <div class="cache-choice-list" id="cache-page-options"></div>
+            </fieldset>
+            <label class="toggle-field inline-toggle cache-toggle">
+              <input id="cache-redis" type="checkbox">
+              <span>Enable Redis object cache</span>
+            </label>
+            <p class="hint">Page cache and object cache are independent. For example, W3 Total Cache can use Redis for object caching.</p>
+            <div class="row">
+              <button class="btn" id="btn-cache-preview" type="submit">Preview changes</button>
+              <button class="btn btn-primary hidden" id="btn-cache-apply" type="button">Apply previewed changes</button>
+              <span class="mono-label" id="cache-status" role="status"></span>
+            </div>
+          </form>
+          <div class="cache-upload hidden" id="cache-upload-instructions" aria-live="polite">
+            <h3>Upload instructions</h3>
+            <p>Upload the selected plugin to <code id="cache-upload-path"></code>, then activate it in WordPress. <span id="cache-upload-state"></span></p>
+          </div>
+          <div id="cache-preview" class="preview-box hidden" aria-live="polite">
+            <h3>Cache change preview</h3>
+            <dl class="kv" id="cache-preview-summary"></dl>
+            <ul class="checks" id="cache-preview-changes"></ul>
+            <ul class="checks" id="cache-preview-operations"></ul>
+          </div>
+          <p class="operator-note">Generated snippet: <code id="cache-snippet-path">Loading…</code></p>
+          <pre class="output" id="cache-output">Loading current cache settings…</pre>
+        </section>
+
+        <section class="management-section">
+          <div class="section-head">
+            <div>
+              <h3>Purge cache</h3>
+              <p class="hint">wpfy asks the plugin to purge, clears nginx FastCGI cache, and flushes Redis when enabled.</p>
+            </div>
+          </div>
+          <div class="row">
+            <button class="btn btn-danger-ghost" id="btn-cache-purge" type="button">Purge site cache</button>
+            <span class="mono-label" id="cache-purge-status" role="status"></span>
+          </div>
+          <ul class="checks" id="cache-purge-outcomes"></ul>
+          <pre class="output output-compact" id="cache-purge-output">No purge run yet.</pre>
+        </section>
+      </div>
+
+      <div class="tab-body hidden" id="tab-security">
+        <form id="security-form">
+          <section class="management-section first-section">
+            <div class="section-head">
+              <div>
+                <h3>Request filters</h3>
+                <p class="hint">One CIDR or user-agent pattern per line. Preview shows every addition and removal.</p>
+              </div>
+              <span class="mono-label" id="security-status" role="status"></span>
+            </div>
+            <div class="form-grid security-grid">
+              <label>Denied IP networks
+                <textarea id="security-deny-ips" rows="7" spellcheck="false" placeholder="198.51.100.0/24"></textarea>
+              </label>
+              <label>Blocked user agents
+                <textarea id="security-ua-blocks" rows="7" spellcheck="false" placeholder="EvilBot"></textarea>
+              </label>
+            </div>
+          </section>
+
+          <section class="management-section">
+            <div class="section-head">
+              <div>
+                <h3>Access controls</h3>
+                <p class="hint">Generated basic-auth passwords are displayed once and stored only as a hash.</p>
+              </div>
+            </div>
+            <div class="form-grid compact-grid">
+              <label class="toggle-field">
+                <input id="security-basic-enabled" type="checkbox">
+                <span>Require HTTP basic auth</span>
+              </label>
+              <label>Username
+                <input id="security-basic-username" type="text" autocomplete="username" spellcheck="false" placeholder="operator">
+              </label>
+              <label>Password <span class="optional">optional; leave blank to generate</span>
+                <input id="security-basic-password" type="password" autocomplete="new-password">
+              </label>
+              <label class="toggle-field">
+                <input id="security-cloudflare-only" type="checkbox">
+                <span>Allow Cloudflare edge traffic only</span>
+              </label>
+              <label class="toggle-field">
+                <input id="security-login-rate-limit" type="checkbox">
+                <span>Rate limit WordPress login attempts</span>
+              </label>
+            </div>
+            <div class="row">
+              <button class="btn" id="btn-security-preview" type="submit">Preview changes</button>
+              <button class="btn btn-primary hidden" id="btn-security-apply" type="button">Apply previewed changes</button>
+              <button class="btn btn-danger-ghost hidden" id="btn-security-acknowledge" type="button">Acknowledge warning and apply</button>
+            </div>
+          </section>
+        </form>
+
+        <div id="security-preview" class="preview-box hidden" aria-live="polite">
+          <h3>Security change preview</h3>
+          <dl class="kv" id="security-preview-summary"></dl>
+          <ul class="checks" id="security-preview-changes"></ul>
+          <ul class="checks" id="security-preview-warnings"></ul>
+        </div>
+        <p class="operator-note">Generated snippet: <code id="security-snippet-path">Loading…</code><br>Trusted edge sources: <code id="security-trusted-sources">Loading…</code></p>
+        <pre class="output output-compact" id="security-output">Loading current security settings…</pre>
+      </div>
+
+      <div class="tab-body hidden" id="tab-cron">
+        <section class="management-section first-section">
+          <div class="section-head">
+            <div>
+              <h3>Scheduled jobs</h3>
+              <p class="hint">Commands run only inside a service belonging to this site.</p>
+            </div>
+            <span class="mono-label" id="cron-status" role="status"></span>
+          </div>
+          <div class="table-wrap">
+            <table id="cron-table">
+              <thead><tr><th>Schedule</th><th>Command</th><th>Service</th><th>Enabled</th><th>Timeout</th><th>Last run</th><th>Actions</th></tr></thead>
+              <tbody></tbody>
+            </table>
+          </div>
+          <p id="cron-empty" class="empty hidden">No scheduled jobs. Add one below.</p>
+          <pre class="output output-compact" id="cron-run-output">No job run yet.</pre>
+        </section>
+
+        <section class="management-section">
+          <div class="section-head">
+            <div>
+              <h3>Add job</h3>
+              <p class="hint">Use a standard five-field cron expression. Timeout is in seconds.</p>
+            </div>
+          </div>
+          <form id="cron-add-form">
+            <div class="form-grid cron-grid">
+              <label>Schedule
+                <input id="cron-schedule" type="text" spellcheck="false" value="*/5 * * * *" required>
+              </label>
+              <label>Service
+                <select id="cron-service" required></select>
+              </label>
+              <label>Timeout
+                <input id="cron-timeout" type="number" min="1" max="86400" value="300" required>
+              </label>
+              <label class="cron-command-field">Command
+                <input id="cron-command" type="text" spellcheck="false" placeholder="wp cron event run --due-now" required>
+              </label>
+            </div>
+            <button class="btn btn-primary" id="btn-cron-add" type="submit">Add scheduled job</button>
+          </form>
+        </section>
+      </div>
+
+      <div class="tab-body hidden" id="tab-files">
+        <section class="management-section first-section">
+          <div class="section-head">
+            <div>
+              <h3>Site files</h3>
+              <p class="hint">Restricted to this site's <code>app/</code> directory. Symlinks are shown but never followed.</p>
+            </div>
+            <span class="mono-label" id="files-status" role="status"></span>
+          </div>
+          <nav class="file-breadcrumbs" id="files-breadcrumbs" aria-label="Current file path"></nav>
+          <div class="file-toolbar">
+            <form class="row" id="file-mkdir-form">
+              <label>New directory
+                <input id="file-mkdir-name" type="text" autocomplete="off" spellcheck="false" placeholder="uploads" required>
+              </label>
+              <button class="btn" id="btn-file-mkdir" type="submit">Create directory</button>
+            </form>
+            <label class="file-drop" id="file-drop-zone">
+              <input id="file-upload-input" type="file">
+              <strong>Drop one file here</strong>
+              <span>or choose a file to upload into this directory</span>
+            </label>
+          </div>
+          <div class="table-wrap">
+            <table id="files-table">
+              <thead><tr><th>Name</th><th>Type</th><th>Size</th><th>Mode</th><th>Modified</th><th>Actions</th></tr></thead>
+              <tbody></tbody>
+            </table>
+          </div>
+          <p id="files-empty" class="empty hidden">This directory is empty.</p>
+        </section>
+
+        <section class="management-section file-editor-section hidden" id="file-editor-section">
+          <div class="section-head">
+            <div>
+              <h3 id="file-editor-title">Edit file</h3>
+              <p class="hint">Text editor is size-capped. Larger or binary files remain downloadable.</p>
+            </div>
+          </div>
+          <p class="file-warning hidden" id="file-wp-config-warning"><strong>Caution:</strong> changing <code>wp-config.php</code> can take the site offline or expose secrets.</p>
+          <textarea class="code-editor file-editor" id="file-editor" rows="18" spellcheck="false"></textarea>
+          <div class="row">
+            <button class="btn btn-primary" id="btn-file-save" type="button">Save file</button>
+            <button class="btn" id="btn-file-download-open" type="button">Download</button>
+            <button class="btn" id="btn-file-close" type="button">Close editor</button>
+          </div>
+        </section>
+
+        <dialog class="file-dialog" id="file-rename-dialog">
+          <form method="dialog" id="file-rename-form">
+            <h3>Rename path</h3>
+            <label>New jail-relative path
+              <input id="file-rename-to" type="text" autocomplete="off" spellcheck="false" required>
+            </label>
+            <div class="row">
+              <button class="btn btn-primary" id="btn-file-rename" value="confirm" type="submit">Rename</button>
+              <button class="btn" value="cancel" type="button" data-dialog-close="file-rename-dialog">Cancel</button>
+            </div>
+          </form>
+        </dialog>
+
+        <dialog class="file-dialog" id="file-chmod-dialog">
+          <form method="dialog" id="file-chmod-form">
+            <h3>Change permissions</h3>
+            <label>Allowed mode
+              <select id="file-chmod-mode">
+                <option>0600</option><option>0640</option><option>0644</option>
+                <option>0700</option><option>0750</option><option>0755</option>
+              </select>
+            </label>
+            <div class="row">
+              <button class="btn btn-primary" id="btn-file-chmod" value="confirm" type="submit">Apply permissions</button>
+              <button class="btn" value="cancel" type="button" data-dialog-close="file-chmod-dialog">Cancel</button>
+            </div>
+          </form>
+        </dialog>
+
+        <dialog class="file-dialog" id="file-delete-dialog">
+          <form method="dialog" id="file-delete-form">
+            <h3>Delete non-empty directory</h3>
+            <p class="hint">Type <strong id="file-delete-name"></strong> to confirm recursive deletion.</p>
+            <label>Confirmation
+              <input id="file-delete-confirm" type="text" autocomplete="off" spellcheck="false" required>
+            </label>
+            <div class="row">
+              <button class="btn btn-danger-ghost" id="btn-file-delete-confirm" value="confirm" type="submit" disabled>Delete directory</button>
+              <button class="btn" value="cancel" type="button" data-dialog-close="file-delete-dialog">Cancel</button>
+            </div>
+          </form>
+        </dialog>
+      </div>
+
+      <div class="tab-body hidden" id="tab-config">
+        <form id="config-form">
+          <div class="form-grid config-grid">
+            <label>PHP version
+              <select id="config-php">
+                <option>7.4</option><option>8.0</option><option>8.1</option>
+                <option>8.2</option><option>8.3</option><option>8.4</option>
+              </select>
+            </label>
+            <label>Site type
+              <select id="config-flavor">
+                <option value="wp">WordPress</option>
+                <option value="wpfc">WordPress + FastCGI cache</option>
+                <option value="wpredis">WordPress + Redis</option>
+                <option value="wpsc">WordPress + Super Cache</option>
+                <option value="wprocket">WordPress + WP Rocket</option>
+                <option value="wpce">WordPress cache-enabled</option>
+                <option value="wpsubdir">WordPress multisite (subdirectories)</option>
+                <option value="wpsubdomain">WordPress multisite (subdomains)</option>
+                <option value="php">PHP site</option>
+                <option value="html">Static HTML</option>
+              </select>
+            </label>
+            <label class="toggle-field">
+              <input id="config-letsencrypt" type="checkbox">
+              <span>Enable Let’s Encrypt</span>
+            </label>
+            <label id="config-password-field">New WordPress admin password <span class="optional">optional</span>
+              <input id="config-password" type="password" autocomplete="new-password">
+            </label>
+          </div>
+          <p class="hint">Preview first. Applying may regenerate the site scaffold and restart affected containers.</p>
+          <div class="row">
+            <button class="btn" id="btn-config-preview" type="submit">Preview changes</button>
+            <button class="btn btn-primary hidden" id="btn-config-apply" type="button">Apply previewed changes</button>
+          </div>
+        </form>
+        <div id="config-preview" class="preview-box hidden" aria-live="polite">
+          <h3>Change preview</h3>
+          <dl class="kv" id="config-preview-summary"></dl>
+          <ul class="checks" id="config-preview-changes"></ul>
+        </div>
+        <pre class="output" id="config-output">No changes previewed yet.</pre>
+      </div>
+
+      <div class="tab-body hidden" id="tab-activity">
+        <div class="section-head">
+          <div>
+            <h3>Site metrics</h3>
+            <p class="hint">Container CPU and memory, site disk usage, and host load.</p>
+          </div>
+          <label class="range-field">Range
+            <select id="activity-range" aria-label="Site activity metrics range"></select>
+          </label>
+        </div>
+        <div class="chart-grid" id="activity-charts"></div>
+        <p id="activity-metrics-empty" class="empty hidden">No samples for this site yet. Install the sampler with <code>wpfy cron install</code>.</p>
+        <div class="row">
+          <button class="btn" id="btn-activity-refresh">Refresh activity</button>
+        </div>
+        <div class="table-wrap">
+          <table id="activity-table">
+            <thead><tr><th>Time</th><th>Action</th><th>Outcome</th><th>Actor</th><th>Job</th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+        <p id="activity-empty" class="empty hidden">No activity recorded for this site yet.</p>
       </div>
     </section>
 
-    <section class="panel">
+    <section class="panel" id="services-panel">
+      <div class="panel-head">
+        <div>
+          <h2>Services</h2>
+          <p class="hint">Container-level status and restarts only. No host services are managed here.</p>
+        </div>
+        <button class="btn" id="btn-services-refresh" type="button">Refresh</button>
+      </div>
+      <div class="table-wrap">
+        <table id="services-table"><thead><tr><th>Service</th><th>Status</th><th>Action</th></tr></thead><tbody></tbody></table>
+      </div>
+      <p id="services-empty" class="empty hidden">No managed containers found.</p>
+      <section class="danger-zone edge-restart">
+        <h3>Restart shared edge</h3>
+        <p class="hint"><strong>Restarting the edge affects every site.</strong> Type <code>wpfy-traefik</code> to confirm.</p>
+        <label class="confirm-field">Confirmation
+          <input id="edge-confirm" type="text" autocomplete="off" spellcheck="false">
+        </label>
+        <button class="btn btn-danger-ghost" id="btn-edge-restart" type="button" disabled>Restart Traefik edge</button>
+      </section>
+    </section>
+
+    <section class="panel" id="events-panel">
+      <div class="panel-head">
+        <div>
+          <h2>Events</h2>
+          <p class="hint">Recent panel and CLI activity.</p>
+        </div>
+        <div class="panel-actions">
+          <label class="search-field" for="events-domain">
+            <span class="hidden-label">Filter events by domain</span>
+            <input id="events-domain" type="search" placeholder="Filter by domain" autocomplete="off">
+          </label>
+          <label class="search-field" for="events-action">
+            <span class="hidden-label">Filter events by action</span>
+            <input id="events-action" type="search" placeholder="Filter by action" autocomplete="off">
+          </label>
+          <button class="btn" id="btn-events-refresh" type="button">Refresh</button>
+        </div>
+      </div>
+      <div class="table-wrap">
+        <table id="events-table">
+          <thead><tr><th>Time</th><th>Action</th><th>Domain</th><th>Outcome</th><th>Actor</th><th>Job</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <p id="events-empty" class="empty hidden">No events match this filter.</p>
+    </section>
+
+    <section class="panel" id="diagnostics-panel">
       <div class="panel-head">
         <h2>System diagnostics</h2>
         <button class="btn" id="btn-sysdiag">Run</button>
@@ -151,10 +891,11 @@
     </section>
   </main>
 
-  <footer class="foot mono-label">wpfy panel · loopback only · token protected</footer>
+  <footer class="foot mono-label" id="foot-principal">wpfy panel</footer>
 </div>
 
-<div id="toast" class="toast hidden"></div>
+<div id="toast" class="toast hidden" role="status" aria-live="polite"></div>
+<script src="/qrcode.min.js"></script>
 <script src="/panel.js"></script>
 </body>
 </html>

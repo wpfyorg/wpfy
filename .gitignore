@@ -6,8 +6,9 @@ __pycache__/
 .context/
 conductor.json
 
-# Graphify generated cache (machine-specific absolute paths)
+# Graphify generated cache and dated snapshots
 graphify-out/cache/
+graphify-out/20*/
 
 # Never commit environment files or local secrets (defensive; none exist in-repo)
 .env
@@ -22,6 +23,8 @@ node_modules
 .tmp-screenshots/
 
 # Local editor, agent, and generated tool state
+.DS_Store
+*.swp
 .cursor/mcp.json
 .cursor/rules/bricks.mdc
 .cursor/skills/bricks

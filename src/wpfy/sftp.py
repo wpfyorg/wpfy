@@ -11,7 +11,8 @@ from .site_layout import (
     generated_secret,
 )
 from .site_paths import compose_path, env_path, read_env, read_text, site_exists, validate_domain
-from .site_runtime import RuntimeResult, compose_command
+from .site_runtime import RuntimeResult, compose_command, runtime_skip_requested
+from .events import record_event
 
 
 _SFTP_IMAGE = "atmoz/sftp:alpine"
@@ -112,6 +113,13 @@ def ensure_sftp_container(domain: str, password: str | None = None) -> RuntimeRe
     )
     ensure_site_scaffold(definition)
 
+    if runtime_skip_requested():
+        record_event("site.sftp.enable", domain=domain, detail=f"sftp configured on port {host_port}")
+        message = f"sftp configured for {domain} on port {host_port}; username: sftpuser"
+        if generated:
+            message += f"\npassword (shown once): {password}"
+        return RuntimeResult(0, message, skipped=True)
+
     proc = compose_command(domain, "up", "-d", "sftp")
     if proc.returncode != 0:
         err = proc.stderr.strip() or proc.stdout.strip() or "docker compose up sftp failed"
@@ -123,7 +131,21 @@ def ensure_sftp_container(domain: str, password: str | None = None) -> RuntimeRe
     message = f"sftp {state} for {domain} on port {host_port}; username: sftpuser"
     if generated:
         message += f"\npassword (shown once): {password}"
-    return RuntimeResult(0, message, ran=True)
+    result = RuntimeResult(0, message, ran=True)
+    record_event("site.sftp.enable", domain=domain, detail=f"sftp enabled on port {host_port}")
+    return result
+
+
+def rotate_sftp_password(domain: str, password: str | None = None) -> RuntimeResult:
+    password = password or generated_secret()[:16]
+    result = ensure_sftp_container(domain, password=password)
+    record_event(
+        "site.sftp.rotate",
+        domain=domain,
+        outcome="ok" if result.exit_code == 0 else "failed",
+        detail="sftp password rotated" if result.exit_code == 0 else "sftp password rotation failed",
+    )
+    return result
 
 
 def remove_sftp_container(domain: str) -> RuntimeResult:

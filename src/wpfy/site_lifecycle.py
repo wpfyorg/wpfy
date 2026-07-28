@@ -1,24 +1,28 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
+from . import site_cache
 from .php_runtime import DEFAULT_PHP_VERSION
 from .redaction import redact_values
 from .site_layout import (
     SiteSpec,
     apply_site_ownership,
+    backup_site,
     bootstrap_site_files,
     ensure_site_scaffold,
     provision_wordpress_site,
+    remove_site_scaffold,
     site_info,
     wordpress_install_state,
 )
 from .site_paths import env_path, read_env
-from .site_runtime import RuntimeResult, compose_command, start_site_runtime, wp_cli_command
+from .site_runtime import RuntimeResult, compose_command, start_site_runtime, stop_site_runtime, wp_cli_command
+from .events import record_event
 from .certificate_lifecycle import preflight_ssl
 from .dns import DNSConfigError, load_cloudflare_config
-from .site_definition import MYSQL_FLAVORS, WORDPRESS_FLAVORS
+from .site_definition import LEGACY_CACHE_FLAVORS, MYSQL_FLAVORS, WORDPRESS_FLAVORS
 from .traefik import acme_email_problem
 
 
@@ -34,6 +38,8 @@ class WordPressCredentials:
 class CreateSiteRequest:
     domain: str
     flavor: str
+    page_cache: str = "none"
+    object_cache: str = "none"
     php_version: str = DEFAULT_PHP_VERSION
     letsencrypt: str | None = None
     dns_provider: str | None = None
@@ -44,6 +50,10 @@ class CreateSiteRequest:
 class UpdateSiteRequest:
     domain: str
     php_version: str | None = None
+    flavor: str | None = None
+    page_cache: str | None = None
+    object_cache: str | None = None
+    dry_run: bool = False
     wpfc: bool = False
     wpredis: bool = False
     wpsubdir: bool = False
@@ -62,6 +72,7 @@ class CreateSiteResult:
     runtime: RuntimeResult
     preflight_message: str | None = None
     wordpress_message: str | None = None
+    cache_message: str | None = None
     wordpress_admin_user: str | None = None
     generated_password: str | None = None
     exit_code: int = 0
@@ -78,6 +89,7 @@ class UpdateSiteResult:
     runtime: RuntimeResult
     changes: tuple[str, ...]
     preflight_message: str | None = None
+    cache_message: str | None = None
     password_summary: str | None = None
     exit_code: int = 0
 
@@ -89,6 +101,21 @@ class EnableSSLResult:
     runtime: RuntimeResult
     preflight_message: str
     wordpress_message: str | None = None
+    exit_code: int = 0
+
+
+@dataclass(frozen=True)
+class DeleteSiteRequest:
+    domain: str
+    force: bool = False
+    skip_backup: bool = False
+
+
+@dataclass(frozen=True)
+class DeleteSiteResult:
+    backup: RuntimeResult
+    runtime: RuntimeResult
+    removed: bool
     exit_code: int = 0
 
 
@@ -136,26 +163,37 @@ def _site_spec(
     *,
     domain: str,
     flavor: str,
+    page_cache: str,
+    object_cache: str,
     php_version: str,
     letsencrypt: str | None,
     dns_provider: str | None,
     proxied: bool,
-    sftp_password: str | None = None,
-    sftp_port: str | None = None,
+    current: SiteSpec | None = None,
 ) -> SiteSpec:
-    return SiteSpec(
-        domain=domain,
-        flavor=flavor,
-        use_mysql=flavor in MYSQL_FLAVORS,
-        use_redis=flavor == "wpredis",
-        letsencrypt=letsencrypt,
-        dns_provider=dns_provider,
-        php_version=php_version,
-        ssl_enabled=bool(letsencrypt),
-        proxied=proxied and bool(letsencrypt),
-        sftp_password=sftp_password,
-        sftp_port=sftp_port,
-    )
+    legacy_page_cache, legacy_object_cache = LEGACY_CACHE_FLAVORS.get(flavor, ("none", "none"))
+    if flavor in LEGACY_CACHE_FLAVORS:
+        page_cache = page_cache if page_cache != "none" else legacy_page_cache
+        object_cache = object_cache if object_cache != "none" else legacy_object_cache
+        flavor = "wp"
+    values = {
+        "domain": domain,
+        "flavor": flavor,
+        "use_mysql": flavor in MYSQL_FLAVORS,
+        "use_redis": object_cache == "redis",
+        "page_cache": page_cache,
+        "object_cache": object_cache,
+        "letsencrypt": letsencrypt,
+        "dns_provider": dns_provider,
+        "php_version": php_version,
+        "ssl_enabled": bool(letsencrypt),
+        "proxied": proxied and bool(letsencrypt),
+    }
+    if current is not None:
+        if not values["use_mysql"]:
+            values["adminer_port"] = None
+        return replace(current, **values)
+    return SiteSpec(**values)
 
 
 def create_site(
@@ -181,6 +219,8 @@ def create_site(
     spec = _site_spec(
         domain=request.domain,
         flavor=request.flavor,
+        page_cache=request.page_cache,
+        object_cache=request.object_cache,
         php_version=request.php_version,
         letsencrypt=request.letsencrypt,
         dns_provider=request.dns_provider,
@@ -228,6 +268,7 @@ def create_site(
     runtime = start_site_runtime(request.domain)
 
     wordpress_message: str | None = None
+    cache_message: str | None = None
     wordpress_admin_user: str | None = None
     generated_password: str | None = None
     exit_code = runtime.exit_code or 0
@@ -254,17 +295,35 @@ def create_site(
             if provision.exit_code == 0 and provision.ran and admin.password_generated:
                 generated_password = admin.password
 
-    return CreateSiteResult(
+    if request.page_cache != "none" or request.object_cache != "none":
+        if runtime.ran and exit_code == 0:
+            cache_result = site_cache.configure_site_cache(request.domain)
+            cache_message = cache_result.message
+            exit_code = cache_result.exit_code
+        else:
+            cache_stage = site_cache.render_cache_nginx(request.domain)
+            cache_message = cache_stage.message + "; plugin activation deferred until runtime is available"
+            exit_code = exit_code or cache_stage.exit_code
+
+    result = CreateSiteResult(
         spec=spec,
         touched=touched,
         bootstrap=bootstrap,
         runtime=runtime,
         preflight_message=preflight_message,
         wordpress_message=wordpress_message,
+        cache_message=cache_message,
         wordpress_admin_user=wordpress_admin_user,
         generated_password=generated_password,
         exit_code=exit_code,
     )
+    record_event(
+        "site.create",
+        domain=request.domain,
+        outcome="ok" if exit_code == 0 else "failed",
+        detail="site lifecycle completed",
+    )
+    return result
 
 
 def update_site(request: UpdateSiteRequest) -> UpdateSiteResult:
@@ -280,21 +339,27 @@ def update_site(request: UpdateSiteRequest) -> UpdateSiteResult:
         existing_env = read_env(env_path(domain))
     except OSError as exc:
         raise SiteLifecycleError(f"unsafe site environment: {exc}") from exc
-    current_flavor = existing_env.get("SITE_FLAVOR", "unknown")
-    current_php = existing_env.get("PHP_VERSION", DEFAULT_PHP_VERSION)
-    current_letsencrypt = existing_env.get("LETSENCRYPT_MODE", "") or None
-    current_dns = existing_env.get("DNS_PROVIDER", "") or None
+    current_spec = SiteSpec.from_env(domain, existing_env)
+    current_flavor = current_spec.flavor
+    current_page_cache = current_spec.page_cache
+    current_object_cache = current_spec.object_cache
+    current_php = current_spec.php_version
+    current_letsencrypt = current_spec.letsencrypt
+    current_dns = current_spec.dns_provider
     new_dns = request.dns_provider or current_dns
-    current_proxied = existing_env.get("PROXIED", "") == "1"
+    current_proxied = current_spec.proxied
 
-    new_flavor = current_flavor
+    new_flavor = request.flavor or current_flavor
+    if request.wpsubdir:
+        new_flavor = "wpsubdir"
+    elif request.wpsubdomain:
+        new_flavor = "wpsubdomain"
+    new_page_cache = request.page_cache or current_page_cache
+    new_object_cache = request.object_cache or current_object_cache
     if request.wpfc:
-        new_flavor = "wpfc"
+        new_page_cache = "wpfc"
     if request.wpredis:
-        new_flavor = "wpredis"
-    if request.wpsubdir or request.wpsubdomain:
-        if new_flavor not in {"wpfc", "wpredis", "wpsc", "wprocket", "wpce"}:
-            new_flavor = "wp"
+        new_object_cache = "redis"
 
     new_php = request.php_version or current_php
     if request.letsencrypt is None:
@@ -309,6 +374,10 @@ def update_site(request: UpdateSiteRequest) -> UpdateSiteResult:
         changes.append(f"php {current_php}→{new_php}")
     if new_flavor != current_flavor:
         changes.append(f"flavor {current_flavor}→{new_flavor}")
+    if new_page_cache != current_page_cache:
+        changes.append(f"page cache {current_page_cache}→{new_page_cache}")
+    if new_object_cache != current_object_cache:
+        changes.append(f"object cache {current_object_cache}→{new_object_cache}")
     if (new_letsencrypt or "") != (current_letsencrypt or ""):
         changes.append(f"ssl enabled ({new_letsencrypt})" if new_letsencrypt else "ssl disabled")
     if (new_dns or "") != (current_dns or ""):
@@ -335,18 +404,40 @@ def update_site(request: UpdateSiteRequest) -> UpdateSiteResult:
     spec = _site_spec(
         domain=domain,
         flavor=new_flavor,
+        page_cache=new_page_cache,
+        object_cache=new_object_cache,
         php_version=new_php,
         letsencrypt=new_letsencrypt,
         dns_provider=new_dns,
         proxied=new_proxied,
-        sftp_password=existing_env.get("SFTP_PASSWORD") or None,
-        sftp_port=existing_env.get("SFTP_PORT") or None,
+        current=current_spec,
     )
+    if request.dry_run:
+        return UpdateSiteResult(
+            spec=spec,
+            touched=(),
+            runtime=RuntimeResult(0, "dry run", skipped=True),
+            changes=tuple(changes),
+        )
+
     try:
         touched = tuple(ensure_site_scaffold(spec))
     except ValueError as exc:
         raise SiteLifecycleError(str(exc)) from exc
     runtime = start_site_runtime(domain)
+
+    cache_message: str | None = None
+    cache_exit_code = 0
+    cache_changed = new_page_cache != current_page_cache or new_object_cache != current_object_cache
+    if cache_changed:
+        if runtime.ran and runtime.exit_code == 0:
+            cache_result = site_cache.configure_site_cache(domain)
+            cache_message = cache_result.message
+            cache_exit_code = cache_result.exit_code
+        else:
+            cache_stage = site_cache.render_cache_nginx(domain)
+            cache_message = cache_stage.message + "; plugin activation deferred until runtime is available"
+            cache_exit_code = cache_stage.exit_code
 
     password_summary: str | None = None
     if request.password:
@@ -369,16 +460,26 @@ def update_site(request: UpdateSiteRequest) -> UpdateSiteResult:
         else:
             password_summary = f"OK password updated for {admin_user}"
 
-    exit_code = runtime.exit_code if runtime.exit_code and not runtime.skipped else 0
-    return UpdateSiteResult(
+    exit_code = runtime.exit_code if runtime.exit_code and not runtime.skipped else cache_exit_code
+    if password_summary and password_summary.startswith("FAIL "):
+        exit_code = exit_code or 1
+    result = UpdateSiteResult(
         spec=spec,
         touched=touched,
         runtime=runtime,
         changes=tuple(changes),
         preflight_message=preflight_message,
+        cache_message=cache_message,
         password_summary=password_summary,
         exit_code=exit_code,
     )
+    record_event(
+        "site.config",
+        domain=domain,
+        outcome="ok" if exit_code == 0 else "failed",
+        detail="site configuration updated",
+    )
+    return result
 
 
 def enable_ssl(
@@ -405,16 +506,18 @@ def enable_ssl(
         existing_env = read_env(env_path(domain))
     except OSError as exc:
         raise SiteLifecycleError(f"unsafe site environment: {exc}") from exc
-    flavor = existing_info.get("flavor", "site")
+    current_spec = SiteSpec.from_env(domain, existing_env)
+    flavor = current_spec.flavor
     spec = _site_spec(
         domain=domain,
         flavor=flavor,
-        php_version=existing_env.get("PHP_VERSION", DEFAULT_PHP_VERSION),
+        page_cache=current_spec.page_cache,
+        object_cache=current_spec.object_cache,
+        php_version=current_spec.php_version,
         letsencrypt=letsencrypt,
         dns_provider=dns_provider,
         proxied=_resolve_proxied(proxied_override, preflight.mode),
-        sftp_password=existing_env.get("SFTP_PASSWORD") or None,
-        sftp_port=existing_env.get("SFTP_PORT") or None,
+        current=current_spec,
     )
     try:
         touched = tuple(ensure_site_scaffold(spec))
@@ -455,3 +558,39 @@ def enable_ssl(
         wordpress_message=wordpress_message,
         exit_code=exit_code,
     )
+
+
+def delete_site(request: DeleteSiteRequest) -> DeleteSiteResult:
+    domain = request.domain
+    try:
+        site_info(domain)
+    except FileNotFoundError as exc:
+        raise SiteLifecycleError(str(exc)) from exc
+    except OSError as exc:
+        raise SiteLifecycleError(f"unsafe site environment: {exc}") from exc
+    except ValueError as exc:
+        raise SiteLifecycleError(str(exc)) from exc
+
+    if request.skip_backup:
+        backup = RuntimeResult(0, "backup skipped by request", skipped=True)
+    else:
+        backup = backup_site(domain, require_database=True)
+        if backup.exit_code != 0 or backup.skipped:
+            record_event("site.delete", domain=domain, outcome="failed", detail="backup failed")
+            blocked = RuntimeResult(0, "runtime blocked by backup failure", skipped=True)
+            return DeleteSiteResult(backup, blocked, False, backup.exit_code or 1)
+
+    runtime = stop_site_runtime(domain, remove_volumes=True)
+    if runtime.exit_code != 0 or runtime.skipped:
+        record_event("site.delete", domain=domain, outcome="failed", detail="runtime stop failed")
+        return DeleteSiteResult(backup, runtime, False, runtime.exit_code or 1)
+
+    removed = remove_site_scaffold(domain)
+    exit_code = 0 if removed else 2
+    record_event(
+        "site.delete",
+        domain=domain,
+        outcome="ok" if removed else "failed",
+        detail="site scaffold removed" if removed else "site scaffold not found",
+    )
+    return DeleteSiteResult(backup, runtime, removed, exit_code)

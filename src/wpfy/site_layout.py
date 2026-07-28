@@ -16,12 +16,21 @@ import tarfile
 import tempfile
 from urllib.request import urlopen
 
-from .settings import PATHS
 from . import registry
+from . import site_security
+from .events import record_event
 from .php_runtime import PHP_IMAGE_REPOSITORY as _PHP_IMAGE_REPOSITORY, php_image
 from .redaction import redact_values
 from .s3_backup import S3ConfigError, S3Uploader, load_s3_config, redact_s3_secrets
-from .site_definition import MYSQL_FLAVORS, WORDPRESS_FLAVORS, SiteDefinition, sftp_service_lines
+from .site_definition import (
+    MYSQL_FLAVORS,
+    WORDPRESS_FLAVORS,
+    SiteDefinition,
+    adminer_service_lines,
+    compose_hardening_lines,
+    sftp_service_lines,
+    validate_php_setting,
+)
 from .site_paths import (
     app_dir,
     backups_dir,
@@ -53,6 +62,12 @@ from .site_runtime import (
     stop_site_runtime,
     wp_cli_command,
 )
+
+
+def _current_paths():
+    from .settings import PATHS as current_paths
+
+    return current_paths
 
 
 PHP_IMAGE_REPOSITORY = _PHP_IMAGE_REPOSITORY
@@ -155,6 +170,7 @@ def web_service_lines(spec: SiteSpec) -> list[str]:
     if spec.site_uid is None:
         raise ValueError("web_service_lines requires spec.site_uid; allocate it via ensure_site_scaffold")
     router_rule = _router_rule(spec.domain, wildcard=spec.letsencrypt == "wildcard")
+    cloudflare_only = site_exists(spec.domain) and site_security.load_security(spec.domain)["cloudflare_only"]
     user = f"{spec.site_uid}:{spec.site_uid}"
     lines = [
         "  web:",
@@ -162,18 +178,7 @@ def web_service_lines(spec: SiteSpec) -> list[str]:
         f"    container_name: {project}-web",
         "    restart: unless-stopped",
         f'    user: "{user}"',
-        "    security_opt:",
-        "      - no-new-privileges:true",
-        "    cap_drop:",
-        "      - NET_RAW",
-        "    pids_limit: 256",
-        "    mem_limit: 256m",
-        "    cpus: 0.50",
-        "    logging:",
-        "      driver: json-file",
-        "      options:",
-        "        max-size: 10m",
-        "        max-file: \"3\"",
+        *compose_hardening_lines(256, "256m", "0.50"),
         "    depends_on:",
         "      - app",
         "    networks:",
@@ -192,7 +197,16 @@ def web_service_lines(spec: SiteSpec) -> list[str]:
             f'      - "traefik.http.routers.{project}.tls.certresolver={certresolver}"',
             f"      - 'traefik.http.routers.{project}-http.rule={router_rule}'",
             f'      - "traefik.http.routers.{project}-http.entrypoints=web"',
-            f'      - "traefik.http.routers.{project}-http.middlewares={project}-redirect"',
+        ])
+        if cloudflare_only:
+            lines.extend([
+                f'      - "traefik.http.routers.{project}.middlewares={project}-cloudflare-only"',
+                f'      - "traefik.http.routers.{project}-http.middlewares='
+                f'{project}-cloudflare-only,{project}-redirect"',
+            ])
+        else:
+            lines.append(f'      - "traefik.http.routers.{project}-http.middlewares={project}-redirect"')
+        lines.extend([
             f'      - "traefik.http.routers.{project}-http.service={project}"',
             f'      - "traefik.http.middlewares.{project}-redirect.redirectscheme.scheme=https"',
         ])
@@ -203,13 +217,31 @@ def web_service_lines(spec: SiteSpec) -> list[str]:
             ])
     else:
         lines.append(f'      - "traefik.http.routers.{project}.entrypoints=web"')
+        if cloudflare_only:
+            lines.append(f'      - "traefik.http.routers.{project}.middlewares={project}-cloudflare-only"')
+    if cloudflare_only:
+        source_ranges = ",".join(site_security.cloudflare_cidrs())
+        lines.append(
+            f'      - "traefik.http.middlewares.{project}-cloudflare-only.ipallowlist.sourcerange={source_ranges}"'
+        )
     lines.extend([
         f'      - "traefik.http.services.{project}.loadbalancer.server.port=8080"',
     ])
     lines.extend([
         "    volumes:",
         "      - ./app:/var/www/html:ro",
+    ])
+    if spec.page_cache == "wpfc":
+        lines.append("      - ./cache-data:/var/cache/nginx/fastcgi")
+    lines.extend([
+        "      - ./nginx/cache-path.conf:/etc/nginx/conf.d/00-wpfy-cache-path.conf:ro",
+        f"      - ./nginx/{site_security.FORWARDED_SCHEME_SNIPPET}:"
+        "/etc/nginx/conf.d/00-wpfy-forwarded-scheme.conf:ro",
+        f"      - ./nginx/{site_security.RATELIMIT_SNIPPET}:/etc/nginx/conf.d/00-wpfy-ratelimit.conf:ro",
+        "      - ./nginx/wpfy-access.log:/var/log/nginx/wpfy-access.log",
         "      - ./nginx/default.conf:/etc/nginx/conf.d/default.conf:ro",
+        f"      - ./nginx/{site_security.HTPASSWD_FILE}:{site_security.HTPASSWD_CONTAINER_PATH}:ro",
+        "      - ./nginx/extra:/etc/nginx/wpfy-extra:ro",
         "    healthcheck:",
         "      test: [\"CMD-SHELL\", \"wget -q -O /dev/null http://127.0.0.1:8080/healthz.html\"]",
         "      interval: 30s",
@@ -233,24 +265,15 @@ def compose_content(spec: SiteSpec) -> str:
         f"    container_name: {project}-app",
         "    restart: unless-stopped",
         f'    user: "{user}"',
-        "    security_opt:",
-        "      - no-new-privileges:true",
-        "    cap_drop:",
-        "      - NET_RAW",
-        "    pids_limit: 512",
-        "    mem_limit: 512m",
-        "    cpus: 1.00",
-        "    logging:",
-        "      driver: json-file",
-        "      options:",
-        "        max-size: 10m",
-        "        max-file: \"3\"",
+        *compose_hardening_lines(512, "512m", "1.00"),
         "    env_file:",
         "      - .env",
         "    networks:",
         "      - site",
         "    volumes:",
         "      - ./app:/var/www/html",
+        "      - ./php/zz-wpfy.ini:/usr/local/etc/php/conf.d/zz-wpfy.ini:ro",
+        "      - ./php/custom.ini:/usr/local/etc/php/conf.d/zzz-custom.ini:ro",
         "    healthcheck:",
         "      test: [\"CMD-SHELL\", \"php -v >/dev/null 2>&1\"]",
         "      interval: 30s",
@@ -268,18 +291,7 @@ def compose_content(spec: SiteSpec) -> str:
             f"    container_name: {project}-db",
             "    restart: unless-stopped",
             f'    user: "{user}"',
-            "    security_opt:",
-            "      - no-new-privileges:true",
-            "    cap_drop:",
-            "      - NET_RAW",
-            "    pids_limit: 512",
-            "    mem_limit: 768m",
-            "    cpus: 1.00",
-            "    logging:",
-            "      driver: json-file",
-            "      options:",
-            "        max-size: 10m",
-            "        max-file: \"3\"",
+            *compose_hardening_lines(512, "768m", "1.00"),
             "    environment:",
             "      MARIADB_DATABASE: ${DB_NAME}",
             "      MARIADB_USER: ${DB_USER}",
@@ -305,18 +317,7 @@ def compose_content(spec: SiteSpec) -> str:
             "    command: [\"redis-server\", \"--appendonly\", \"yes\"]",
             "    restart: unless-stopped",
             f'    user: "{user}"',
-            "    security_opt:",
-            "      - no-new-privileges:true",
-            "    cap_drop:",
-            "      - NET_RAW",
-            "    pids_limit: 256",
-            "    mem_limit: 256m",
-            "    cpus: 0.50",
-            "    logging:",
-            "      driver: json-file",
-            "      options:",
-            "        max-size: 10m",
-            "        max-file: \"3\"",
+            *compose_hardening_lines(256, "256m", "0.50"),
             "    networks:",
             "      - site",
             "    volumes:",
@@ -332,6 +333,12 @@ def compose_content(spec: SiteSpec) -> str:
         lines.append("")
         lines.extend(sftp_service_lines(spec))
 
+    if spec.adminer_port:
+        if not spec.use_mysql:
+            raise ValueError("Adminer requires a database-enabled site")
+        lines.append("")
+        lines.extend(adminer_service_lines(spec))
+
     lines.extend([
         "",
         "  wpcli:",
@@ -340,18 +347,7 @@ def compose_content(spec: SiteSpec) -> str:
         "    profiles:",
         "      - cli",
         f'    user: "{user}"',
-        "    security_opt:",
-        "      - no-new-privileges:true",
-        "    cap_drop:",
-        "      - NET_RAW",
-        "    pids_limit: 256",
-        "    mem_limit: 512m",
-        "    cpus: 1.00",
-        "    logging:",
-        "      driver: json-file",
-        "      options:",
-        "        max-size: 10m",
-        "        max-file: \"3\"",
+        *compose_hardening_lines(256, "512m", "1.00"),
         "    entrypoint:",
         "      - /usr/local/bin/wp",
         "    env_file:",
@@ -360,6 +356,8 @@ def compose_content(spec: SiteSpec) -> str:
         "      - site",
         "    volumes:",
         "      - ./app:/var/www/html",
+        "      - ./php/zz-wpfy.ini:/usr/local/etc/php/conf.d/zz-wpfy.ini:ro",
+        "      - ./php/custom.ini:/usr/local/etc/php/conf.d/zzz-custom.ini:ro",
     ])
     if spec.use_mysql:
         lines.extend([
@@ -385,15 +383,35 @@ def generated_secret() -> str:
     return secrets.token_urlsafe(32)
 
 
+def php_ini_content(spec: SiteSpec) -> str:
+    memory_limit = validate_php_setting("php_memory_limit", spec.php_memory_limit)
+    execution_time = validate_php_setting("php_max_execution_time", spec.php_max_execution_time)
+    input_time = validate_php_setting("php_max_input_time", spec.php_max_input_time)
+    input_vars = validate_php_setting("php_max_input_vars", spec.php_max_input_vars)
+    upload_size = validate_php_setting("php_upload_max_size", spec.php_upload_max_size)
+    return "\n".join([
+        "; Generated by wpfy. Edit php/custom.ini for operator overrides.",
+        f"memory_limit = {memory_limit}",
+        f"max_execution_time = {execution_time}",
+        f"max_input_time = {input_time}",
+        f"max_input_vars = {input_vars}",
+        f"upload_max_filesize = {upload_size}",
+        f"post_max_size = {upload_size}",
+        "",
+    ])
+
+
 # Keys fully owned by SiteDefinition.env_values: regeneration adds or drops them
 # from .env as the spec dictates (e.g. disabling SFTP removes SFTP_PASSWORD).
 # Any other key found in an existing .env was added by the operator and must
 # survive regeneration untouched.
 MANAGED_ENV_KEYS = {
-    "DOMAIN", "COMPOSE_PROJECT_NAME", "SITE_FLAVOR", "APP_ROOT", "PHP_VERSION",
+    "DOMAIN", "COMPOSE_PROJECT_NAME", "SITE_FLAVOR", "PAGE_CACHE", "APP_ROOT", "PHP_VERSION",
     "SITE_UID", "DB_NAME", "DB_USER", "DB_PASSWORD", "DB_ROOT_PASSWORD",
     "LETSENCRYPT_MODE", "DNS_PROVIDER", "PROXIED", "REDIS_ENABLED",
-    "SFTP_PASSWORD", "SFTP_PORT",
+    "SFTP_PASSWORD", "SFTP_PORT", "ADMINER_PORT",
+    "PHP_MEMORY_LIMIT", "PHP_MAX_EXECUTION_TIME", "PHP_MAX_INPUT_TIME",
+    "PHP_MAX_INPUT_VARS", "PHP_UPLOAD_MAX_SIZE",
 }
 
 
@@ -495,6 +513,23 @@ def _read_text_safely(root: Path, name: str) -> str | None:
             return None
         with os.fdopen(file_fd, "r", encoding="utf-8") as source:
             return source.read()
+    finally:
+        os.close(root_fd)
+
+
+def _file_exists_safely(root: Path, name: str) -> bool:
+    root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        try:
+            file_fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=root_fd)
+        except FileNotFoundError:
+            return False
+        try:
+            if not stat.S_ISREG(os.fstat(file_fd).st_mode):
+                raise OSError(f"managed scaffold destination is not a regular file: {name}")
+            return True
+        finally:
+            os.close(file_fd)
     finally:
         os.close(root_fd)
 
@@ -801,8 +836,12 @@ def backup_site(
                 proc = subprocess.run(
                     [
                         "docker", "compose", "exec", "-T", "db", "sh", "-lc",
-                        'mariadb-dump --single-transaction -u"$MARIADB_USER" '
-                        '-p"$MARIADB_PASSWORD" "$MARIADB_DATABASE"',
+                        'databases="$(mariadb -N -B -uroot -p"$MARIADB_ROOT_PASSWORD" '
+                        '-e "SELECT SCHEMA_NAME FROM information_schema.SCHEMATA '
+                        "WHERE SCHEMA_NAME NOT IN ('information_schema','performance_schema','mysql','sys') "
+                        'ORDER BY SCHEMA_NAME")" && test -n "$databases" && '
+                        'mariadb-dump --single-transaction -uroot -p"$MARIADB_ROOT_PASSWORD" '
+                        '--databases $databases',
                     ],
                     cwd=site_dir(domain),
                     check=False,
@@ -818,7 +857,15 @@ def backup_site(
             return RuntimeResult(3, "database backup required but Docker runtime was unavailable or skipped")
 
         with tarfile.open(archive_staging, "w:gz") as archive:
-            for entry in (compose_path(domain), env_path(domain), app_dir(domain), nginx_dir(domain), php_dir(domain)):
+            for entry in (
+                compose_path(domain),
+                env_path(domain),
+                site_dir(domain) / site_security.SECURITY_STATE,
+                site_dir(domain) / "cron.json",
+                app_dir(domain),
+                nginx_dir(domain),
+                php_dir(domain),
+            ):
                 if entry is None or not entry.exists():
                     continue
                 archive.add(entry, arcname=str(Path(domain) / entry.name), recursive=True)
@@ -876,6 +923,7 @@ def backup_site(
             return RuntimeResult(prune.exit_code, f"{message}; retention failed: {prune.message}", ran=True)
         message = f"{message}; retention: {prune.message}"
 
+    record_event("site.backup", domain=domain, detail="site backup completed")
     return RuntimeResult(0, message, ran=True)
 
 
@@ -1178,9 +1226,10 @@ def restore_site(domain: str, archive_path: str) -> RuntimeResult:
     disk = shutil.disk_usage(target)
     needed = archive_size * 3  # rough estimate: archive + extracted + safety margin
     if needed > disk.free:
-        return RuntimeResult(2,
+        return RuntimeResult(
+            2,
             f"insufficient disk space: need ~{needed // (1024*1024)}MB, "
-            f"available {disk.free // (1024*1024)}MB on {target}"
+            f"available {disk.free // (1024*1024)}MB on {target}",
         )
 
     with tempfile.TemporaryDirectory(prefix="wpfy-restore-") as temp_dir:
@@ -1236,7 +1285,7 @@ def restore_site(domain: str, archive_path: str) -> RuntimeResult:
                 proc = subprocess.run(
                     [
                         "docker", "compose", "exec", "-T", "db", "sh", "-lc",
-                        'mariadb -u"$MARIADB_USER" -p"$MARIADB_PASSWORD" "$MARIADB_DATABASE"',
+                        'mariadb -uroot -p"$MARIADB_ROOT_PASSWORD"',
                     ],
                     cwd=target,
                     check=False,
@@ -1248,6 +1297,7 @@ def restore_site(domain: str, archive_path: str) -> RuntimeResult:
                 message = proc.stderr.strip() or proc.stdout.strip() or "database restore failed"
                 return RuntimeResult(proc.returncode, message)
 
+    record_event("site.restore", domain=domain, detail="site restore completed")
     return RuntimeResult(0, f"site restored from {archive_path}", ran=True)
 
 
@@ -1258,7 +1308,7 @@ def list_sites() -> list[dict[str, str]]:
             return sites
     except Exception:
         pass
-    root = Path(PATHS.sites_dir)
+    root = Path(_current_paths().sites_dir)
     if not root.exists():
         return []
 
@@ -1315,11 +1365,25 @@ def site_info(domain: str) -> dict[str, str]:
 def remove_site_scaffold(domain: str) -> bool:
     validate_domain(domain)
     path = site_dir(domain)
-    if not path.exists():
-        return False
-    shutil.rmtree(path)
-    registry.remove_site(domain)
-    return True
+    removed = path.exists()
+    if removed:
+        shutil.rmtree(path)
+        registry.remove_site(domain)
+    try:
+        rotation_removed = site_security._remove_access_log_rotation(domain)
+        configs_changed = site_security._render_fail2ban_configs(skip_invalid=True)
+        if (rotation_removed or configs_changed) and site_security.fail2ban_available():
+            reload_error = site_security._reload_fail2ban()
+            if reload_error:
+                record_event(
+                    "site.security.fail2ban.reload",
+                    domain=domain,
+                    outcome="failed",
+                    detail="fail2ban reload failed after site removal",
+                )
+    except OSError:
+        pass
+    return removed
 
 
 def write_if_changed(path: Path, content: str) -> bool:
@@ -1342,7 +1406,7 @@ def _project_collision(domain: str) -> str | None:
         known.update(site["domain"] for site in registry.list_sites() if site.get("domain"))
     except Exception:
         pass
-    sites_root = Path(PATHS.sites_dir)
+    sites_root = Path(_current_paths().sites_dir)
     if sites_root.exists():
         for env_file in sites_root.glob("*/.env"):
             known.add(read_env(env_file).get("DOMAIN") or env_file.parent.name)
@@ -1392,6 +1456,7 @@ def _apply_site_ownership(domain: str, uid: int) -> RuntimeResult:
 
     targets = [
         (app_dir(domain), 0o750, True),
+        (site_dir(domain) / "cache-data", 0o700, False),
         (db_data_dir(domain), 0o700, False),
         (redis_data_dir(domain), 0o700, False),
     ]
@@ -1428,6 +1493,17 @@ def _apply_site_ownership(domain: str, uid: int) -> RuntimeResult:
                     own_directory(path_fd)
             finally:
                 os.close(path_fd)
+
+        access_log = nginx_dir(domain) / site_security.ACCESS_LOG_FILE
+        try:
+            metadata = access_log.lstat()
+        except FileNotFoundError:
+            pass
+        else:
+            if stat.S_ISLNK(metadata.st_mode):
+                return RuntimeResult(3, f"ownership failed: unsafe access-log symlink: {access_log.name}")
+            os.chown(access_log, uid, uid, follow_symlinks=False)
+            os.chmod(access_log, 0o640, follow_symlinks=False)
     except PermissionError as exc:
         return RuntimeResult(0, f"ownership skipped (chown not permitted: {exc})", skipped=True)
     except OSError as exc:
@@ -1447,6 +1523,123 @@ def apply_site_ownership(domain: str) -> RuntimeResult:
     return _apply_site_ownership(domain, int(value))
 
 
+def get_nginx_custom(domain: str) -> RuntimeResult:
+    validate_domain(domain)
+    if not site_exists(domain):
+        return RuntimeResult(2, f"site not found: {domain}")
+    extra_root = nginx_dir(domain) / "extra"
+    try:
+        content = _read_text_safely(extra_root, "custom.conf")
+    except OSError as exc:
+        return RuntimeResult(3, f"failed to read nginx custom config: {exc}")
+    return RuntimeResult(0, content or "", ran=True)
+
+
+def _validate_nginx_candidate(domain: str, content: str) -> RuntimeResult:
+    if not isinstance(content, str) or "\x00" in content:
+        return RuntimeResult(2, "nginx custom config must be text without NUL bytes")
+    if runtime_skip_requested() or not docker_available():
+        return RuntimeResult(3, "nginx custom config refused: Docker runtime unavailable for validation")
+
+    extra_root = nginx_dir(domain) / "extra"
+    candidate_name = f".custom-{secrets.token_hex(8)}.candidate"
+    candidate_path = extra_root / candidate_name
+    try:
+        _write_text_safely(extra_root, candidate_name, content)
+        proc = compose_command(
+            domain,
+            "run",
+            "--rm",
+            "-T",
+            "--no-deps",
+            "-v",
+            f"{candidate_path}:/etc/nginx/wpfy-extra/custom.conf:ro",
+            "web",
+            "nginx",
+            "-t",
+        )
+        output = "\n".join(part.strip() for part in (proc.stdout, proc.stderr) if part and part.strip())
+        if proc.returncode != 0:
+            if 'host not found in upstream "app"' in output.lower():
+                return RuntimeResult(
+                    proc.returncode or 1,
+                    "nginx custom config validation requires the site runtime to be running "
+                    "(upstream app was unavailable)",
+                )
+            return RuntimeResult(proc.returncode or 1, output or "nginx -t failed")
+        return RuntimeResult(0, output or "nginx configuration test passed", ran=True)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return RuntimeResult(3, f"nginx validation failed: {exc}")
+    finally:
+        try:
+            root_fd = os.open(extra_root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            try:
+                os.unlink(candidate_name, dir_fd=root_fd)
+            except FileNotFoundError:
+                pass
+            finally:
+                os.close(root_fd)
+        except OSError:
+            pass
+
+
+def validate_nginx_custom(domain: str, content: str | None = None) -> RuntimeResult:
+    validate_domain(domain)
+    if not site_exists(domain):
+        return RuntimeResult(2, f"site not found: {domain}")
+    if content is None:
+        current = get_nginx_custom(domain)
+        if current.exit_code != 0:
+            return current
+        content = current.message
+    return _validate_nginx_candidate(domain, content)
+
+
+def set_nginx_custom(domain: str, content: str) -> RuntimeResult:
+    validate_domain(domain)
+    if not site_exists(domain):
+        return RuntimeResult(2, f"site not found: {domain}")
+    validation = _validate_nginx_candidate(domain, content)
+    if validation.exit_code != 0:
+        return validation
+
+    extra_root = nginx_dir(domain) / "extra"
+    replacement_name = f".custom-{secrets.token_hex(8)}.replacement"
+    try:
+        _write_text_safely(extra_root, replacement_name, content)
+        root_fd = os.open(extra_root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            try:
+                metadata = os.stat("custom.conf", dir_fd=root_fd, follow_symlinks=False)
+                if stat.S_ISLNK(metadata.st_mode):
+                    return RuntimeResult(3, "nginx custom config refused: custom.conf is a symlink")
+            except FileNotFoundError:
+                pass
+            os.replace(replacement_name, "custom.conf", src_dir_fd=root_fd, dst_dir_fd=root_fd)
+        finally:
+            os.close(root_fd)
+    except OSError as exc:
+        return RuntimeResult(3, f"failed to install nginx custom config: {exc}")
+    finally:
+        try:
+            root_fd = os.open(extra_root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            try:
+                os.unlink(replacement_name, dir_fd=root_fd)
+            except FileNotFoundError:
+                pass
+            finally:
+                os.close(root_fd)
+        except OSError:
+            pass
+
+    reload_proc = compose_command(domain, "exec", "-T", "web", "nginx", "-s", "reload")
+    if reload_proc.returncode != 0:
+        output = reload_proc.stderr.strip() or reload_proc.stdout.strip() or "nginx reload failed"
+        return RuntimeResult(reload_proc.returncode or 1, f"config validated and installed; {output}", ran=True)
+    record_event("site.nginx-custom", domain=domain, detail="validated nginx custom config installed")
+    return RuntimeResult(0, validation.message, ran=True)
+
+
 def ensure_site_scaffold(spec: SiteSpec) -> list[str]:
     validate_domain(spec.domain)
     # Allocate (or reuse) this site's unique uid before rendering the templates,
@@ -1458,9 +1651,22 @@ def ensure_site_scaffold(spec: SiteSpec) -> list[str]:
         site_root / "compose.yaml",
         site_root / ".env",
         site_root / "nginx",
+        site_root / "nginx" / "cache-path.conf",
+        site_root / "nginx" / site_security.FORWARDED_SCHEME_SNIPPET,
+        site_root / "nginx" / site_security.RATELIMIT_SNIPPET,
+        site_root / "nginx" / site_security.ACCESS_LOG_FILE,
         site_root / "nginx" / "default.conf",
+        site_root / "nginx" / site_security.HTPASSWD_FILE,
+        site_root / "nginx" / "extra",
+        site_root / "nginx" / "extra" / "custom.conf",
+        site_root / "nginx" / "extra" / "wpfy-cache.conf",
+        site_root / "nginx" / "extra" / site_security.SECURITY_SNIPPET,
+        site_root / site_security.SECURITY_STATE,
         site_root / "php",
+        site_root / "php" / "zz-wpfy.ini",
+        site_root / "php" / "custom.ini",
         site_root / "backups",
+        site_root / "cache-data",
         site_root / "app",
         site_root / "app" / "healthz.html",
         site_root / "db-data" if spec.use_mysql else site_root,
@@ -1487,8 +1693,10 @@ def ensure_site_scaffold(spec: SiteSpec) -> list[str]:
     for path in (
         site_root,
         nginx_dir(spec.domain),
+        nginx_dir(spec.domain) / "extra",
         php_dir(spec.domain),
         backups_dir(spec.domain),
+        site_root / "cache-data" if spec.page_cache == "wpfc" else None,
         db_data_dir(spec.domain) if spec.use_mysql else None,
         redis_data_dir(spec.domain) if spec.use_redis else None,
     ):
@@ -1504,19 +1712,6 @@ def ensure_site_scaffold(spec: SiteSpec) -> list[str]:
     except OSError as exc:
         raise ValueError(f"unsafe healthcheck destination: {exc}") from exc
 
-    compose_file = compose_path(spec.domain)
-    compose_rendered = compose_content(spec)
-    try:
-        if _read_text_safely(site_root, compose_file.name) != compose_rendered:
-            _write_text_safely(site_root, compose_file.name, compose_rendered)
-            touched.append(str(compose_file))
-        env_rendered = env_content(spec, existing_env)
-        if _read_text_safely(site_root, env_file.name) != env_rendered:
-            _write_text_safely(site_root, env_file.name, env_rendered)
-            touched.append(str(env_file))
-        _chmod_file_safely(site_root, env_file.name, 0o600)
-    except OSError as exc:
-        raise ValueError(f"unsafe scaffold destination: {exc}") from exc
     nginx_file = nginx_conf_path(spec.domain)
     nginx_lines = [
         "server {",
@@ -1526,20 +1721,32 @@ def ensure_site_scaffold(spec: SiteSpec) -> list[str]:
         "    root /var/www/html;",
         "    index index.php index.html;",
         "    autoindex off;",
-        # Match the bundled PHP images: upload_max_filesize/post_max_size 64M,
-        # max_execution_time 300 (nginx defaults of 1m/60s would 413/504 first).
-        "    client_max_body_size 64m;",
+        "    access_log /var/log/nginx/wpfy-access.log combined;",
+        # Keep nginx's request-body limit aligned with the generated PHP upload limits.
+        f"    client_max_body_size {validate_php_setting('php_upload_max_size', spec.php_upload_max_size).lower()};",
         "    add_header X-Content-Type-Options nosniff always;",
         "    add_header X-Frame-Options SAMEORIGIN always;",
+        '    add_header X-XSS-Protection "0" always;',
         "    add_header Referrer-Policy strict-origin-when-cross-origin always;",
         "    add_header Permissions-Policy \"geolocation=(), microphone=(), camera=()\" always;",
+        "    include /etc/nginx/wpfy-extra/*.conf;",
     ]
     if spec.ssl_enabled:
         nginx_lines.append("    add_header Strict-Transport-Security \"max-age=31536000\" always;")
     nginx_lines.extend([
         "    location = /healthz.html {",
         "        access_log off;",
+        "        auth_basic off;",
         "        add_header Content-Type text/plain;",
+        "    }",
+        "    location = /wp-admin/install.php {",
+        "        return 404;",
+        "    }",
+        "    location = /wp-admin/upgrade.php {",
+        "        return 404;",
+        "    }",
+        "    location ~* ^/wp-content/(?:updraft|uploads/updraft|sucuri|uploads/sucuri)/ {",
+        "        return 404;",
         "    }",
         "    location ~* ^/wp-content/uploads/.*\\.php$ {",
         "        return 404;",
@@ -1560,6 +1767,7 @@ def ensure_site_scaffold(spec: SiteSpec) -> list[str]:
         "        try_files $uri =404;",
         "        include fastcgi_params;",
         "        fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;",
+        "        fastcgi_param HTTPS $wpfy_https;",
         "        fastcgi_read_timeout 300s;",
         "        fastcgi_pass app:9000;",
         "    }",
@@ -1567,10 +1775,67 @@ def ensure_site_scaffold(spec: SiteSpec) -> list[str]:
         "",
     ])
     nginx_content = "\n".join(nginx_lines)
+    compose_file = compose_path(spec.domain)
+    compose_rendered = compose_content(spec)
     try:
+        env_rendered = env_content(spec, existing_env)
+        if _read_text_safely(site_root, env_file.name) != env_rendered:
+            _write_text_safely(site_root, env_file.name, env_rendered)
+            touched.append(str(env_file))
+        _chmod_file_safely(site_root, env_file.name, 0o600)
+
+        php_root = php_dir(spec.domain)
+        generated_ini = php_ini_content(spec)
+        if _read_text_safely(php_root, "zz-wpfy.ini") != generated_ini:
+            _write_text_safely(php_root, "zz-wpfy.ini", generated_ini)
+            touched.append(str(php_root / "zz-wpfy.ini"))
+        if not _file_exists_safely(php_root, "custom.ini"):
+            _write_text_safely(php_root, "custom.ini", "")
+            touched.append(str(php_root / "custom.ini"))
+
+        nginx_root = nginx_dir(spec.domain)
+        if not _file_exists_safely(nginx_root, "cache-path.conf"):
+            _write_text_safely(nginx_root, "cache-path.conf", "")
+            touched.append(str(nginx_root / "cache-path.conf"))
+        if not _file_exists_safely(nginx_root, site_security.RATELIMIT_SNIPPET):
+            site_security._safe_write_in_place(nginx_root, site_security.RATELIMIT_SNIPPET, "", 0o644)
+            touched.append(str(nginx_root / site_security.RATELIMIT_SNIPPET))
+        if not _file_exists_safely(nginx_root, site_security.ACCESS_LOG_FILE):
+            site_security._safe_write_in_place(nginx_root, site_security.ACCESS_LOG_FILE, "", 0o640)
+            touched.append(str(nginx_root / site_security.ACCESS_LOG_FILE))
+        _chmod_file_safely(nginx_root, site_security.ACCESS_LOG_FILE, 0o640)
+        site_security._configure_access_log_rotation(spec.domain)
+        if not _file_exists_safely(nginx_root, site_security.HTPASSWD_FILE):
+            _write_text_safely(nginx_root, site_security.HTPASSWD_FILE, "")
+            touched.append(str(nginx_root / site_security.HTPASSWD_FILE))
+        _chmod_file_safely(nginx_root, site_security.HTPASSWD_FILE, 0o640)
+        extra_root = nginx_root / "extra"
+        if not _file_exists_safely(extra_root, "custom.conf"):
+            _write_text_safely(extra_root, "custom.conf", "")
+            touched.append(str(extra_root / "custom.conf"))
         if _read_text_safely(nginx_file.parent, nginx_file.name) != nginx_content:
             _write_text_safely(nginx_file.parent, nginx_file.name, nginx_content)
             touched.append(str(nginx_file))
+
+        if _read_text_safely(site_root, compose_file.name) != compose_rendered:
+            _write_text_safely(site_root, compose_file.name, compose_rendered)
+            touched.append(str(compose_file))
+
+        forwarded_scheme_result = site_security.render_forwarded_scheme(spec.domain)
+        if forwarded_scheme_result.exit_code != 0:
+            raise ValueError(forwarded_scheme_result.message)
+        if forwarded_scheme_result.changed:
+            touched.append(str(nginx_root / site_security.FORWARDED_SCHEME_SNIPPET))
+
+        security_state = site_root / site_security.SECURITY_STATE
+        security_state_existed = security_state.exists()
+        security_result = site_security.render_security(spec.domain)
+        if security_result.exit_code != 0:
+            raise ValueError(security_result.message)
+        if not security_state_existed and security_state.exists():
+            touched.append(str(security_state))
+        if security_result.changed:
+            touched.append(str(extra_root / site_security.SECURITY_SNIPPET))
     except OSError as exc:
         raise ValueError(f"unsafe scaffold destination: {exc}") from exc
     try:

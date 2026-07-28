@@ -10,6 +10,7 @@ from wpfy.traefik import (
     TRAEFIK_PROJECT,
     ensure_traefik_scaffold,
     ensure_traefik_network,
+    traefik_network_cidrs,
     traefik_status,
 )
 from wpfy.site_layout import RuntimeResult
@@ -141,6 +142,35 @@ def test_ensure_traefik_network_skipped_with_env(monkeypatch):
     assert result.skipped is True
 
 
+def test_traefik_network_cidrs_uses_docker_ipam(monkeypatch):
+    import subprocess
+
+    monkeypatch.delenv("WPFY_TEST_TRAEFIK_NETWORK_CIDRS", raising=False)
+    monkeypatch.setattr("wpfy.traefik.docker_available", lambda: True)
+    monkeypatch.setattr(
+        "wpfy.traefik.subprocess.run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            args[0], 0, '[{"Subnet":"172.18.0.0/16","Gateway":"172.18.0.1"}]\n', "",
+        ),
+    )
+
+    assert traefik_network_cidrs() == ("172.18.0.0/16",)
+
+
+def test_traefik_network_cidrs_refuses_missing_ipam(monkeypatch):
+    import subprocess
+
+    monkeypatch.delenv("WPFY_TEST_TRAEFIK_NETWORK_CIDRS", raising=False)
+    monkeypatch.setattr("wpfy.traefik.docker_available", lambda: True)
+    monkeypatch.setattr(
+        "wpfy.traefik.subprocess.run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(args[0], 0, "[]\n", ""),
+    )
+
+    with pytest.raises(RuntimeError, match="no subnet"):
+        traefik_network_cidrs()
+
+
 def test_ensure_traefik_scaffold_touches_files(tmp_wpfy_home, monkeypatch):
     from pathlib import Path
 
@@ -166,6 +196,58 @@ def test_traefik_status_before_scaffold_does_not_raise(tmp_wpfy_home, monkeypatc
 
     assert result.exit_code == 0
     assert "not installed" in result.message
+
+
+def test_start_recreates_running_traefik_when_static_config_changes(monkeypatch, tmp_path):
+    import subprocess
+    import wpfy.traefik as traefik
+
+    config = tmp_path / "traefik.yml"
+    calls = []
+    monkeypatch.setattr(traefik, "runtime_skip_requested", lambda: False)
+    monkeypatch.setattr(traefik, "docker_available", lambda: True)
+    monkeypatch.setattr(traefik, "traefik_running", lambda: True)
+    monkeypatch.setattr(traefik, "traefik_config_path", lambda: config)
+    monkeypatch.setattr(traefik, "ensure_traefik_scaffold", lambda: [str(config)])
+    monkeypatch.setattr(traefik, "ensure_traefik_network", lambda: RuntimeResult(0, "ok"))
+    monkeypatch.setattr(traefik, "ensure_panel_edge_network", lambda: RuntimeResult(0, "ok"))
+
+    def compose(*args):
+        calls.append(args)
+        return subprocess.CompletedProcess(args, 0, "Recreated", "")
+
+    monkeypatch.setattr(traefik, "_traefik_compose", compose)
+
+    result = traefik.start_traefik()
+
+    assert result.exit_code == 0
+    assert calls == [("up", "-d", "--force-recreate", "traefik")]
+
+
+def test_start_does_not_recreate_when_static_config_is_unchanged(monkeypatch, tmp_path):
+    import subprocess
+    import wpfy.traefik as traefik
+
+    config = tmp_path / "traefik.yml"
+    calls = []
+    monkeypatch.setattr(traefik, "runtime_skip_requested", lambda: False)
+    monkeypatch.setattr(traefik, "docker_available", lambda: True)
+    monkeypatch.setattr(traefik, "traefik_running", lambda: True)
+    monkeypatch.setattr(traefik, "traefik_config_path", lambda: config)
+    monkeypatch.setattr(traefik, "ensure_traefik_scaffold", lambda: [])
+    monkeypatch.setattr(traefik, "ensure_traefik_network", lambda: RuntimeResult(0, "ok"))
+    monkeypatch.setattr(traefik, "ensure_panel_edge_network", lambda: RuntimeResult(0, "ok"))
+
+    def compose(*args):
+        calls.append(args)
+        return subprocess.CompletedProcess(args, 0, "Running", "")
+
+    monkeypatch.setattr(traefik, "_traefik_compose", compose)
+
+    result = traefik.start_traefik()
+
+    assert result.exit_code == 0
+    assert calls == [("up", "-d")]
 
 
 def test_acme_email_problem_flags_unconfigured_default(monkeypatch, tmp_path):
