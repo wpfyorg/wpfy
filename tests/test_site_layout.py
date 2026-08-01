@@ -458,6 +458,32 @@ def test_ensure_site_scaffold_writes_cache_managed_paths(tmp_wpfy_home, monkeypa
     assert (wpfy.site_layout.nginx_dir(domain) / "cache-path.conf").read_text(encoding="utf-8") == ""
 
 
+def test_ensure_site_scaffold_skips_unrecognised_wp_config(tmp_wpfy_home, monkeypatch):
+    import wpfy.site_layout
+
+    importlib.reload(wpfy.site_layout)
+    domain = "unrecognised-config.example.com"
+    spec = wpfy.site_layout.SiteSpec(domain=domain, flavor="wp", use_mysql=True, use_redis=False)
+    wpfy.site_layout.ensure_site_scaffold(spec)
+    config = wpfy.site_layout.app_dir(domain) / "wp-config.php"
+    content = (
+        b"<?php\n$table_prefix = 'wp_';\nif ( ! defined( 'ABSPATH' ) ) {\n"
+        b"    define( 'ABSPATH', __DIR__ . '/' );\n}\nrequire_once ABSPATH . 'wp-settings.php';\n"
+    )
+    config.write_bytes(content)
+    events = []
+    monkeypatch.setattr(wpfy.site_layout, "record_event", lambda *args, **kwargs: events.append((args, kwargs)))
+
+    wpfy.site_layout.ensure_site_scaffold(spec)
+
+    assert config.read_bytes() == content
+    assert events == [(("site.wp-config-anchor",), {
+        "domain": domain,
+        "outcome": "skipped",
+        "detail": "wp-config.php anchor repair skipped: unrecognised config shape",
+    })]
+
+
 def test_ensure_site_scaffold_writes_private_env(tmp_wpfy_home, monkeypatch):
     import wpfy.site_layout
 

@@ -78,25 +78,25 @@ def test_traefik_compose_content_has_no_acme_command():
     assert "certificatesresolvers.le.acme" not in content
 
 
-def test_traefik_static_config_has_api():
+def test_traefik_static_config_has_api(tmp_wpfy_home):
     config = traefik_static_config()
     assert "api:" in config
     assert "dashboard: false" in config
 
 
-def test_traefik_static_config_has_ping():
+def test_traefik_static_config_has_ping(tmp_wpfy_home):
     config = traefik_static_config()
     assert "ping: {}" in config
 
 
-def test_traefik_static_config_has_entrypoints():
+def test_traefik_static_config_has_entrypoints(tmp_wpfy_home):
     config = traefik_static_config()
     assert "entryPoints:" in config
     assert 'address: ":80"' in config
     assert 'address: ":443"' in config
 
 
-def test_traefik_static_config_has_providers():
+def test_traefik_static_config_has_providers(tmp_wpfy_home):
     config = traefik_static_config()
     assert "providers:" in config
     assert "docker:" in config
@@ -104,32 +104,32 @@ def test_traefik_static_config_has_providers():
     assert f"network: {TRAEFIK_NETWORK}" in config
 
 
-def test_traefik_static_config_has_acme_resolver(monkeypatch):
+def test_traefik_static_config_has_acme_resolver(tmp_wpfy_home, monkeypatch):
     monkeypatch.setenv("WPFY_ACME_EMAIL", "ops@example.com")
     config = traefik_static_config()
     assert "certificatesResolvers:" in config
     assert "  le:" in config
     assert "    acme:" in config
-    assert "      email: ops@example.com" in config
+    assert '      email: "ops@example.com"' in config
     assert "      storage: /letsencrypt/acme.json" in config
     assert "      tlsChallenge: {}" in config
 
 
-def test_traefik_static_config_has_http_challenge_resolver():
+def test_traefik_static_config_has_http_challenge_resolver(tmp_wpfy_home):
     config = traefik_static_config()
     assert "  le-http:" in config
     assert "      httpChallenge:" in config
     assert "        entryPoint: web" in config
 
 
-def test_traefik_static_config_has_cloudflare_dns_resolver():
+def test_traefik_static_config_has_cloudflare_dns_resolver(tmp_wpfy_home):
     config = traefik_static_config()
     assert "  le-dns-cloudflare:" in config
     assert "      dnsChallenge:" in config
     assert "        provider: cloudflare" in config
 
 
-def test_traefik_static_config_is_text():
+def test_traefik_static_config_is_text(tmp_wpfy_home):
     config = traefik_static_config()
     assert isinstance(config, str)
     assert config.endswith("\n")
@@ -198,7 +198,7 @@ def test_traefik_status_before_scaffold_does_not_raise(tmp_wpfy_home, monkeypatc
     assert "not installed" in result.message
 
 
-def test_start_recreates_running_traefik_when_static_config_changes(monkeypatch, tmp_path):
+def test_start_recreates_running_traefik_when_static_config_changes(monkeypatch, tmp_wpfy_home, tmp_path):
     import subprocess
     import wpfy.traefik as traefik
 
@@ -206,9 +206,11 @@ def test_start_recreates_running_traefik_when_static_config_changes(monkeypatch,
     calls = []
     monkeypatch.setattr(traefik, "runtime_skip_requested", lambda: False)
     monkeypatch.setattr(traefik, "docker_available", lambda: True)
+    monkeypatch.setattr(traefik, "_pull_traefik_image", lambda: RuntimeResult(0, "ready"))
     monkeypatch.setattr(traefik, "traefik_running", lambda: True)
-    monkeypatch.setattr(traefik, "traefik_config_path", lambda: config)
-    monkeypatch.setattr(traefik, "ensure_traefik_scaffold", lambda: [str(config)])
+    monkeypatch.setattr(traefik, "_ensure_traefik_scaffold", lambda: [str(config)])
+    monkeypatch.setattr(traefik, "_traefik_static_config", lambda: "changed")
+    monkeypatch.setattr(traefik, "_applied_config_hash", lambda: None)
     monkeypatch.setattr(traefik, "ensure_traefik_network", lambda: RuntimeResult(0, "ok"))
     monkeypatch.setattr(traefik, "ensure_panel_edge_network", lambda: RuntimeResult(0, "ok"))
 
@@ -217,6 +219,8 @@ def test_start_recreates_running_traefik_when_static_config_changes(monkeypatch,
         return subprocess.CompletedProcess(args, 0, "Recreated", "")
 
     monkeypatch.setattr(traefik, "_traefik_compose", compose)
+    monkeypatch.setattr(traefik, "_wait_for_traefik_healthy", lambda: RuntimeResult(0, "healthy"))
+    monkeypatch.setattr(traefik, "_record_applied_state", lambda config: None)
 
     result = traefik.start_traefik()
 
@@ -224,17 +228,23 @@ def test_start_recreates_running_traefik_when_static_config_changes(monkeypatch,
     assert calls == [("up", "-d", "--force-recreate", "traefik")]
 
 
-def test_start_does_not_recreate_when_static_config_is_unchanged(monkeypatch, tmp_path):
+def test_start_does_not_recreate_when_static_config_is_unchanged(monkeypatch, tmp_wpfy_home, tmp_path):
     import subprocess
     import wpfy.traefik as traefik
 
     config = tmp_path / "traefik.yml"
+    # "unchanged" must be true of the rendered file as well as the recorded
+    # hash: since L8 the file is authoritative, because it is what Traefik reads.
+    config.write_text("unchanged", encoding="utf-8")
     calls = []
     monkeypatch.setattr(traefik, "runtime_skip_requested", lambda: False)
     monkeypatch.setattr(traefik, "docker_available", lambda: True)
+    monkeypatch.setattr(traefik, "_pull_traefik_image", lambda: RuntimeResult(0, "ready"))
     monkeypatch.setattr(traefik, "traefik_running", lambda: True)
+    monkeypatch.setattr(traefik, "_ensure_traefik_scaffold", lambda: [])
     monkeypatch.setattr(traefik, "traefik_config_path", lambda: config)
-    monkeypatch.setattr(traefik, "ensure_traefik_scaffold", lambda: [])
+    monkeypatch.setattr(traefik, "_traefik_static_config", lambda: "unchanged")
+    monkeypatch.setattr(traefik, "_applied_config_hash", lambda: traefik._config_hash("unchanged"))
     monkeypatch.setattr(traefik, "ensure_traefik_network", lambda: RuntimeResult(0, "ok"))
     monkeypatch.setattr(traefik, "ensure_panel_edge_network", lambda: RuntimeResult(0, "ok"))
 
@@ -243,6 +253,8 @@ def test_start_does_not_recreate_when_static_config_is_unchanged(monkeypatch, tm
         return subprocess.CompletedProcess(args, 0, "Running", "")
 
     monkeypatch.setattr(traefik, "_traefik_compose", compose)
+    monkeypatch.setattr(traefik, "_wait_for_traefik_healthy", lambda: RuntimeResult(0, "healthy"))
+    monkeypatch.setattr(traefik, "_record_applied_state", lambda config: None)
 
     result = traefik.start_traefik()
 
@@ -250,7 +262,41 @@ def test_start_does_not_recreate_when_static_config_is_unchanged(monkeypatch, tm
     assert calls == [("up", "-d")]
 
 
-def test_acme_email_problem_flags_unconfigured_default(monkeypatch, tmp_path):
+def test_start_records_only_after_healthy_apply(monkeypatch, tmp_wpfy_home):
+    import subprocess
+    import wpfy.traefik as traefik
+
+    monkeypatch.setattr(traefik, "runtime_skip_requested", lambda: False)
+    monkeypatch.setattr(traefik, "docker_available", lambda: True)
+    monkeypatch.setattr(traefik, "_pull_traefik_image", lambda: RuntimeResult(0, "ready"))
+    monkeypatch.setattr(traefik, "traefik_running", lambda: True)
+    monkeypatch.setattr(traefik, "ensure_traefik_network", lambda: RuntimeResult(0, "ok"))
+    monkeypatch.setattr(traefik, "ensure_panel_edge_network", lambda: RuntimeResult(0, "ok"))
+    monkeypatch.setattr(
+        traefik,
+        "_traefik_compose",
+        lambda *args: subprocess.CompletedProcess(args, 0, "started", ""),
+    )
+    monkeypatch.setattr(traefik, "_wait_for_traefik_healthy", lambda: RuntimeResult(1, "unhealthy"))
+
+    assert traefik.start_traefik().exit_code == 1
+    assert traefik.applied_config_hash() is None
+
+    monkeypatch.setattr(traefik, "_wait_for_traefik_healthy", lambda: RuntimeResult(0, "healthy"))
+    assert traefik.start_traefik().exit_code == 0
+    assert traefik.applied_config_hash() is not None
+
+
+def test_traefik_transaction_rejects_same_thread_reentry(tmp_wpfy_home):
+    import wpfy.traefik as traefik
+
+    with traefik.traefik_transaction():
+        with pytest.raises(RuntimeError, match="cannot be re-entered"):
+            with traefik.traefik_transaction():
+                pass
+
+
+def test_acme_email_problem_flags_unconfigured_default(monkeypatch, tmp_wpfy_home, tmp_path):
     import wpfy.traefik as traefik
 
     monkeypatch.setattr(traefik, "traefik_config_path", lambda: tmp_path / "traefik.yml")
@@ -259,10 +305,10 @@ def test_acme_email_problem_flags_unconfigured_default(monkeypatch, tmp_path):
     problem = traefik.acme_email_problem()
 
     assert problem is not None
-    assert "WPFY_ACME_EMAIL" in problem
+    assert "stack acme-email" in problem
 
 
-def test_acme_email_problem_accepts_valid_env_email(monkeypatch, tmp_path):
+def test_acme_email_problem_accepts_valid_env_email(monkeypatch, tmp_wpfy_home, tmp_path):
     import wpfy.traefik as traefik
 
     monkeypatch.setattr(traefik, "traefik_config_path", lambda: tmp_path / "traefik.yml")
@@ -271,7 +317,7 @@ def test_acme_email_problem_accepts_valid_env_email(monkeypatch, tmp_path):
     assert traefik.acme_email_problem() is None
 
 
-def test_acme_email_problem_rejects_malformed_env_email(monkeypatch, tmp_path):
+def test_acme_email_problem_rejects_malformed_env_email(monkeypatch, tmp_wpfy_home, tmp_path):
     import wpfy.traefik as traefik
 
     monkeypatch.setattr(traefik, "traefik_config_path", lambda: tmp_path / "traefik.yml")
@@ -280,7 +326,7 @@ def test_acme_email_problem_rejects_malformed_env_email(monkeypatch, tmp_path):
     assert traefik.acme_email_problem() is not None
 
 
-def test_acme_email_problem_reads_scaffolded_config_over_env(monkeypatch, tmp_path):
+def test_acme_email_problem_prefers_valid_env_over_config(monkeypatch, tmp_wpfy_home, tmp_path):
     import wpfy.traefik as traefik
 
     config = tmp_path / "traefik.yml"
@@ -293,15 +339,17 @@ def test_acme_email_problem_reads_scaffolded_config_over_env(monkeypatch, tmp_pa
     # valid env var alone is not enough until the scaffold is regenerated.
     monkeypatch.setenv("WPFY_ACME_EMAIL", "ops@example.com")
 
-    assert traefik.acme_email_problem() is not None
+    assert traefik.acme_email_problem() is None
 
 
-def test_acme_email_problem_accepts_valid_scaffolded_config(monkeypatch, tmp_path):
+def test_acme_email_problem_accepts_valid_scaffolded_config(monkeypatch, tmp_wpfy_home, tmp_path):
     import wpfy.traefik as traefik
 
     config = tmp_path / "traefik.yml"
     config.write_text(
-        "certificatesResolvers:\n  le:\n    acme:\n      email: ops@example.com\n",
+        "certificatesResolvers:\n  le:\n    acme:\n      email: ops@example.com\n"
+        "  le-http:\n    acme:\n      email: ops@example.com\n"
+        "  le-dns-cloudflare:\n    acme:\n      email: ops@example.com\n",
         encoding="utf-8",
     )
     monkeypatch.setattr(traefik, "traefik_config_path", lambda: config)

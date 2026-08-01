@@ -136,12 +136,13 @@ def test_upgrade_reports_missing_install(monkeypatch, tmp_path):
     assert result.exit_code == 2
 
 
-def test_upgrade_reports_restart_failure_and_exception(monkeypatch):
+def test_upgrade_reports_restart_failure_and_exception(monkeypatch, tmp_wpfy_home):
     monkeypatch.setattr(stack.traefik, "traefik_compose_path", lambda: Path("/tmp/compose.yaml"))
     monkeypatch.setattr(stack.traefik, "traefik_dir", lambda: Path("/tmp"))
     monkeypatch.setattr(Path, "exists", lambda self: True)
     responses = iter((Proc(), Proc(9, stderr="restart failed")))
     monkeypatch.setattr(stack.subprocess, "run", lambda *args, **kwargs: next(responses))
+    monkeypatch.setattr(stack.traefik, "_wait_for_traefik_healthy", lambda: RuntimeResult(0, "healthy"))
 
     failed = stack.upgrade()
     monkeypatch.setattr(stack.subprocess, "run", lambda *args, **kwargs: (_ for _ in ()).throw(OSError("missing")))

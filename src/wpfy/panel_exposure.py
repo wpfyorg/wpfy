@@ -168,8 +168,13 @@ def expose(domain, *, confirm, port=DEFAULT_PANEL_PORT) -> RuntimeResult:
         if not preflight.passed:
             return RuntimeResult(2, preflight.message)
 
-        traefik.ensure_traefik_scaffold()
-        start_result = traefik.start_traefik()
+        if not traefik.runtime_skip_requested() and traefik.docker_available():
+            pull_result = traefik._pull_traefik_image()
+            if pull_result.exit_code != 0:
+                return pull_result
+        with traefik.traefik_transaction():
+            traefik._ensure_traefik_scaffold()
+            start_result = traefik._start_traefik_locked()
         if start_result.exit_code != 0:
             return start_result
         host = edge_bind_address()

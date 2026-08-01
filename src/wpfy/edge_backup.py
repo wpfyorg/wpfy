@@ -49,30 +49,31 @@ def backup_edge(
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
     archive_path = backup_dir / f"edge-{stamp}.tar.gz"
 
-    with tempfile.TemporaryDirectory(prefix="wpfy-edge-backup-") as temp_dir:
-        root = Path(temp_dir) / "edge"
-        root.mkdir()
-        copied = 0
-        for source, name in (
-            (traefik.traefik_compose_path(), "compose.yaml"),
-            (traefik.traefik_config_path(), "traefik.yml"),
-        ):
-            if source.exists():
-                shutil.copy2(source, root / name)
+    with traefik.traefik_transaction():
+        with tempfile.TemporaryDirectory(prefix="wpfy-edge-backup-") as temp_dir:
+            root = Path(temp_dir) / "edge"
+            root.mkdir()
+            copied = 0
+            for source, name in (
+                (traefik.traefik_compose_path(), "compose.yaml"),
+                (traefik.traefik_config_path(), "traefik.yml"),
+            ):
+                if source.exists():
+                    shutil.copy2(source, root / name)
+                    copied += 1
+            acme = root / "letsencrypt" / "acme.json"
+            acme.parent.mkdir()
+            if _local_acme_path().exists():
+                shutil.copy2(_local_acme_path(), acme)
                 copied += 1
-        acme = root / "letsencrypt" / "acme.json"
-        acme.parent.mkdir()
-        if _local_acme_path().exists():
-            shutil.copy2(_local_acme_path(), acme)
-            copied += 1
-        elif _copy_acme_from_container(acme):
-            copied += 1
-        if copied == 0:
-            return RuntimeResult(2, "edge state not found")
-        if acme.exists():
-            acme.chmod(0o600)
-        with tarfile.open(archive_path, "w:gz") as archive:
-            archive.add(root, arcname="edge", recursive=True)
+            elif _copy_acme_from_container(acme):
+                copied += 1
+            if copied == 0:
+                return RuntimeResult(2, "edge state not found")
+            if acme.exists():
+                acme.chmod(0o600)
+            with tarfile.open(archive_path, "w:gz") as archive:
+                archive.add(root, arcname="edge", recursive=True)
     archive_path.chmod(0o600)
 
     verify = subprocess.run(["tar", "-tzf", str(archive_path)], check=False, capture_output=True, text=True)
@@ -130,18 +131,19 @@ def restore_edge(archive_path: str, *, force: bool) -> RuntimeResult:
         root = Path(temp_dir) / "edge"
         if not root.exists():
             return RuntimeResult(2, "edge archive missing edge root")
-        traefik.traefik_dir().mkdir(parents=True, exist_ok=True)
-        for source_file, target in (
-            (root / "compose.yaml", traefik.traefik_compose_path()),
-            (root / "traefik.yml", traefik.traefik_config_path()),
-            (root / "letsencrypt" / "acme.json", _local_acme_path()),
-        ):
-            if source_file.exists():
-                target.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(source_file, target)
-                if target.name == "acme.json":
-                    target.chmod(0o600)
-        runtime = traefik.restart_traefik_existing()
+        with traefik.traefik_transaction():
+            traefik.traefik_dir().mkdir(parents=True, exist_ok=True)
+            for source_file, target in (
+                (root / "compose.yaml", traefik.traefik_compose_path()),
+                (root / "traefik.yml", traefik.traefik_config_path()),
+                (root / "letsencrypt" / "acme.json", _local_acme_path()),
+            ):
+                if source_file.exists():
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(source_file, target)
+                    if target.name == "acme.json":
+                        target.chmod(0o600)
+            runtime = traefik._restart_traefik_existing_locked()
     if runtime.exit_code != 0:
         return RuntimeResult(runtime.exit_code, f"edge restored; traefik restart failed: {runtime.message}", ran=True)
     return RuntimeResult(0, f"edge restored from {archive_path}; {runtime.message}", ran=True)

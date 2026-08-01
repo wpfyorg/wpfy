@@ -1,26 +1,47 @@
 from __future__ import annotations
 
 import ipaddress
+from contextlib import contextmanager
+from dataclasses import dataclass
+import fcntl
+import hashlib
 import json
 import os
 import re
 import shutil
 import subprocess
+import threading
+import time
+import uuid
 from pathlib import Path
 
 from . import settings
 from .site_runtime import RuntimeResult, docker_available, runtime_skip_requested
 from .dns import cloudflare_config_path
 from .site_definition import compose_hardening_lines
+from .site_paths import read_env
 
 
 TRAEFIK_IMAGE = "traefik:v3.6.17"
 _DEFAULT_ACME_EMAIL = "admin@localhost"
-_ACME_EMAIL_RE = re.compile(r"[^@\s]+@[^@\s.]+(?:\.[^@\s.]+)+")
+_ACME_EMAIL_RE = re.compile(
+    r"[A-Za-z0-9][A-Za-z0-9.!#$%&'+/=?^_`{|}~-]*@"
+    r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
+    r"(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+"
+)
 TRAEFIK_NETWORK = "wpfy"
 PANEL_EDGE_NETWORK = "wpfy-panel-edge"
 TRAEFIK_CONTAINER = "wpfy-traefik"
 TRAEFIK_PROJECT = "wpfy-traefik"
+_COMPOSE_TIMEOUT_SECONDS = 120
+_HEALTH_TIMEOUT_SECONDS = 180
+_transaction_state = threading.local()
+
+
+@dataclass(frozen=True, slots=True)
+class AcmeEmailResolution:
+    email: str
+    source: str
 
 
 def traefik_dir() -> Path:
@@ -35,6 +56,146 @@ def traefik_config_path() -> Path:
     return traefik_dir() / "traefik.yml"
 
 
+def acme_email_path() -> Path:
+    return Path(settings.PATHS.config_dir) / "acme.env"
+
+
+def applied_state_path() -> Path:
+    return Path(settings.PATHS.state_dir) / "traefik-applied.json"
+
+
+@contextmanager
+def traefik_transaction():
+    if getattr(_transaction_state, "held", False):
+        raise RuntimeError("Traefik transaction cannot be re-entered in the same thread")
+    path = Path(settings.PATHS.state_dir) / "traefik.lock"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        _transaction_state.held = True
+        yield
+    finally:
+        _transaction_state.held = False
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+def _valid_acme_email(address: object) -> bool:
+    return isinstance(address, str) and bool(_ACME_EMAIL_RE.fullmatch(address))
+
+
+def _config_acme_email() -> str | None:
+    try:
+        text = traefik_config_path().read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return None
+    emails: list[str] = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("email:"):
+            continue
+        value = stripped.split(":", 1)[1].strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        emails.append(value)
+    if len(emails) == 3 and len(set(emails)) == 1 and _valid_acme_email(emails[0]):
+        return emails[0]
+    return None
+
+
+def _file_acme_email() -> str | None:
+    try:
+        value = read_env(acme_email_path()).get("WPFY_ACME_EMAIL", "").strip()
+    except OSError:
+        return None
+    return value if _valid_acme_email(value) else None
+
+
+def resolve_acme_email() -> AcmeEmailResolution:
+    """Resolve desired ACME address. Caller holds transaction when state can change."""
+    environment = os.environ.get("WPFY_ACME_EMAIL", "").strip()
+    if _valid_acme_email(environment):
+        return AcmeEmailResolution(environment, "env")
+    persisted = _file_acme_email()
+    if persisted:
+        return AcmeEmailResolution(persisted, "file")
+    configured = _config_acme_email()
+    if configured:
+        return AcmeEmailResolution(configured, "config")
+    return AcmeEmailResolution(_DEFAULT_ACME_EMAIL, "default")
+
+
+def _atomic_write(path: Path, content: bytes, mode: int = 0o600) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        os.chmod(path, mode)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def _set_acme_email(address: str) -> Path:
+    if not _valid_acme_email(address):
+        raise ValueError("ACME contact email must be a valid email address")
+    path = acme_email_path()
+    _atomic_write(path, f"WPFY_ACME_EMAIL={address}\n".encode("utf-8"))
+    return path
+
+
+def set_acme_email(address: str) -> Path:
+    with traefik_transaction():
+        return _set_acme_email(address)
+
+
+def _config_hash(config_text: str) -> str:
+    return hashlib.sha256(config_text.encode("utf-8")).hexdigest()
+
+
+def _applied_config_hash() -> str | None:
+    try:
+        payload = json.loads(applied_state_path().read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    value = payload.get("hash") if isinstance(payload, dict) else None
+    return value if isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value) else None
+
+
+def applied_config_hash() -> str | None:
+    with traefik_transaction():
+        return _applied_config_hash()
+
+
+def _record_applied_state(config_text: str) -> None:
+    _atomic_write(applied_state_path(), (json.dumps({"hash": _config_hash(config_text)}) + "\n").encode("utf-8"))
+
+
+def record_applied_state(config_text: str) -> None:
+    with traefik_transaction():
+        _record_applied_state(config_text)
+
+
+def _clear_applied_state() -> None:
+    try:
+        applied_state_path().unlink()
+    except FileNotFoundError:
+        pass
+
+
+def clear_applied_state() -> None:
+    with traefik_transaction():
+        _clear_applied_state()
+
+
 def _traefik_compose(*args: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         ["docker", "compose", *args],
@@ -42,6 +203,7 @@ def _traefik_compose(*args: str) -> subprocess.CompletedProcess[str]:
         check=False,
         capture_output=True,
         text=True,
+        timeout=_COMPOSE_TIMEOUT_SECONDS,
     )
 
 
@@ -126,34 +288,32 @@ def traefik_network_cidrs(network_name: str = TRAEFIK_NETWORK) -> tuple[str, ...
 
 
 def effective_acme_email() -> str:
-    """The ACME contact email Traefik will actually use: the one already
-    written to traefik.yml if the proxy is scaffolded, else the env value
-    a future scaffold would render."""
-    config_file = traefik_config_path()
-    if config_file.exists():
-        for line in config_file.read_text(encoding="utf-8").splitlines():
-            stripped = line.strip()
-            if stripped.startswith("email:"):
-                return stripped.split(":", 1)[1].strip()
-    return os.environ.get("WPFY_ACME_EMAIL", _DEFAULT_ACME_EMAIL)
+    with traefik_transaction():
+        return resolve_acme_email().email
 
 
 def acme_email_problem() -> str | None:
     """Return an actionable message if certificate issuance would fail at ACME
     registration because no real contact email is configured, else None."""
-    email = effective_acme_email()
-    if email and email != _DEFAULT_ACME_EMAIL and _ACME_EMAIL_RE.fullmatch(email):
-        return None
-    return (
-        f"ACME contact email is not configured (current: {email or 'unset'}); "
-        "Let's Encrypt rejects invalid contact addresses. "
-        "Set WPFY_ACME_EMAIL=you@example.com and re-run 'wpfy stack install --nginx'; "
-        "wpfy will recreate a running Traefik when its static config changes. Then retry enabling SSL"
-    )
+    with traefik_transaction():
+        if resolve_acme_email().source != "default":
+            return None
+        return (
+            "ACME contact email is not configured; "
+            "Let's Encrypt rejects invalid contact addresses. "
+            "Run 'wpfy stack acme-email you@example.com', then restart Traefik if requested. "
+            "Then retry enabling SSL"
+        )
 
 
 def traefik_static_config() -> str:
-    acme_email = os.environ.get("WPFY_ACME_EMAIL", _DEFAULT_ACME_EMAIL)
+    with traefik_transaction():
+        return _traefik_static_config()
+
+
+def _traefik_static_config() -> str:
+    """Render static config. Caller holds the Traefik transaction."""
+    acme_email = resolve_acme_email().email
     lines = [
         "api:",
         "  dashboard: false",
@@ -178,7 +338,7 @@ def traefik_static_config() -> str:
         "certificatesResolvers:",
         "  le:",
         "    acme:",
-        f"      email: {acme_email}",
+        f'      email: "{acme_email}"',
         "      storage: /letsencrypt/acme.json",
         "      tlsChallenge: {}",
         # le-http validates over plain HTTP on :80, so it works for domains
@@ -186,18 +346,43 @@ def traefik_static_config() -> str:
         # /.well-known/acme-challenge/ path to the origin.
         "  le-http:",
         "    acme:",
-        f"      email: {acme_email}",
+        f'      email: "{acme_email}"',
         "      storage: /letsencrypt/acme.json",
         "      httpChallenge:",
         "        entryPoint: web",
         "  le-dns-cloudflare:",
         "    acme:",
-        f"      email: {acme_email}",
+        f'      email: "{acme_email}"',
         "      storage: /letsencrypt/acme.json",
         "      dnsChallenge:",
         "        provider: cloudflare",
     ]
     return "\n".join(lines) + "\n"
+
+
+def _static_config_needs_apply() -> bool:
+    """True when the rendered file, or the running proxy, is not the desired config.
+
+    The rendered file is authoritative and is checked first: it is what Traefik
+    reads, so a mismatch there always needs an apply no matter what any recorded
+    state claims. Recorded state only answers the narrower question of whether
+    the running container has loaded a file that is already correct — Traefik
+    reads static config at startup only. Trusting the record alone let a wrong
+    record hide a wrong file indefinitely.
+    """
+    desired = _traefik_static_config()
+    try:
+        on_disk = traefik_config_path().read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return True
+    if on_disk != desired:
+        return True
+    return _config_hash(desired) != _applied_config_hash()
+
+
+def static_config_needs_apply() -> bool:
+    with traefik_transaction():
+        return _static_config_needs_apply()
 
 
 def traefik_compose_content() -> str:
@@ -248,7 +433,21 @@ def traefik_compose_content() -> str:
     return "\n".join(lines) + "\n"
 
 
-def ensure_traefik_scaffold() -> list[str]:
+def _migrate_or_bootstrap_acme_email() -> None:
+    """Persist only legacy floor migration or first valid environment bootstrap."""
+    if acme_email_path().exists():
+        return
+    floor = _config_acme_email()
+    if floor:
+        _set_acme_email(floor)
+        return
+    environment = os.environ.get("WPFY_ACME_EMAIL", "").strip()
+    if _valid_acme_email(environment):
+        _set_acme_email(environment)
+
+
+def _ensure_traefik_scaffold() -> list[str]:
+    """Write generated files in place. Caller holds the Traefik transaction."""
     touched: list[str] = []
     td = traefik_dir()
     if not td.exists():
@@ -272,12 +471,124 @@ def ensure_traefik_scaffold() -> list[str]:
         touched.append(str(compose_file))
 
     config_file = traefik_config_path()
-    config_content = traefik_static_config()
+    _migrate_or_bootstrap_acme_email()
+    config_content = _traefik_static_config()
     if not config_file.exists() or config_file.read_text(encoding="utf-8") != config_content:
-        config_file.write_text(config_content, encoding="utf-8")
+        with config_file.open("w", encoding="utf-8") as stream:
+            stream.write(config_content)
+            stream.flush()
+            os.fsync(stream.fileno())
         touched.append(str(config_file))
 
     return touched
+
+
+def ensure_traefik_scaffold() -> list[str]:
+    with traefik_transaction():
+        return _ensure_traefik_scaffold()
+
+
+def _wait_for_traefik_healthy() -> RuntimeResult:
+    """Wait for Traefik health. Caller holds the Traefik transaction."""
+    deadline = time.monotonic() + _HEALTH_TIMEOUT_SECONDS
+    while time.monotonic() < deadline:
+        try:
+            proc = subprocess.run(
+                ["docker", "inspect", "--format", "{{.State.Health.Status}}", TRAEFIK_CONTAINER],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            return RuntimeResult(1, f"Traefik health inspection failed: {exc}")
+        if proc.returncode == 0 and proc.stdout.strip() == "healthy":
+            return RuntimeResult(0, "traefik is healthy", ran=True)
+        time.sleep(1)
+    return RuntimeResult(
+        1,
+        f"Traefik did not become healthy within {_HEALTH_TIMEOUT_SECONDS} seconds; "
+        "it may still be starting, check 'wpfy stack status'",
+    )
+
+
+def _start_traefik() -> RuntimeResult:
+    """Apply desired static config. Caller holds the Traefik transaction."""
+    was_running = traefik_running()
+    # Decide this BEFORE the scaffold writes, or the comparison is made against
+    # the file we are about to overwrite and every change looks like a no-op.
+    needs_apply = _static_config_needs_apply()
+    _ensure_traefik_scaffold()
+    desired = _traefik_static_config()
+    for ensure_network in (ensure_traefik_network, ensure_panel_edge_network):
+        net_result = ensure_network()
+        if net_result.exit_code != 0:
+            return net_result
+    command = (
+        ("up", "-d", "--force-recreate", "traefik")
+        if was_running and needs_apply
+        else ("up", "-d")
+    )
+    try:
+        proc = _traefik_compose(*command)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return RuntimeResult(1, f"docker compose up failed: {exc}")
+    if proc.returncode != 0:
+        message = proc.stderr.strip() or proc.stdout.strip() or "docker compose up failed"
+        return RuntimeResult(proc.returncode, message)
+    health = _wait_for_traefik_healthy()
+    if health.exit_code != 0:
+        return health
+    _record_applied_state(desired)
+    message = proc.stdout.strip() or proc.stderr.strip() or "traefik started"
+    return RuntimeResult(0, message, ran=True)
+
+
+def _start_traefik_locked() -> RuntimeResult:
+    """Start Traefik. Caller holds the Traefik transaction."""
+    if runtime_skip_requested():
+        return RuntimeResult(0, "traefik start skipped by WPFY_SKIP_RUNTIME=1", skipped=True)
+    if not docker_available():
+        return RuntimeResult(0, "traefik start skipped (Docker/Compose not available)", skipped=True)
+    return _start_traefik()
+
+
+def _traefik_image_available() -> bool:
+    try:
+        proc = subprocess.run(
+            ["docker", "image", "inspect", TRAEFIK_IMAGE],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return proc.returncode == 0
+
+
+def _pull_traefik_image() -> RuntimeResult:
+    """Pull before acquiring the Traefik transaction."""
+    if _traefik_image_available():
+        return RuntimeResult(0, "Traefik image already available", ran=True)
+    try:
+        proc = subprocess.run(
+            ["docker", "pull", TRAEFIK_IMAGE],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=_COMPOSE_TIMEOUT_SECONDS,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        if _traefik_image_available():
+            return RuntimeResult(0, f"Traefik image pull failed; using local image: {exc}", ran=True)
+        return RuntimeResult(1, f"Traefik image pull failed: {exc}")
+    if proc.returncode != 0:
+        message = proc.stderr.strip() or proc.stdout.strip() or "Traefik image pull failed"
+        if _traefik_image_available():
+            return RuntimeResult(0, f"Traefik image pull failed; using local image: {message}", ran=True)
+        return RuntimeResult(proc.returncode, message)
+    return RuntimeResult(0, "Traefik image ready", ran=True)
 
 
 def start_traefik() -> RuntimeResult:
@@ -285,35 +596,40 @@ def start_traefik() -> RuntimeResult:
         return RuntimeResult(0, "traefik start skipped by WPFY_SKIP_RUNTIME=1", skipped=True)
     if not docker_available():
         return RuntimeResult(0, "traefik start skipped (Docker/Compose not available)", skipped=True)
+    pulled = _pull_traefik_image()
+    if pulled.exit_code != 0:
+        return pulled
+    with traefik_transaction():
+        return _start_traefik_locked()
 
-    was_running = traefik_running()
-    touched = ensure_traefik_scaffold()
-    for ensure_network in (ensure_traefik_network, ensure_panel_edge_network):
-        net_result = ensure_network()
-        if net_result.exit_code != 0:
-            return net_result
 
-    static_changed = str(traefik_config_path()) in touched
-    command = ("up", "-d", "--force-recreate", "traefik") if was_running and static_changed else ("up", "-d")
-    proc = _traefik_compose(*command)
+def _restart_traefik_existing() -> RuntimeResult:
+    """Restart restored config. Caller holds the Traefik transaction."""
+    try:
+        proc = _traefik_compose("restart", "traefik")
+    except (OSError, subprocess.SubprocessError) as exc:
+        return RuntimeResult(1, f"traefik restart failed: {exc}")
     if proc.returncode != 0:
-        message = proc.stderr.strip() or proc.stdout.strip() or "docker compose up failed"
+        message = proc.stderr.strip() or proc.stdout.strip() or "docker compose restart failed"
         return RuntimeResult(proc.returncode, message)
-    message = proc.stdout.strip() or proc.stderr.strip() or "traefik started"
+    health = _wait_for_traefik_healthy()
+    if health.exit_code != 0:
+        return health
+    try:
+        config_text = traefik_config_path().read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        return RuntimeResult(1, f"cannot read restored Traefik config: {exc}")
+    _record_applied_state(config_text)
+    message = proc.stdout.strip() or proc.stderr.strip() or "traefik restarted"
     return RuntimeResult(0, message, ran=True)
 
 
-def restart_traefik_existing() -> RuntimeResult:
-    if runtime_skip_requested():
-        return RuntimeResult(0, "traefik restart skipped by WPFY_SKIP_RUNTIME=1", skipped=True)
-    if not docker_available():
-        return RuntimeResult(0, "traefik restart skipped (Docker/Compose not available)", skipped=True)
-    ensure_traefik_scaffold()
-    for ensure_network in (ensure_traefik_network, ensure_panel_edge_network):
-        net_result = ensure_network()
-        if net_result.exit_code != 0:
-            return net_result
-    proc = _traefik_compose("restart", "traefik")
+def _restart_traefik_without_state() -> RuntimeResult:
+    """Restart existing Traefik. Caller holds the Traefik transaction."""
+    try:
+        proc = _traefik_compose("restart", "traefik")
+    except (OSError, subprocess.SubprocessError) as exc:
+        return RuntimeResult(1, f"traefik restart failed: {exc}")
     if proc.returncode != 0:
         message = proc.stderr.strip() or proc.stdout.strip() or "docker compose restart failed"
         return RuntimeResult(proc.returncode, message)
@@ -321,10 +637,37 @@ def restart_traefik_existing() -> RuntimeResult:
     return RuntimeResult(0, message, ran=True)
 
 
+def _restart_traefik_existing_locked(*, scaffold: bool = False) -> RuntimeResult:
+    """Restart Traefik. Caller holds the Traefik transaction."""
+    if runtime_skip_requested():
+        return RuntimeResult(0, "traefik restart skipped by WPFY_SKIP_RUNTIME=1", skipped=True)
+    if not docker_available():
+        return RuntimeResult(0, "traefik restart skipped (Docker/Compose not available)", skipped=True)
+    if scaffold:
+        _ensure_traefik_scaffold()
+        for ensure_network in (ensure_traefik_network, ensure_panel_edge_network):
+            net_result = ensure_network()
+            if net_result.exit_code != 0:
+                return net_result
+        return _restart_traefik_without_state()
+    return _restart_traefik_existing()
+
+
+def restart_traefik_existing() -> RuntimeResult:
+    with traefik_transaction():
+        return _restart_traefik_existing_locked(scaffold=True)
+
+
 def stop_traefik() -> RuntimeResult:
     if runtime_skip_requested() or not docker_available():
         return RuntimeResult(0, "traefik stop skipped", skipped=True)
-    proc = _traefik_compose("down")
+    try:
+        with traefik_transaction():
+            proc = _traefik_compose("down")
+            if proc.returncode == 0:
+                _clear_applied_state()
+    except (OSError, subprocess.SubprocessError) as exc:
+        return RuntimeResult(1, f"docker compose down failed: {exc}")
     if proc.returncode != 0:
         message = proc.stderr.strip() or proc.stdout.strip() or "docker compose down failed"
         return RuntimeResult(proc.returncode, message)

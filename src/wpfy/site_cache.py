@@ -8,6 +8,7 @@ import stat
 import time
 
 from . import cache_operations
+from .events import record_event
 from .site_definition import (
     PAGE_CACHE_OPTIONS,
     WORDPRESS_FLAVORS,
@@ -49,7 +50,9 @@ PLUGIN_PURGE_ARGS = {
     "cache-enabler": ("cache-enabler", "clear"),
     "wp-fastest-cache": ("fastest-cache", "clear", "all"),
     "wp-rocket": ("rocket", "clean", "--confirm"),
-    "flying-press": ("flying-press", "purge"),
+    # FlyingPress registers preload-cache, purge-pages-and-preload,
+    # purge-everything and activate-license — there is no bare "purge".
+    "flying-press": ("flying-press", "purge-everything"),
 }
 
 
@@ -110,6 +113,7 @@ def _cache_snippet(plugin: str) -> str:
     if plugin == "wpfc":
         lines.extend([
             "fastcgi_cache WPFY;",
+            "add_header X-Wpfy-Cache $upstream_cache_status always;",
             "fastcgi_cache_methods GET HEAD;",
             'fastcgi_cache_key "$scheme$request_method$host$request_uri";',
             "fastcgi_cache_valid 200 301 302 10m;",
@@ -352,9 +356,17 @@ def set_page_cache(domain: str, plugin: str) -> CacheConfigurationResult:
     runtime = start_site_runtime(domain)
     if runtime.exit_code != 0 and not runtime.skipped:
         action = CacheActionResult("error", runtime.message, runtime.exit_code)
-        return CacheConfigurationResult(desired, (action,), touched)
-    configured = configure_site_cache(domain)
-    return CacheConfigurationResult(configured.definition, configured.actions, touched)
+        result = CacheConfigurationResult(desired, (action,), touched)
+    else:
+        configured = configure_site_cache(domain)
+        result = CacheConfigurationResult(configured.definition, configured.actions, touched)
+    record_event(
+        "cache.page.set",
+        domain=domain,
+        outcome="ok" if result.exit_code == 0 else "error",
+        detail=f"page cache={plugin}",
+    )
+    return result
 
 
 def set_object_cache(domain: str, backend: str) -> CacheConfigurationResult:
@@ -365,9 +377,17 @@ def set_object_cache(domain: str, backend: str) -> CacheConfigurationResult:
     runtime = start_site_runtime(domain)
     if runtime.exit_code != 0 and not runtime.skipped:
         action = CacheActionResult("error", runtime.message, runtime.exit_code)
-        return CacheConfigurationResult(desired, (action,), touched)
-    action = wire_redis_backend(domain)
-    return CacheConfigurationResult(desired, (action,), touched)
+        result = CacheConfigurationResult(desired, (action,), touched)
+    else:
+        action = wire_redis_backend(domain)
+        result = CacheConfigurationResult(desired, (action,), touched)
+    record_event(
+        "cache.object.set",
+        domain=domain,
+        outcome="ok" if result.exit_code == 0 else "error",
+        detail=f"object cache={backend}",
+    )
+    return result
 
 
 def purge_site_cache(domain: str) -> cache_operations.CacheResult:
@@ -387,4 +407,20 @@ def purge_site_cache(domain: str) -> cache_operations.CacheResult:
             ))
     outcomes.append(cache_operations._nginx(domain))
     outcomes.append(cache_operations._redis(domain))
-    return cache_operations.CacheResult(tuple(outcomes))
+    result = cache_operations.CacheResult(tuple(outcomes))
+    # Report which layers actually cleared, not merely which were attempted:
+    # after an incident the question is "was the cache purged", and a layer that
+    # was skipped or errored must be visible without consulting anything else.
+    if result.exit_code != 0:
+        event_outcome = "error"
+    elif all(outcome.status == "ok" for outcome in outcomes):
+        event_outcome = "ok"
+    else:
+        event_outcome = "partial"
+    record_event(
+        "cache.purge",
+        domain=domain,
+        outcome=event_outcome,
+        detail="layers=" + ",".join(f"{o.cache}:{o.status}" for o in outcomes),
+    )
+    return result

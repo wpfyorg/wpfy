@@ -183,10 +183,16 @@ def upgrade() -> StackResult:
             message = _process_message(pull, "pull failed")
             fact = StackFact("Traefik", "FAIL", f"pull failed: {message}", pull.returncode)
             return StackResult((fact,), pull.returncode)
-        restart = subprocess.run(
-            ["docker", "compose", "-f", str(compose_file), "up", "-d"],
-            cwd=traefik.traefik_dir(), check=False, capture_output=True, text=True,
-        )
+        with traefik.traefik_transaction():
+            restart = subprocess.run(
+                ["docker", "compose", "-f", str(compose_file), "up", "-d"],
+                cwd=traefik.traefik_dir(), check=False, capture_output=True, text=True, timeout=120,
+            )
+            if restart.returncode == 0:
+                health = traefik._wait_for_traefik_healthy()
+                if health.exit_code != 0:
+                    return StackResult((StackFact("Traefik", "FAIL", health.message, health.exit_code),), health.exit_code)
+                traefik._record_applied_state(traefik.traefik_config_path().read_text(encoding="utf-8"))
     except (OSError, subprocess.SubprocessError) as exc:
         return StackResult((StackFact("Traefik", "FAIL", str(exc), 1),), 1)
     if restart.returncode != 0:

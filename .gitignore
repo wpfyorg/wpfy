@@ -33,3 +33,4 @@ node_modules
 .playwright-mcp/page-*.yml
 .superpowers/brainstorm/
 .vitepress/cache/
+.agent-work/

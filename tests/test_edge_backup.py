@@ -121,7 +121,7 @@ def test_restore_edge_validates_then_restarts_without_regenerating(tmp_path, mon
     calls = []
     monkeypatch.setattr(
         wpfy.edge_backup.traefik,
-        "restart_traefik_existing",
+            "_restart_traefik_existing_locked",
         lambda: calls.append("restart") or RuntimeResult(0, "restarted", ran=True),
     )
 

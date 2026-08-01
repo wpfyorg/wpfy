@@ -6,7 +6,7 @@ import subprocess
 
 from .events import record_event
 from .site_definition import PHP_SETTING_FIELDS, SiteDefinition, validate_php_setting
-from .site_layout import ensure_site_scaffold
+from .site_layout import ensure_site_scaffold, validate_php_custom
 from .site_paths import env_path, read_env, site_exists, validate_domain
 from .site_runtime import RuntimeResult, compose_command, docker_available, runtime_skip_requested
 
@@ -39,6 +39,9 @@ def _restart_php_services(domain: str) -> RuntimeResult:
     if runtime_skip_requested() or not docker_available():
         return RuntimeResult(0, "runtime restart skipped", skipped=True)
     try:
+        validation = validate_php_custom(domain)
+        if validation.exit_code == 1:
+            return RuntimeResult(1, f"PHP restart refused: {validation.message}")
         proc = compose_command(domain, "up", "-d", "--force-recreate", "app", "web")
     except (OSError, subprocess.SubprocessError) as exc:
         return RuntimeResult(3, f"runtime restart failed: {exc}")

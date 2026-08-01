@@ -25,6 +25,17 @@ def test_build_parser_returns_parser():
     assert parser is not None
 
 
+def test_stack_acme_email_persists_and_reports_pending_apply(tmp_wpfy_home, monkeypatch):
+    import wpfy.cli as cli
+
+    monkeypatch.delenv("WPFY_ACME_EMAIL", raising=False)
+    result = cli.handle_stack_acme_email(type("Args", (), {"address": "ops@example.com"})())
+
+    assert result.exit_code == 0
+    assert "source: file" in result.message
+    assert "Traefik restart required" in result.message
+
+
 def test_parser_retains_grouped_and_flat_subcommands():
     parser = build_parser()
     subparsers_actions = [action for action in parser._actions if hasattr(action, 'choices')]

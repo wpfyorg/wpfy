@@ -123,7 +123,13 @@ def start_site_runtime(domain: str) -> RuntimeResult:
         return RuntimeResult(0, "runtime skipped by WPFY_SKIP_RUNTIME=1", skipped=True)
     if not docker_available():
         return RuntimeResult(0, "runtime skipped because Docker or Compose is unavailable", skipped=True)
-    proc = compose_command(domain, "up", "-d")
+    # --remove-orphans reconciles containers the site no longer declares. compose.yaml
+    # is regenerated in full from the SiteDefinition, so anything in the project that
+    # is not a defined service is stale by construction — without this, disabling the
+    # Redis object cache left its container running outside wpfy's lifecycle. The
+    # one-off `...-wpcli-run-...` containers are safe: wpcli is itself a defined
+    # service, so they are never orphans.
+    proc = compose_command(domain, "up", "-d", "--remove-orphans")
     if proc.returncode != 0:
         message = proc.stderr.strip() or proc.stdout.strip() or "docker compose up failed"
         return RuntimeResult(proc.returncode, message)

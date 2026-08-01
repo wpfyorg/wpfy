@@ -88,6 +88,7 @@ WORDPRESS_VERSION_URL = "https://api.wordpress.org/core/version-check/1.7/"
 WORDPRESS_VERSION_RE = re.compile(r"[0-9]+\.[0-9]+(?:\.[0-9]+)?")
 WORDPRESS_METADATA_LIMIT = 1024 * 1024
 WORDPRESS_DOWNLOAD_CHUNK_SIZE = 1024 * 1024
+WP_CONFIG_ANCHOR = "/* That's all, stop editing! Happy publishing. */"
 
 
 SiteSpec = SiteDefinition
@@ -955,12 +956,42 @@ def _wordpress_config_content(env: dict[str, str]) -> str:
         "define('DB_COLLATE', '');",
         salts,
         "$table_prefix = 'wp_';",
+        WP_CONFIG_ANCHOR,
         "if (!defined('ABSPATH')) {",
         "    define('ABSPATH', __DIR__ . '/');",
         "}",
         "require_once ABSPATH . 'wp-settings.php';",
         "",
     ])
+
+
+def repair_wp_config_anchor(domain: str) -> RuntimeResult:
+    validate_domain(domain)
+    config = app_dir(domain) / "wp-config.php"
+    unsafe = _destination_symlink(config.parent, (config,))
+    if unsafe is not None:
+        return RuntimeResult(2, "unsafe WordPress destination symlink: wp-config.php")
+
+    try:
+        content = _read_text_safely(config.parent, config.name)
+    except (OSError, UnicodeError) as exc:
+        return RuntimeResult(2, f"failed to read wp-config.php for anchor repair: {exc}")
+    if content is None:
+        return RuntimeResult(0, "wp-config.php anchor repair skipped: config does not exist", skipped=True)
+    if WP_CONFIG_ANCHOR in content:
+        return RuntimeResult(0, "wp-config.php anchor already present", ran=True)
+
+    table_prefix = content.find("$table_prefix")
+    abspath = content.find("if (!defined('ABSPATH')) {")
+    require = content.find("require_once ABSPATH . 'wp-settings.php';")
+    if table_prefix == -1 or abspath == -1 or require == -1 or not table_prefix < abspath < require:
+        return RuntimeResult(0, "wp-config.php anchor repair skipped: unrecognised config shape", skipped=True)
+
+    try:
+        _write_text_safely(config.parent, config.name, content[:abspath] + WP_CONFIG_ANCHOR + "\n" + content[abspath:])
+    except OSError as exc:
+        return RuntimeResult(2, f"failed to repair wp-config.php anchor: {exc}")
+    return RuntimeResult(0, "wp-config.php anchor repaired", ran=True)
 
 
 def _ensure_wordpress_config(domain: str) -> RuntimeResult:
@@ -1595,6 +1626,66 @@ def validate_nginx_custom(domain: str, content: str | None = None) -> RuntimeRes
     return _validate_nginx_candidate(domain, content)
 
 
+def _validate_php_candidate(domain: str, content: str) -> RuntimeResult:
+    if not isinstance(content, str) or "\x00" in content:
+        return RuntimeResult(2, "PHP custom config must be text without NUL bytes")
+    if not any(line.strip() and not line.lstrip().startswith(";") for line in content.splitlines()):
+        return RuntimeResult(0, "PHP custom config is empty or comments only")
+    if runtime_skip_requested() or not docker_available():
+        return RuntimeResult(3, "PHP custom config refused: Docker runtime unavailable for validation")
+
+    php_root = php_dir(domain)
+    candidate_name = f".custom-{secrets.token_hex(8)}.candidate"
+    candidate_path = php_root / candidate_name
+    try:
+        _write_text_safely(php_root, candidate_name, content)
+        proc = compose_command(
+            domain,
+            "run",
+            "--rm",
+            "-T",
+            "--no-deps",
+            "-v",
+            f"{candidate_path}:/usr/local/etc/php/conf.d/zzz-custom.ini:ro",
+            "app",
+            "php",
+            "-v",
+        )
+        output = "\n".join(part.strip() for part in (proc.stdout, proc.stderr) if part and part.strip())
+        if "syntax error" in output.lower():
+            return RuntimeResult(1, output or "PHP custom config has a syntax error", ran=True)
+        if proc.returncode != 0:
+            return RuntimeResult(3, output or "PHP custom config validation could not run")
+        return RuntimeResult(0, "PHP custom config validation passed", ran=True)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return RuntimeResult(3, f"PHP custom config validation failed: {exc}")
+    finally:
+        try:
+            root_fd = os.open(php_root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            try:
+                os.unlink(candidate_name, dir_fd=root_fd)
+            except FileNotFoundError:
+                pass
+            finally:
+                os.close(root_fd)
+        except OSError:
+            pass
+
+
+def validate_php_custom(domain: str, content: str | None = None) -> RuntimeResult:
+    validate_domain(domain)
+    if not site_exists(domain):
+        return RuntimeResult(2, f"site not found: {domain}")
+    if content is None:
+        try:
+            content = _read_text_safely(php_dir(domain), "custom.ini")
+        except (OSError, UnicodeError) as exc:
+            return RuntimeResult(2, f"PHP custom config refused: {exc}")
+        if content is None:
+            return RuntimeResult(2, f"PHP custom config not found: {domain}")
+    return _validate_php_candidate(domain, content)
+
+
 def set_nginx_custom(domain: str, content: str) -> RuntimeResult:
     validate_domain(domain)
     if not site_exists(domain):
@@ -1844,6 +1935,14 @@ def ensure_site_scaffold(spec: SiteSpec) -> list[str]:
             touched.append(str(health_file))
     except OSError as exc:
         raise ValueError(f"unsafe healthcheck destination: {exc}") from exc
+
+    config = app_dir(spec.domain) / "wp-config.php"
+    if spec.flavor in WORDPRESS_FLAVORS and (config.exists() or config.is_symlink()):
+        repair = repair_wp_config_anchor(spec.domain)
+        if repair.exit_code != 0:
+            raise ValueError(repair.message)
+        if repair.skipped:
+            record_event("site.wp-config-anchor", domain=spec.domain, outcome="skipped", detail=repair.message)
 
     metadata = spec.registry_metadata()
     existing_metadata = registry.get_site(spec.domain) or {}

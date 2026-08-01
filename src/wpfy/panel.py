@@ -46,7 +46,7 @@ from .site_runtime import (
     start_site_runtime,
     stop_site_runtime,
 )
-from . import traefik
+from . import panel_exposure, traefik
 
 DEFAULT_PANEL_PORT = 8642
 STATIC_DIR = Path(__file__).parent / "panel_static"
@@ -66,6 +66,76 @@ _SITE_MANAGER_ALLOWED_ACTIONS = frozenset({
     "auth.me", "auth.logout", "auth.totp.enable", "auth.totp.disable",
     "site.list", "job.list", "job.read", "event.list",
 })
+
+_TRUSTED_EDGE_LOCK = threading.Lock()
+_TRUSTED_EDGE_NETWORKS: tuple[str, ...] | None = None
+
+
+def _address_in_networks(address: object, networks: tuple[str, ...]) -> bool:
+    if not isinstance(address, str) or not networks:
+        return False
+    try:
+        parsed = ipaddress.ip_address(address.strip())
+    except ValueError:
+        return False
+    for raw in networks:
+        try:
+            network = ipaddress.ip_network(raw, strict=False)
+        except ValueError:
+            continue
+        if parsed.version == network.version and parsed in network:
+            return True
+    return False
+
+
+def resolve_client_address(peer: str, forwarded: object, trusted: tuple[str, ...]) -> str:
+    """Resolve the caller that failed-login throttling should be keyed on.
+
+    A forwarded header is believed only when the connection itself arrived from
+    the known edge. Believing it unconditionally would be worse than keying on
+    the proxy: any caller could then evade its own cooldown and pin one onto
+    somebody else's address.
+
+    Mirrors the site-level handling in `site_security` — trust only the edge,
+    walk the chain right-to-left past our own hops (`real_ip_recursive`), and
+    fail closed to the peer when no edge is known.
+    """
+    if not _address_in_networks(peer, trusted):
+        return peer
+    if not isinstance(forwarded, str):
+        return peer
+    for candidate in reversed(forwarded.split(",")):
+        candidate = candidate.strip()
+        if not candidate:
+            continue
+        try:
+            ipaddress.ip_address(candidate)
+        except ValueError:
+            continue
+        if not _address_in_networks(candidate, trusted):
+            return candidate
+    return peer
+
+
+def trusted_edge_networks() -> tuple[str, ...]:
+    """CIDRs whose peers may assert a forwarded client address.
+
+    Consulted on every sign-in, and discovery shells out to Docker, so a
+    successful result is cached for the process. A failure is deliberately not
+    cached: a transient Docker outage then degrades to the shared bucket for one
+    request instead of pinning that degradation for the panel's lifetime.
+    """
+    global _TRUSTED_EDGE_NETWORKS
+    with _TRUSTED_EDGE_LOCK:
+        if _TRUSTED_EDGE_NETWORKS is not None:
+            return _TRUSTED_EDGE_NETWORKS
+    try:
+        discovered = tuple(traefik.traefik_network_cidrs(panel_exposure.PANEL_EDGE_NETWORK))
+    except (RuntimeError, OSError, ValueError, subprocess.SubprocessError):
+        return ()
+    with _TRUSTED_EDGE_LOCK:
+        _TRUSTED_EDGE_NETWORKS = discovered
+    return discovered
 
 
 @dataclass(frozen=True, slots=True)
@@ -1830,7 +1900,11 @@ def make_panel_handler(config: PanelConfig) -> type[BaseHTTPRequestHandler]:
                 else:
                     body = {}
                 if route.meta.action in {"auth.login", "setup.create"}:
-                    body["_socket_client"] = self.client_address[0]
+                    body["_socket_client"] = resolve_client_address(
+                        self.client_address[0],
+                        self.headers.get("X-Forwarded-For"),
+                        trusted_edge_networks(),
+                    )
                 if route.meta.action in {"setup.status", "setup.create"}:
                     body["_edge_bind"] = config.edge_bind
                 status, payload = route.handler(principal, match, parse_qs(parsed.query), body)

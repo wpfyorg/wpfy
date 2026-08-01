@@ -8,7 +8,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/wpfyorg/wpfy/releases/tag/v1.0.0-rc2"><img src="https://img.shields.io/github/v/release/wpfyorg/wpfy?include_prereleases&display_name=tag&sort=semver" alt="Current release: v1.0.0-rc2"></a>
+  <a href="https://github.com/wpfyorg/wpfy/releases/tag/v1.0.0-rc3"><img src="https://img.shields.io/github/v/release/wpfyorg/wpfy?include_prereleases&display_name=tag&sort=semver" alt="Current release: v1.0.0-rc3"></a>
   <a href="https://github.com/wpfyorg/wpfy/actions/workflows/tests.yml"><img src="https://github.com/wpfyorg/wpfy/actions/workflows/tests.yml/badge.svg?branch=main" alt="Tests workflow status"></a>
   <a href="https://github.com/wpfyorg/wpfy/blob/main/pyproject.toml"><img src="https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white" alt="Python 3.10 or later"></a>
   <a href="https://github.com/wpfyorg/wpfy/blob/main/LICENSE"><img src="https://img.shields.io/github/license/wpfyorg/wpfy" alt="AGPL-3.0-only license"></a>
@@ -27,7 +27,7 @@
 ![wpfy control panel showing a sanitized local demonstration site](.github/assets/wpfy-panel-overview.jpg)
 
 > [!WARNING]
-> **`v1.0.0-rc2` is a release candidate, not a production-readiness claim.** It passed local tests and public CI, but RC2 still lacks disposable-VPS, provider-S3, real-systemd, anonymous-image-pull, and external-scanner validation. Start on a fresh or disposable VPS, read the [safety model](#safety-and-isolation), and [report problems](https://github.com/wpfyorg/wpfy/issues/new/choose). See the [release notes](https://github.com/wpfyorg/wpfy/releases/tag/v1.0.0-rc2) and [roadmap](ROADMAP.md) for open release work.
+> **`v1.0.0-rc3` is a release candidate, not a production-readiness claim.** It passed local tests and public CI; the panel HTTP surface has now been verified against a live server, and a certificate was issued end to end. Provider-S3, real-systemd, anonymous-image-pull, and external-scanner coverage remain unvalidated. Start on a fresh or disposable VPS, read the [safety model](#safety-and-isolation), and [report problems](https://github.com/wpfyorg/wpfy/issues/new/choose). See the [release notes](https://github.com/wpfyorg/wpfy/releases/tag/v1.0.0-rc3) and [roadmap](ROADMAP.md) for open release work.
 
 ## Why wpfy?
 
@@ -46,7 +46,7 @@ Built for developers and WordPress server administrators who operate their own U
 | TLS and DNS | Let’s Encrypt through Traefik, DNS/IP preflight before issuance, Cloudflare detection, and Cloudflare-DNS wildcard certificates. |
 | Backups and recovery | Verified local archives, explicit restore, local retention/pruning, S3-compatible remote operations, edge backups, and a systemd backup schedule. |
 | WordPress operations | WP-CLI, controlled PHP/config changes, cache clearing, cron runners, and SMTP configuration with explicit test sends. |
-| Access and diagnostics | Per-site SFTP lifecycle, logs, security audits, health checks, diagnostics, and a loopback-only browser panel. |
+| Access and diagnostics | Per-site SFTP lifecycle, logs, security audits, health checks, diagnostics, and a browser panel that is loopback-only by default. |
 
 ## Quick start
 
@@ -60,18 +60,18 @@ Built for developers and WordPress server administrators who operate their own U
 
 ### Install the current release candidate
 
-Review the installer, pin the immutable release tag, and let the installer verify the downloaded source archive with the checksum published for RC2:
+Review the installer, pin the immutable release tag, and let the installer verify the downloaded source archive with the checksum published for RC3:
 
 ```bash
-curl -fsSLO https://raw.githubusercontent.com/wpfyorg/wpfy/v1.0.0-rc2/install.sh
+curl -fsSLO https://raw.githubusercontent.com/wpfyorg/wpfy/v1.0.0-rc3/install.sh
 less install.sh
 
-sudo WPFY_REF=v1.0.0-rc2 \
-  WPFY_SOURCE_SHA256=398c7bbeb93d0e5a7fffea2940df200740db8481052ae92ec62c6148a6b2831e \
+sudo WPFY_REF=v1.0.0-rc3 \
+  WPFY_SOURCE_SHA256=<paste the SHA-256 from the RC3 release page> \
   bash install.sh
 ```
 
-The checksum is the official source-archive SHA-256 in the [RC2 release](https://github.com/wpfyorg/wpfy/releases/tag/v1.0.0-rc2). The installer logs to `/var/log/wpfy/install.log`; `--dry-run`, `--verbose`, and `--no-color` are available when needed.
+Take the checksum from the [RC3 release](https://github.com/wpfyorg/wpfy/releases/tag/v1.0.0-rc3) — it is the official source-archive SHA-256 for that tag, and pasting one from an earlier release will correctly abort the install. The installer logs to `/var/log/wpfy/install.log`; `--dry-run`, `--verbose`, and `--no-color` are available when needed.
 
 ### Create, secure, and verify a site
 
@@ -94,13 +94,13 @@ For a new site whose DNS is already correct, combine creation and TLS with `wpfy
 
 ### Open the browser panel
 
-The panel listens only on loopback and requires a fresh token. On the VPS, run `wpfy panel`; from your workstation, tunnel the port and open the token-bearing URL printed by the command:
+The ad-hoc `wpfy panel` service stays loopback-only and requires a fresh token. The panel access token can be supplied with `--token-file` or the `WPFY_PANEL_TOKEN` environment variable; `--token` still works but exposes the value in the process table and now warns. On the VPS, run `wpfy panel`; from your workstation, tunnel the port and open the token-bearing URL printed by the command:
 
 ```bash
 ssh -L 8642:127.0.0.1:8642 user@your-server
 ```
 
-The screenshot above is the real current panel against a sanitized local demo state. It shows an overview; the panel also exposes site details, health, diagnostics, logs, backups/restores, runtime actions, SFTP, WP-CLI, and PHP changes. Phase 1 adds site creation and deletion from the panel, with background jobs and live step progress. Newly created or rotated credentials are displayed in a one-time panel; deletion requires typing the exact domain and is refused if the pre-delete backup fails. The Config tab can show a dry-run change preview before applying a mutation, and the Events view plus each site’s Activity tab expose recorded operations. Recent events are also available from the CLI with `wpfy log events` (optionally filtered by `--domain` and limited with `--limit`). The panel remains loopback-only and bearer-token protected for one operator; it has no user accounts or roles yet, so remote access should still use an SSH tunnel.
+The screenshot above is the real current panel against a sanitized local demo state. It shows an overview; the panel also exposes site details, health, diagnostics, logs, backups/restores, runtime actions, SFTP, WP-CLI, and PHP changes. Phase 1 adds site creation and deletion from the panel, with background jobs and live step progress. Newly created or rotated credentials are displayed in a one-time panel; deletion requires typing the exact domain and is refused if the pre-delete backup fails. The Config tab can show a dry-run change preview before applying a mutation, and the Events view plus each site’s Activity tab expose recorded operations. Recent events are also available from the CLI with `wpfy log events` (optionally filtered by `--domain` and limited with `--limit`). The panel has named user accounts with administrator and site-manager roles; site-managers are scoped to their assigned sites and refused everything else. TOTP two-factor enrollment is verified before it is persisted, and a first-run browser setup wizard creates the first administrator; both setup routes close permanently once a user exists. The panel remains loopback-only by default, with SSH tunnelling recommended; `wpfy panel expose` opts into Traefik publishing only after named-user authentication, at least one enrolled TOTP factor, DNS/IP preflight, and typed exact-domain confirmation.
 
 ### Develop from source
 
@@ -224,13 +224,13 @@ wpfy’s model is designed to reduce accidental cross-site coupling, not to make
 - **Unix identity:** wpfy allocates a unique site UID and applies it to site files.
 - **Nginx hardening:** the web service uses `nginxinc/nginx-unprivileged` and generated Nginx configuration denies common sensitive paths.
 - **Secret and backup handling:** site `.env` files are restricted, and local backup archives are written with mode `0600`.
-- **Panel exposure:** the panel refuses non-loopback binds, uses a bearer token, and is intended for SSH-tunnel access.
+- **Panel exposure:** ad-hoc `wpfy panel` stays loopback-only; the opt-in exposed service binds only to the dedicated `wpfy-panel-edge` gateway address, while wildcard, public, and off-network binds are refused. SSH tunnelling remains the recommended access path.
 
 Important limits:
 
 - Docker-daemon access and Traefik’s Docker socket access are host-level trust boundaries. A Docker or host compromise defeats per-site isolation.
 - wpfy has **not** had an independent security audit or penetration test.
-- RC2’s release validation is incomplete; do not infer production readiness from local tests or CI alone.
+- RC3’s release validation is incomplete; do not infer production readiness from local tests or CI alone.
 - Hosting mutually untrusted tenants on a shared host is out of scope during beta.
 
 Read [SECURITY.md](SECURITY.md) before production use or security testing.
@@ -263,7 +263,7 @@ Remote deletion and pruning are explicit operations. wpfy manages its own object
 ## Known limitations
 
 - This is beta software. Interfaces and behavior may change before a final v1.0.0 release.
-- RC2 is missing several real-world validation gates listed in its [release notes](https://github.com/wpfyorg/wpfy/releases/tag/v1.0.0-rc2).
+- RC3’s panel HTTP surface has been verified against a live server and a certificate was issued end to end, but provider-S3, real-systemd, anonymous-image-pull, and external-scanner coverage remain unvalidated; see its [release notes](https://github.com/wpfyorg/wpfy/releases/tag/v1.0.0-rc3) for the remaining gates.
 - `wpfy stack migrate` does not migrate host-installed WordPress stacks in v1.
 - The MySQLTuner helper is skipped until a vetted pinned image exists.
 - phpMyAdmin, Adminer, and Composer helpers are pull-only; they do not create a public dashboard.
@@ -273,7 +273,7 @@ See [ROADMAP.md](ROADMAP.md) for planned hardening and future work. Planned item
 
 ## Documentation and support
 
-- [Release notes](https://github.com/wpfyorg/wpfy/releases/tag/v1.0.0-rc2) for RC2 provenance, validation, and known deferred checks.
+- [Release notes](https://github.com/wpfyorg/wpfy/releases/tag/v1.0.0-rc3) for RC3 provenance, validation, and known deferred checks.
 - [Roadmap](ROADMAP.md) for beta hardening and v2 candidates.
 - [Security policy](SECURITY.md) for private vulnerability reporting and threat-model boundaries.
 - [Bug report](https://github.com/wpfyorg/wpfy/issues/new?template=bug_report.md) for reproducible problems. Redact domains, IPs, tokens, passwords, and `.env` contents.

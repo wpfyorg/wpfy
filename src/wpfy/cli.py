@@ -74,6 +74,7 @@ from .site_layout import (
     site_info,
     set_nginx_custom,
     validate_nginx_custom,
+    validate_php_custom,
 )
 from .site_paths import (
     app_dir,
@@ -2086,7 +2087,15 @@ def add_panel_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentPar
     )
     parser.add_argument("--host", default="127.0.0.1", help="loopback address to bind")
     parser.add_argument("--port", type=int, default=panel.DEFAULT_PANEL_PORT, help="port to listen on")
-    parser.add_argument("--token", help="access token used only while no panel users exist")
+    parser.add_argument(
+        "--token",
+        help="access token used only while no panel users exist; exposes the value in "
+             "the process table, prefer --token-file or WPFY_PANEL_TOKEN",
+    )
+    parser.add_argument(
+        "--token-file",
+        help="read the access token from a file, keeping it out of the process table",
+    )
     parser.add_argument("--edge-service", action="store_true", help=argparse.SUPPRESS)
     commands = parser.add_subparsers(dest="panel_command")
 
@@ -2265,8 +2274,47 @@ def handle_panel_exposure(args: argparse.Namespace) -> CommandResult:
     return CommandResult(result.message, exit_code=result.exit_code)
 
 
+def resolve_panel_token(
+    args: argparse.Namespace, environ: dict | None = None,
+) -> tuple[str, str | None]:
+    """Resolve the panel token and any warning about how it was supplied.
+
+    Highest precedence first: --token-file, WPFY_PANEL_TOKEN, --token, generated.
+
+    `--token` remains supported because removing it would break existing operator
+    scripts, but it places the token in the process command line, which is
+    world-readable via /proc at mode 444 for the lifetime of a long-running
+    panel. The two sources above it exist so that never has to happen.
+    """
+    environ = os.environ if environ is None else environ
+
+    token_file = getattr(args, "token_file", None)
+    if token_file:
+        value = Path(token_file).read_text(encoding="utf-8").strip()
+        if not value:
+            raise ValueError(f"panel token file is empty: {token_file}")
+        return value, None
+
+    from_env = str(environ.get("WPFY_PANEL_TOKEN", "")).strip()
+    if from_env:
+        return from_env, None
+
+    if getattr(args, "token", None):
+        return args.token, (
+            "warning: --token places the panel token in this process's command line, "
+            "where any local user can read it; prefer --token-file or WPFY_PANEL_TOKEN"
+        )
+
+    return panel.generate_panel_token(), None
+
+
 def handle_panel(args: argparse.Namespace) -> CommandResult:
-    token = args.token or panel.generate_panel_token()
+    try:
+        token, token_warning = resolve_panel_token(args)
+    except (OSError, ValueError) as exc:
+        return CommandResult(f"panel token could not be read: {exc}", exit_code=2)
+    if token_warning:
+        print(token_warning, file=sys.stderr)
     config = panel.PanelConfig(host=args.host, port=args.port, token=token, edge_bind=args.edge_service)
     try:
         server = panel.make_panel_server(config)
@@ -2662,6 +2710,22 @@ def add_site_nginx_parser(site_subparsers: argparse._SubParsersAction[argparse.A
     set_parser.set_defaults(handler=handle_site_nginx)
 
 
+def handle_site_php(args: argparse.Namespace) -> CommandResult:
+    try:
+        result = validate_php_custom(args.domain)
+    except ValueError as exc:
+        return CommandResult(str(exc), exit_code=2)
+    return CommandResult(result.message, exit_code=result.exit_code)
+
+
+def add_site_php_parser(site_subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+    parser = _add_parser(site_subparsers, "php", help="Inspect PHP operator overrides.")
+    parser.add_argument("domain")
+    commands = parser.add_subparsers(dest="php_command")
+    validate = _add_parser(commands, "validate", help="Validate php/custom.ini with the site's PHP image.")
+    validate.set_defaults(handler=handle_site_php)
+
+
 def handle_site_files(args: argparse.Namespace) -> CommandResult:
     try:
         if args.site_files_command == "ls":
@@ -2872,6 +2936,7 @@ def add_site_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentPars
     add_site_files_parser(site_subparsers)
     add_site_cron_parser(site_subparsers)
     add_site_nginx_parser(site_subparsers)
+    add_site_php_parser(site_subparsers)
     add_site_security_parser(site_subparsers)
 
     site_action_names = ("delete", "list", "info", "show", "status")
@@ -2966,6 +3031,14 @@ def add_stack_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentPar
     install.add_argument("--composer", action="store_true")
     install.add_argument("--mysqltuner", action="store_true")
     install.set_defaults(handler=handle_stack_install)
+
+    acme_email = _add_parser(
+        stack_subparsers,
+        "acme-email",
+        help="Set or show the shared ACME contact email.",
+    )
+    acme_email.add_argument("address", nargs="?")
+    acme_email.set_defaults(handler=handle_stack_acme_email)
 
     for name in ("remove", "purge", "migrate", "upgrade", "status"):
         help_text = {
@@ -3303,6 +3376,23 @@ def handle_stack_install(args: argparse.Namespace) -> CommandResult:
         results.append("nothing selected")
         results.append("hint: use --nginx, --php, --mysql, --redis, --wpcli, or --all")
     return CommandResult("\n".join(results), exit_code=result.exit_code)
+
+
+def handle_stack_acme_email(args: argparse.Namespace) -> CommandResult:
+    if args.address is not None:
+        try:
+            stack.traefik.set_acme_email(args.address)
+        except ValueError as exc:
+            return CommandResult(str(exc), exit_code=2)
+    resolution = stack.traefik.resolve_acme_email()
+    pending = stack.traefik.static_config_needs_apply()
+    action = "Traefik restart required" if pending else "Traefik already has desired config"
+    return CommandResult(
+        _render_summary(
+            "stack acme-email",
+            [f"email: {resolution.email}", f"source: {resolution.source}", action],
+        )
+    )
 
 
 def handle_stack_status(args: argparse.Namespace) -> CommandResult:

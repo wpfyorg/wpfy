@@ -6,6 +6,24 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [1.0.0-rc3] - 2026-08-01
+
+### Added
+
+- Add the isolated `wpfy-agent` development workflow CLI.
+- Validate `php/custom.ini` with the site's own PHP image before recreating the PHP container, and add `wpfy site php <domain> validate` so an operator can check a file before it costs an outage. Only a syntax error PHP itself reports refuses the recreate; an unverifiable file proceeds, so a Docker hiccup never keeps a site down.
+- Record `cache.page.set`, `cache.object.set` and `cache.purge` events so cache configuration changes are auditable.
+- Expose the nginx page-cache status as the `X-Wpfy-Cache` response header on sites using the `wpfc` integration.
+
+### Fixed
+
+- Purge the FlyingPress plugin cache with `wp flying-press purge-everything` instead of `wp flying-press purge`, which FlyingPress does not register. Purging a FlyingPress site previously cleared only the nginx layer while the plugin layer failed with `Error: Invalid command: purge`; the failure was invisible to the offline suite because it stubs `subprocess.run`.
+- Accept the panel access token from `--token-file` or `WPFY_PANEL_TOKEN`, so it need never appear in the process command line where any local user can read it. `--token` still works and now warns.
+- Remove containers a site no longer declares when starting its runtime. Disabling the Redis object cache dropped the service from `compose.yaml` but left the container running outside wpfy's lifecycle.
+- Key panel failed-login throttling on the real client rather than the socket peer. Published through Traefik every request's peer is the proxy, so ten failed sign-ins from any one caller cooled down every remote operator for 60 seconds. A forwarded client address is honoured only when the connection itself arrives from the discovered edge network, and the chain is walked right-to-left past known hops; when no edge can be discovered the behaviour falls back to the peer rather than trusting an unverifiable header.
+- Treat the rendered `traefik.yml` as authoritative when deciding whether the Traefik static configuration needs applying, instead of trusting a recorded hash alone. A recorded state that disagreed with the file made `wpfy stack acme-email` report "Traefik already has desired config" while the running proxy still used the old ACME contact, and the same stale comparison skipped the force-recreate, so a corrected address was written to disk but never loaded.
+- Report per-layer status in the `cache.purge` audit event. It previously listed the layers attempted (`layers=plugin,nginx,redis`) with `outcome: ok` even when only nginx cleared; it now records `layers=plugin:ok,nginx:ok,redis:skipped` and a new `partial` outcome for a purge where some layer did not clear.
+
 ### First-run panel setup and telemetry (2026-07-28)
 - Added a run-token-authorized two-step browser setup wizard that creates the first administrator, records separate licence and telemetry choices, retires both setup routes with HTTP 410 after first use, refuses edge-bound account creation, and applies the existing client throttle plus a 12-character password minimum.
 - Extended panel users with forward-compatible first-name, last-name, and email fields; added mode-0600 install-scoped state with a stable UUID; and added verified-before-persisted TOTP enrollment or an explicit consequence-confirmed skip.
