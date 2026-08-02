@@ -8,7 +8,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/wpfyorg/wpfy/releases/tag/v1.0.0-rc3"><img src="https://img.shields.io/github/v/release/wpfyorg/wpfy?include_prereleases&display_name=tag&sort=semver" alt="Current release: v1.0.0-rc3"></a>
+  <a href="https://github.com/wpfyorg/wpfy/releases/tag/v1.0.0-rc4"><img src="https://img.shields.io/github/v/release/wpfyorg/wpfy?include_prereleases&display_name=tag&sort=semver" alt="Current release: v1.0.0-rc4"></a>
   <a href="https://github.com/wpfyorg/wpfy/actions/workflows/tests.yml"><img src="https://github.com/wpfyorg/wpfy/actions/workflows/tests.yml/badge.svg?branch=main" alt="Tests workflow status"></a>
   <a href="https://github.com/wpfyorg/wpfy/blob/main/pyproject.toml"><img src="https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white" alt="Python 3.10 or later"></a>
   <a href="https://github.com/wpfyorg/wpfy/blob/main/LICENSE"><img src="https://img.shields.io/github/license/wpfyorg/wpfy" alt="AGPL-3.0-only license"></a>
@@ -27,7 +27,7 @@
 ![wpfy control panel showing a sanitized local demonstration site](.github/assets/wpfy-panel-overview.jpg)
 
 > [!WARNING]
-> **`v1.0.0-rc3` is a release candidate, not a production-readiness claim.** It passed local tests and public CI; the panel HTTP surface has now been verified against a live server, and a certificate was issued end to end. Provider-S3, real-systemd, anonymous-image-pull, and external-scanner coverage remain unvalidated. Start on a fresh or disposable VPS, read the [safety model](#safety-and-isolation), and [report problems](https://github.com/wpfyorg/wpfy/issues/new/choose). See the [release notes](https://github.com/wpfyorg/wpfy/releases/tag/v1.0.0-rc3) and [roadmap](ROADMAP.md) for open release work.
+> **`v1.0.0-rc4` is a release candidate, not a production-readiness claim.** It passed local tests and public CI; the panel HTTP surface has been verified against a live server, and a certificate was issued end to end. Provider-S3, real-systemd, anonymous-image-pull, and external-scanner coverage remain unvalidated. Start on a fresh or disposable VPS, read the [safety model](#safety-and-isolation), and [report problems](https://github.com/wpfyorg/wpfy/issues/new/choose). See the [release notes](https://github.com/wpfyorg/wpfy/releases/tag/v1.0.0-rc4) and [roadmap](ROADMAP.md) for open release work.
 
 ## Why wpfy?
 
@@ -60,18 +60,18 @@ Built for developers and WordPress server administrators who operate their own U
 
 ### Install the current release candidate
 
-Review the installer, pin the immutable release tag, and let the installer verify the downloaded source archive with the checksum published for RC3:
+Review the installer, pin the immutable release tag, and let the installer verify the downloaded source archive with the checksum published for RC4:
 
 ```bash
-curl -fsSLO https://raw.githubusercontent.com/wpfyorg/wpfy/v1.0.0-rc3/install.sh
+curl -fsSLO https://raw.githubusercontent.com/wpfyorg/wpfy/v1.0.0-rc4/install.sh
 less install.sh
 
-sudo WPFY_REF=v1.0.0-rc3 \
-  WPFY_SOURCE_SHA256=<paste the SHA-256 from the RC3 release page> \
+sudo WPFY_REF=v1.0.0-rc4 \
+  WPFY_SOURCE_SHA256=<paste the SHA-256 from the RC4 release page> \
   bash install.sh
 ```
 
-Take the checksum from the [RC3 release](https://github.com/wpfyorg/wpfy/releases/tag/v1.0.0-rc3) — it is the official source-archive SHA-256 for that tag, and pasting one from an earlier release will correctly abort the install. The installer logs to `/var/log/wpfy/install.log`; `--dry-run`, `--verbose`, and `--no-color` are available when needed.
+Take the checksum from the [RC4 release](https://github.com/wpfyorg/wpfy/releases/tag/v1.0.0-rc4) — it is the official source-archive SHA-256 for that tag, and pasting one from an earlier release will correctly abort the install. The installer logs to `/var/log/wpfy/install.log`; `--dry-run`, `--verbose`, and `--no-color` are available when needed.
 
 ### Create, secure, and verify a site
 
@@ -230,7 +230,7 @@ Important limits:
 
 - Docker-daemon access and Traefik’s Docker socket access are host-level trust boundaries. A Docker or host compromise defeats per-site isolation.
 - wpfy has **not** had an independent security audit or penetration test.
-- RC3’s release validation is incomplete; do not infer production readiness from local tests or CI alone.
+- RC4’s release validation is incomplete; do not infer production readiness from local tests or CI alone.
 - Hosting mutually untrusted tenants on a shared host is out of scope during beta.
 
 Read [SECURITY.md](SECURITY.md) before production use or security testing.
@@ -263,7 +263,7 @@ Remote deletion and pruning are explicit operations. wpfy manages its own object
 ## Known limitations
 
 - This is beta software. Interfaces and behavior may change before a final v1.0.0 release.
-- RC3’s panel HTTP surface has been verified against a live server and a certificate was issued end to end, but provider-S3, real-systemd, anonymous-image-pull, and external-scanner coverage remain unvalidated; see its [release notes](https://github.com/wpfyorg/wpfy/releases/tag/v1.0.0-rc3) for the remaining gates.
+- RC4’s panel HTTP surface has been verified against a live server and a certificate was issued end to end, but provider-S3, real-systemd, anonymous-image-pull, and external-scanner coverage remain unvalidated; see its [release notes](https://github.com/wpfyorg/wpfy/releases/tag/v1.0.0-rc4) for the remaining gates.
 - `wpfy stack migrate` does not migrate host-installed WordPress stacks in v1.
 - The MySQLTuner helper is skipped until a vetted pinned image exists.
 - phpMyAdmin, Adminer, and Composer helpers are pull-only; they do not create a public dashboard.
@@ -273,7 +273,7 @@ See [ROADMAP.md](ROADMAP.md) for planned hardening and future work. Planned item
 
 ## Documentation and support
 
-- [Release notes](https://github.com/wpfyorg/wpfy/releases/tag/v1.0.0-rc3) for RC3 provenance, validation, and known deferred checks.
+- [Release notes](https://github.com/wpfyorg/wpfy/releases/tag/v1.0.0-rc4) for RC4 provenance, validation, and known deferred checks.
 - [Roadmap](ROADMAP.md) for beta hardening and v2 candidates.
 - [Security policy](SECURITY.md) for private vulnerability reporting and threat-model boundaries.
 - [Bug report](https://github.com/wpfyorg/wpfy/issues/new?template=bug_report.md) for reproducible problems. Redact domains, IPs, tokens, passwords, and `.env` contents.
