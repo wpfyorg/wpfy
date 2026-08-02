@@ -16,7 +16,11 @@ from .site_definition import (
     validate_object_cache,
     validate_page_cache,
 )
-from .site_layout import ensure_site_scaffold
+from .site_layout import (
+    BASE_SECURITY_HEADERS as WPFY_SECURITY_HEADERS,
+    HSTS_HEADER as WPFY_HSTS_HEADER,
+    ensure_site_scaffold,
+)
 from .site_paths import env_path, nginx_dir, read_env, site_exists, validate_domain
 from .site_runtime import (
     ProcessResult,
@@ -35,6 +39,13 @@ FREE_PAGE_CACHE_PLUGINS = frozenset({
     "wp-fastest-cache",
 })
 BYO_PAGE_CACHE_PLUGINS = frozenset({"wp-rocket", "flying-press"})
+# WP Rocket's own default mobile-detection list. Only consulted when the site is
+# keeping a separate mobile cache, so a false positive costs nothing.
+MOBILE_USER_AGENTS = (
+    "android|blackberry|iphone|ipad|ipod|iemobile|opera mobile|palmos|webos|googlebot-mobile"
+)
+# WP Rocket writes its page cache here, under the site's document root.
+ROCKET_CACHE_DIR = "/var/www/html/wp-content/cache/wp-rocket"
 MANAGED_PAGE_CACHE_PLUGINS = frozenset({*FREE_PAGE_CACHE_PLUGINS, "nginx-helper"})
 PAGE_CACHE_PLUGIN_SLUG = {
     "wpfc": "nginx-helper",
@@ -101,8 +112,66 @@ def _bypass_conditions() -> str:
     ])
 
 
-def _cache_snippet(plugin: str) -> str:
-    validate_page_cache(plugin)
+def _rocket_nginx_lines(ssl_enabled: bool) -> list[str]:
+    """Serve WP Rocket's cached HTML from nginx instead of routing it through PHP.
+
+    Adapted from Rocket-Nginx 3.1.2 (MIT), https://github.com/satellitewp/rocket-nginx.
+    Two deliberate departures from upstream:
+
+    * wpfy's own `$wpfy_skip_cache` decides whether a request may be served from
+      cache. Upstream re-derives that from its own cookie/method list; keeping one
+      authority means the bypass invariant cannot drift between the two halves.
+    * The pre-gzipped `.html_gzip` variants are never served. Handing a client a
+      pre-encoded body means owning Content-Encoding by hand, and getting it wrong
+      corrupts the response; nginx's own gzip compresses the plain file instead.
+      # ponytail: re-compresses per request. Serve `_gzip` if CPU ever shows up.
+    """
+    cached_html = "^/wp-content/cache/wp-rocket/.*\\.html$"
+    headers = list(WPFY_SECURITY_HEADERS)
+    if ssl_enabled:
+        headers.append(WPFY_HSTS_HEADER)
+    return [
+        "# WP Rocket static cache (Rocket-Nginx 3.1.2, MIT).",
+        "set $rocket_bypass 1;",
+        'set $rocket_cache "MISS";',
+        'set $rocket_https_prefix "";',
+        'set $rocket_mobile_prefix "";',
+        'set $rocket_device "desktop";',
+        "# wpfy's bypass rules are authoritative; rocket only resolves the filename.",
+        "if ($wpfy_skip_cache = 1) { set $rocket_bypass 0; }",
+        # WP Rocket names its directories from the raw request path, so the lookup
+        # has to use $request_uri (percent-encoded) rather than the decoded $uri.
+        "set $rocket_uri_path $request_uri;",
+        'if ($request_uri ~* "^([^?]*)\\?") { set $rocket_uri_path $1; }',
+        'if ($wpfy_https = "on") { set $rocket_https_prefix "-https"; }',
+        'set $rocket_dir "$document_root/wp-content/cache/wp-rocket/$http_host$rocket_uri_path";',
+        # WP Rocket drops a .mobile-active marker only when it is keeping a separate
+        # mobile cache. Without this check a phone would be served the desktop page.
+        f'if ($http_user_agent ~* "{MOBILE_USER_AGENTS}") {{ set $rocket_device "mobile"; }}',
+        'if (-f "$rocket_dir/.mobile-active") { set $rocket_mobile_prefix "-mobile"; }',
+        'if ($rocket_device != "mobile") { set $rocket_mobile_prefix ""; }',
+        'set $rocket_name "index$rocket_mobile_prefix$rocket_https_prefix.html";',
+        'if (!-f "$rocket_dir/$rocket_name") { set $rocket_bypass 0; }',
+        'if (-f "$document_root/.maintenance") { set $rocket_bypass 0; }',
+        'if ($rocket_bypass = 1) { set $rocket_cache "HIT"; }',
+        "add_header X-Wpfy-Cache $rocket_cache always;",
+        "if ($rocket_bypass = 1) {",
+        '    rewrite .* "/wp-content/cache/wp-rocket/$http_host$rocket_uri_path/$rocket_name" last;',
+        "}",
+        f"location ~ {cached_html} {{",
+        *(f"    {header}" for header in headers),
+        "    add_header X-Wpfy-Cache $rocket_cache always;",
+        # A shared cache in front of the site sees one URL answered either from this
+        # file or by PHP for a logged-in visitor. Vary on Cookie so it cannot merge
+        # the two, and refuse to let it keep a copy of a page wpfy may purge.
+        '    add_header Vary "Accept-Encoding, Cookie" always;',
+        '    add_header Cache-Control "no-cache, no-store, must-revalidate" always;',
+        "}",
+    ]
+
+
+def _cache_snippet(plugin: str, ssl_enabled: bool = False) -> str:
+    plugin = validate_page_cache(plugin)
     if plugin == "none":
         return ""
     lines = [
@@ -118,6 +187,8 @@ def _cache_snippet(plugin: str) -> str:
             'fastcgi_cache_key "$scheme$request_method$host$request_uri";',
             "fastcgi_cache_valid 200 301 302 10m;",
         ])
+    elif plugin == "wp-rocket":
+        lines.extend(_rocket_nginx_lines(ssl_enabled))
     lines.extend([
         "fastcgi_cache_bypass $wpfy_skip_cache;",
         "fastcgi_no_cache $wpfy_skip_cache;",
@@ -205,7 +276,7 @@ def _cleanup(root: Path, name: str) -> None:
 def render_cache_nginx(domain: str) -> CacheActionResult:
     definition = _definition(domain)
     plugin = validate_page_cache(definition.page_cache)
-    cache_content = _cache_snippet(plugin)
+    cache_content = _cache_snippet(plugin, definition.ssl_enabled)
     path_content = _cache_path_snippet(plugin)
     nginx_root = nginx_dir(domain)
     extra_root = nginx_root / "extra"
@@ -390,6 +461,36 @@ def set_object_cache(domain: str, backend: str) -> CacheConfigurationResult:
     return result
 
 
+def _purge_rocket_files(domain: str) -> cache_operations.CacheOutcome:
+    """Delete WP Rocket's cached HTML from disk.
+
+    nginx serves these files without consulting PHP, so a failed `wp rocket clean`
+    would otherwise leave purged pages still being served. Runs in the app
+    container, which owns the files; the web container mounts the app read-only.
+    """
+    if runtime_skip_requested() or not docker_available():
+        return cache_operations.CacheOutcome(
+            domain, "rocket", "error", "runtime unavailable (Docker/Compose not available)",
+        )
+    try:
+        proc = compose_command(
+            domain,
+            "exec",
+            "-T",
+            "app",
+            "sh",
+            "-lc",
+            f"rm -rf {ROCKET_CACHE_DIR}/* 2>/dev/null || true",
+        )
+    except Exception as exc:  # noqa: BLE001 - surfaced as an outcome, never raised
+        return cache_operations.CacheOutcome(domain, "rocket", "error", f"exec failed: {exc}")
+    if proc.returncode == 0:
+        return cache_operations.CacheOutcome(domain, "rocket", "ok", "static page cache cleared")
+    return cache_operations.CacheOutcome(
+        domain, "rocket", "error", "exec failed (site may be stopped)",
+    )
+
+
 def purge_site_cache(domain: str) -> cache_operations.CacheResult:
     definition = _definition(domain)
     outcomes: list[cache_operations.CacheOutcome] = []
@@ -405,6 +506,8 @@ def purge_site_cache(domain: str) -> cache_operations.CacheResult:
                 "skipped",
                 _process_message(proc, "plugin purge command unavailable"),
             ))
+    if definition.page_cache == "wp-rocket":
+        outcomes.append(_purge_rocket_files(domain))
     outcomes.append(cache_operations._nginx(domain))
     outcomes.append(cache_operations._redis(domain))
     result = cache_operations.CacheResult(tuple(outcomes))

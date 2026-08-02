@@ -354,6 +354,107 @@ def test_purge_attempts_plugin_then_always_clears_owned_layers(monkeypatch):
     assert result.outcomes[0].status == "skipped"
 
 
+def test_wp_rocket_serves_the_static_cache_only_when_wpfy_allows_it():
+    from wpfy import site_cache as cache
+
+    snippet = cache._cache_snippet("wp-rocket")
+
+    # The rewrite is what skips PHP; it must never fire on its own judgement.
+    assert "if ($wpfy_skip_cache = 1) { set $rocket_bypass 0; }" in snippet
+    assert 'if (!-f "$rocket_dir/$rocket_name") { set $rocket_bypass 0; }' in snippet
+    rewrite = [line for line in snippet.splitlines() if "rewrite" in line]
+    assert len(rewrite) == 1, snippet
+    assert "/wp-content/cache/wp-rocket/" in rewrite[0]
+    guard = snippet.split("rewrite")[0].splitlines()[-2]
+    assert guard.strip() == "if ($rocket_bypass = 1) {", snippet
+
+
+def test_wp_rocket_cached_location_reissues_the_inherited_security_headers():
+    """nginx drops every inherited add_header from a location that sets one."""
+    from wpfy import site_cache as cache
+    from wpfy.site_layout import BASE_SECURITY_HEADERS, HSTS_HEADER
+
+    location = cache._cache_snippet("wp-rocket").split("location ~ ^/wp-content/cache")[1]
+    for header in BASE_SECURITY_HEADERS:
+        assert header in location, f"cached pages would be served without: {header}"
+    # A shared cache must not merge the cached copy with a logged-in response.
+    assert 'add_header Vary "Accept-Encoding, Cookie" always;' in location
+    assert HSTS_HEADER not in location
+
+    secure = cache._cache_snippet("wp-rocket", ssl_enabled=True)
+    assert HSTS_HEADER in secure.split("location ~ ^/wp-content/cache")[1]
+
+
+def test_other_page_caches_do_not_emit_the_rocket_rewrite():
+    from wpfy import site_cache as cache
+
+    for plugin in ("wpfc", "flying-press", "wp-super-cache"):
+        assert "rocket" not in cache._cache_snippet(plugin)
+
+
+def test_purge_clears_rocket_files_even_when_the_plugin_command_fails(monkeypatch):
+    """nginx serves those files without PHP, so a failed `wp rocket clean` alone
+    would leave purged pages still being served."""
+    from wpfy import site_cache as cache
+
+    execs = []
+    definition = _definition(cache, page_cache="wp-rocket")
+    monkeypatch.setattr(cache, "_definition", lambda domain: definition)
+    monkeypatch.setattr(
+        cache,
+        "run_wp_cli",
+        lambda domain, *args, **kwargs: cache.ProcessResult(1, stderr="command not found"),
+    )
+    monkeypatch.setattr(cache, "runtime_skip_requested", lambda: False)
+    monkeypatch.setattr(cache, "docker_available", lambda: True)
+    monkeypatch.setattr(
+        cache,
+        "compose_command",
+        lambda domain, *args: execs.append(args) or subprocess.CompletedProcess(args, 0),
+    )
+    monkeypatch.setattr(
+        cache.cache_operations,
+        "_nginx",
+        lambda domain: cache.cache_operations.CacheOutcome(domain, "nginx", "ok", "cache cleared"),
+    )
+    monkeypatch.setattr(
+        cache.cache_operations,
+        "_redis",
+        lambda domain: cache.cache_operations.CacheOutcome(domain, "redis", "skipped", "not enabled"),
+    )
+
+    result = cache.purge_site_cache(definition.domain)
+
+    assert [outcome.cache for outcome in result.outcomes] == ["plugin", "rocket", "nginx", "redis"]
+    assert result.outcomes[1].status == "ok"
+    # The app container owns the files; the web container mounts the app read-only.
+    assert execs == [("exec", "-T", "app", "sh", "-lc", f"rm -rf {cache.ROCKET_CACHE_DIR}/* 2>/dev/null || true")]
+
+
+def test_purge_skips_the_rocket_layer_for_other_page_caches(monkeypatch):
+    from wpfy import site_cache as cache
+
+    definition = _definition(cache, page_cache="wpfc")
+    monkeypatch.setattr(cache, "_definition", lambda domain: definition)
+    monkeypatch.setattr(
+        cache, "run_wp_cli", lambda domain, *args, **kwargs: cache.ProcessResult(0),
+    )
+    monkeypatch.setattr(
+        cache.cache_operations,
+        "_nginx",
+        lambda domain: cache.cache_operations.CacheOutcome(domain, "nginx", "ok", "cache cleared"),
+    )
+    monkeypatch.setattr(
+        cache.cache_operations,
+        "_redis",
+        lambda domain: cache.cache_operations.CacheOutcome(domain, "redis", "skipped", "not enabled"),
+    )
+
+    result = cache.purge_site_cache(definition.domain)
+
+    assert "rocket" not in [outcome.cache for outcome in result.outcomes]
+
+
 def test_switching_page_cache_is_idempotent_and_refresh_stable(tmp_wpfy_home, monkeypatch):
     layout, cache = _modules(tmp_wpfy_home)
     monkeypatch.setenv("WPFY_SKIP_RUNTIME", "1")

@@ -84,6 +84,18 @@ REDIS_IMAGE = "redis:7.2-alpine"
 # database, or cache. The base sits above host system accounts and typical human
 # operators; userns-remap is not in use, so the container uid maps 1:1 to the host.
 SITE_UID_BASE = 100000
+
+# nginx's add_header inheritance is all-or-nothing: a location that adds a header
+# of its own drops every header inherited from the server block. Any location that
+# must add one re-emits this list instead of silently shedding the security set.
+BASE_SECURITY_HEADERS = (
+    "add_header X-Content-Type-Options nosniff always;",
+    "add_header X-Frame-Options SAMEORIGIN always;",
+    'add_header X-XSS-Protection "0" always;',
+    "add_header Referrer-Policy strict-origin-when-cross-origin always;",
+    'add_header Permissions-Policy "geolocation=(), microphone=(), camera=()" always;',
+)
+HSTS_HEADER = 'add_header Strict-Transport-Security "max-age=31536000" always;'
 WORDPRESS_VERSION_URL = "https://api.wordpress.org/core/version-check/1.7/"
 WORDPRESS_VERSION_RE = re.compile(r"[0-9]+\.[0-9]+(?:\.[0-9]+)?")
 WORDPRESS_METADATA_LIMIT = 1024 * 1024
@@ -1815,15 +1827,11 @@ def ensure_site_scaffold(spec: SiteSpec) -> list[str]:
         "    access_log /var/log/nginx/wpfy-access.log combined;",
         # Keep nginx's request-body limit aligned with the generated PHP upload limits.
         f"    client_max_body_size {validate_php_setting('php_upload_max_size', spec.php_upload_max_size).lower()};",
-        "    add_header X-Content-Type-Options nosniff always;",
-        "    add_header X-Frame-Options SAMEORIGIN always;",
-        '    add_header X-XSS-Protection "0" always;',
-        "    add_header Referrer-Policy strict-origin-when-cross-origin always;",
-        "    add_header Permissions-Policy \"geolocation=(), microphone=(), camera=()\" always;",
+        *(f"    {header}" for header in BASE_SECURITY_HEADERS),
         "    include /etc/nginx/wpfy-extra/*.conf;",
     ]
     if spec.ssl_enabled:
-        nginx_lines.append("    add_header Strict-Transport-Security \"max-age=31536000\" always;")
+        nginx_lines.append(f"    {HSTS_HEADER}")
     nginx_lines.extend([
         "    location = /healthz.html {",
         "        access_log off;",

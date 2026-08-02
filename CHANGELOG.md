@@ -6,6 +6,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [1.0.0-rc4] - 2026-08-02
+
+### Added
+
+- Serve WP Rocket's page cache directly from nginx on sites using the `wp-rocket` integration, via an adapted [Rocket-Nginx](https://github.com/satellitewp/rocket-nginx) 3.1.2 block (MIT). An anonymous hit is answered from WP Rocket's cache file with no PHP, WordPress or MySQL in the request path, and reports `X-Wpfy-Cache: HIT`. wpfy's existing `$wpfy_skip_cache` rules remain the sole authority on whether a request may be served from cache, so a logged-in, POST, query-string or `/wp-admin` request still reaches PHP; upstream's own cookie and method conditions are deliberately not carried, to keep one authority for the invariant. wpfy's server-side configuration for `wp-rocket` was previously inert — it emitted `fastcgi_cache_bypass` directives that mean nothing without a FastCGI cache zone — so every request traversed PHP. See ADR 0029.
+- Delete WP Rocket's cached files during `wpfy cache <domain> purge` as a separate `rocket` layer, whether or not `wp rocket clean` succeeded. nginx answers from those files without consulting PHP, so a failed plugin command would otherwise leave purged pages still being served.
+
+### Fixed
+
+- Re-emit the vhost's security headers inside any generated nginx location that adds a header of its own. nginx's `add_header` inheritance is all-or-nothing, so the new cached-page location would otherwise have served WP Rocket's cached HTML without `X-Content-Type-Options`, `X-Frame-Options`, `Referrer-Policy`, `Permissions-Policy` or HSTS. The header set now has a single definition that the vhost and the cache snippet both read.
+
 ## [1.0.0-rc3] - 2026-08-01
 
 ### Added
