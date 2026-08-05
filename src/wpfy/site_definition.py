@@ -20,6 +20,8 @@ PAGE_CACHE_OPTIONS: Final = frozenset({
     "flying-press",
 })
 OBJECT_CACHE_OPTIONS: Final = frozenset({"none", "redis"})
+LETSENCRYPT_MODES: Final = ("default", "wildcard", "off")
+DNS_PROVIDERS: Final = ("cloudflare",)
 LEGACY_CACHE_FLAVORS: Final = {
     "wpfc": ("wpfc", "none"),
     "wpredis": ("none", "redis"),

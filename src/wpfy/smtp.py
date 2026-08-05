@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from email.message import EmailMessage
+import os
 from pathlib import Path
 import smtplib
 import ssl
@@ -43,18 +44,19 @@ def smtp_config_path() -> Path:
 def write_smtp_config(config: SMTPConfig) -> Path:
     path = smtp_config_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        "\n".join([
-            f"WPFY_SMTP_HOST={config.host}",
-            f"WPFY_SMTP_PORT={config.port}",
-            f"WPFY_SMTP_SENDER={config.sender}",
-            f"WPFY_SMTP_USERNAME={config.username}",
-            f"WPFY_SMTP_PASSWORD={config.password}",
-            f"WPFY_SMTP_TLS={config.tls}",
-            "",
-        ]),
-        encoding="utf-8",
-    )
+    with os.fdopen(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w", encoding="utf-8") as output:
+        os.fchmod(output.fileno(), 0o600)
+        output.write(
+            "\n".join([
+                f"WPFY_SMTP_HOST={config.host}",
+                f"WPFY_SMTP_PORT={config.port}",
+                f"WPFY_SMTP_SENDER={config.sender}",
+                f"WPFY_SMTP_USERNAME={config.username}",
+                f"WPFY_SMTP_PASSWORD={config.password}",
+                f"WPFY_SMTP_TLS={config.tls}",
+                "",
+            ])
+        )
     path.chmod(0o600)
     return path
 

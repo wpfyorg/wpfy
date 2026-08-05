@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
 from pathlib import Path
 from urllib.error import URLError
 from urllib.request import Request, urlopen
@@ -31,7 +32,9 @@ def cloudflare_config_path() -> Path:
 def write_cloudflare_config(config: CloudflareConfig) -> Path:
     path = cloudflare_config_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(f"CF_DNS_API_TOKEN={config.token}\n", encoding="utf-8")
+    with os.fdopen(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w", encoding="utf-8") as output:
+        os.fchmod(output.fileno(), 0o600)
+        output.write(f"CF_DNS_API_TOKEN={config.token}\n")
     path.chmod(0o600)
     return path
 

@@ -142,7 +142,7 @@ def test_ensure_traefik_network_skipped_with_env(monkeypatch):
     assert result.skipped is True
 
 
-def test_traefik_network_cidrs_uses_docker_ipam(monkeypatch):
+def test_traefik_network_cidrs_uses_traefik_container_addresses(monkeypatch):
     import subprocess
 
     monkeypatch.delenv("WPFY_TEST_TRAEFIK_NETWORK_CIDRS", raising=False)
@@ -150,14 +150,14 @@ def test_traefik_network_cidrs_uses_docker_ipam(monkeypatch):
     monkeypatch.setattr(
         "wpfy.traefik.subprocess.run",
         lambda *args, **kwargs: subprocess.CompletedProcess(
-            args[0], 0, '[{"Subnet":"172.18.0.0/16","Gateway":"172.18.0.1"}]\n', "",
+            args[0], 0, '{"wpfy":{"IPAddress":"172.18.0.2","GlobalIPv6Address":"2001:db8::2"}}\n', "",
         ),
     )
 
-    assert traefik_network_cidrs() == ("172.18.0.0/16",)
+    assert traefik_network_cidrs() == ("172.18.0.2/32", "2001:db8::2/128")
 
 
-def test_traefik_network_cidrs_refuses_missing_ipam(monkeypatch):
+def test_traefik_network_cidrs_refuses_missing_edge_address(monkeypatch):
     import subprocess
 
     monkeypatch.delenv("WPFY_TEST_TRAEFIK_NETWORK_CIDRS", raising=False)
@@ -167,7 +167,7 @@ def test_traefik_network_cidrs_refuses_missing_ipam(monkeypatch):
         lambda *args, **kwargs: subprocess.CompletedProcess(args[0], 0, "[]\n", ""),
     )
 
-    with pytest.raises(RuntimeError, match="no subnet"):
+    with pytest.raises(RuntimeError, match="not on wpfy"):
         traefik_network_cidrs()
 
 

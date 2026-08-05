@@ -147,6 +147,30 @@ def test_security_api_applies_the_wordpress_login_rate_limit(panel_server):
     assert "limit_req" in (site / "nginx" / "extra" / "wpfy-security.conf").read_text(encoding="utf-8")
 
 
+def test_security_api_reconciles_requested_unchanged_lists(panel_server, monkeypatch):
+    base_url, paths = panel_server
+    _seed_site(paths)
+    import wpfy.panel as panel
+
+    calls = []
+    monkeypatch.setattr(
+        panel.site_security,
+        "apply_security_runtime",
+        lambda domain: calls.append(domain) or panel.site_security.SecurityResult(0, "security config unchanged"),
+    )
+
+    status, payload = _request(
+        base_url,
+        f"/api/sites/{DOMAIN}/security",
+        method="PUT",
+        body={"deny_ips": []},
+    )
+
+    assert status == 200
+    assert payload["ok"] is True
+    assert calls == [DOMAIN]
+
+
 def test_cloudflare_warning_requires_deliberate_acknowledgement(panel_server):
     base_url, paths = panel_server
     site = _seed_site(paths)
@@ -202,7 +226,7 @@ def test_generated_basic_auth_password_is_one_time_and_never_cleartext(panel_ser
     _, later = _request(base_url, f"/api/sites/{DOMAIN}/security")
     assert password not in json.dumps(later)
     assert all(password.encode() not in content for content in _snapshot(site).values())
-    assert "{SHA}" in (site / "nginx" / "htpasswd").read_text()
+    assert "$6$" in (site / "nginx" / "htpasswd").read_text()
 
 
 def test_security_rejects_unknown_and_hostile_fields_without_secret_leaks(panel_server):

@@ -11,7 +11,7 @@ def test_site_definition_renders_sftp_across_persisted_representations():
         use_mysql=True,
         use_redis=True,
         php_version="8.3",
-        letsencrypt="certbot",
+        letsencrypt="default",
         ssl_enabled=True,
         sftp_password="secret",
         sftp_port="2230",

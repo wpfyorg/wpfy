@@ -6,6 +6,50 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Changed
+
+- `wpfy site create --pass`, grouped `wpfy site update --password`, and
+  `wpfy sftp --password` accept passwords only from stdin (`-`) or a TTY
+  prompt (`prompt` or an omitted value), never process argv. SFTP still
+  generates a password when `--password` is omitted. `wpfy panel --token`
+  now refuses raw values; use `--token-file` or `WPFY_PANEL_TOKEN`.
+
+### Fixed
+
+- Validate PHP image, Let's Encrypt mode, and DNS provider vocabularies before
+  site lifecycle preflight or scaffold writes. CLI and panel now share the
+  accepted values: PHP `7.4`, `8.0`–`8.4`; Let's Encrypt `default`,
+  `wildcard`, or `off`; DNS provider `cloudflare`.
+
+- Redact boundary-delimited `PWD`, `PASS`, `PASSWORD`, `SECRET`, `TOKEN`,
+  `KEY`, `CREDENTIAL`, `AUTH`, and `AUTHORIZATION` assignments in operation
+  events, including quoted values and HTTP Authorization headers. This prevents
+  cron-command secrets from reaching the JSONL log or panel, while preserving
+  harmless diagnostics such as `monkey=12` and `authority=high`. Event
+  redaction remains best-effort pattern matching: a secret without a
+  recognizable key can still be logged.
+
+- Write new basic-auth credentials as OpenSSL sha512crypt (`$6$`) hashes,
+  passing the password through stdin. Hosts without OpenSSL fall back to salted
+  APR1 (`$apr1$`); the basic-auth operation event records the selected scheme.
+  Restore re-applies `0640` and the site's uid:gid ownership to
+  `nginx/htpasswd` before restarting the site.
+
+- Create secret `.env`, stored S3/Cloudflare/SMTP configuration, and downloaded
+  remote backup archives with mode `0600` at open time. Scaffold regeneration
+  and restore preserve existing ownership and in-place writes; non-secret
+  generated bind mounts remain at their established modes.
+
+- Bound each accepted panel connection to a 30-second idle socket timeout. Slow or
+  incomplete unauthenticated request lines and headers are disconnected, while
+  intentional HTTP/1.1 keep-alive requests remain available between shorter idle gaps.
+
+- Require HTTPS for S3-compatible backup endpoints by default. `backup storage set --allow-insecure` persists the explicit HTTP opt-out as `WPFY_BACKUP_S3_ALLOW_INSECURE=1`; plaintext endpoints fail closed unless that opt-out is set. The S3 opener refuses cross-host redirects so SigV4 authorization headers cannot be replayed to another host.
+
+- Trust forwarded client address and forwarded scheme only from Traefik's discovered IPv4/IPv6 container addresses on `wpfy`, never every peer in its Docker subnet. Edge startup re-renders changed managed-site trust snippets and reloads changed running nginx services.
+
+- Apply per-site security mutations to the running edge before reporting success: basic authentication, deny-IP, user-agent blocks, and login rate limits reload the site's nginx service; Cloudflare-only recreates `web` when the rendered Traefik labels differ from the running container's `traefik.*` label slice. Already-applied Cloudflare-only labels are not re-applied on an unchanged panel save. If a site is stopped, wpfy stages the configuration and reports success that it will apply when the site starts. If either runtime operation fails, wpfy retains the staged configuration but returns a non-zero result that says it was not applied. Repeating the same CLI or panel request retries the runtime operation safely; documented offline behavior remains unchanged.
+
 ## [1.0.0-rc4] - 2026-08-02
 
 ### Added

@@ -47,7 +47,7 @@ from . import telemetry
 from . import operational_inspection
 from .php_runtime import DEFAULT_PHP_VERSION, SUPPORTED_PHP_VERSIONS
 from .certificate_lifecycle import cert_expiry_days, force_renew_cert, get_cert_info, preflight_ssl
-from .site_definition import PAGE_CACHE_OPTIONS, SiteDefinition
+from .site_definition import DNS_PROVIDERS, LETSENCRYPT_MODES, PAGE_CACHE_OPTIONS, SiteDefinition
 from .s3_backup import (
     S3Config,
     S3Uploader,
@@ -869,8 +869,8 @@ def _add_site_create_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--flyingpress", action="store_true")
     parser.add_argument("--wpsubdir", action="store_true")
     parser.add_argument("--wpsubdomain", action="store_true")
-    parser.add_argument("-le", "--letsencrypt", nargs="?", const="default")
-    parser.add_argument("--dns")
+    parser.add_argument("-le", "--letsencrypt", nargs="?", const="default", choices=LETSENCRYPT_MODES)
+    parser.add_argument("--dns", choices=DNS_PROVIDERS)
     parser.add_argument(
         "--proxied",
         action=argparse.BooleanOptionalAction,
@@ -879,7 +879,13 @@ def _add_site_create_arguments(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument("--user", dest="wp_user", help="WordPress administrator username")
     parser.add_argument("--email", dest="wp_email", help="WordPress administrator email")
-    parser.add_argument("--pass", dest="wp_password", help="WordPress administrator password")
+    parser.add_argument(
+        "--pass",
+        dest="wp_password",
+        nargs="?",
+        const="prompt",
+        help="WordPress administrator password: '-' for stdin, or prompt",
+    )
 
 
 def add_run_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
@@ -1007,6 +1013,11 @@ def add_backup_storage_parser(subparsers: argparse._SubParsersAction[argparse.Ar
     set_parser.add_argument("--prefix", default="")
     set_parser.add_argument("--profile")
     set_parser.add_argument("--access-key", required=True)
+    set_parser.add_argument(
+        "--allow-insecure",
+        action="store_true",
+        help="allow plaintext HTTP S3 transport; exposes backup contents and SigV4 credentials",
+    )
     set_parser.add_argument("--secret-key-stdin", action="store_true")
     set_parser.set_defaults(handler=handle_backup_storage)
 
@@ -1498,8 +1509,8 @@ def add_config_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentPa
     parser.add_argument("--wpredis", action="store_true")
     parser.add_argument("--wpsubdir", action="store_true")
     parser.add_argument("--wpsubdomain", action="store_true")
-    parser.add_argument("-le", "--letsencrypt", nargs="?", const="default", default=None)
-    parser.add_argument("--dns")
+    parser.add_argument("-le", "--letsencrypt", nargs="?", const="default", default=None, choices=LETSENCRYPT_MODES)
+    parser.add_argument("--dns", choices=DNS_PROVIDERS)
     parser.add_argument(
         "--proxied",
         action=argparse.BooleanOptionalAction,
@@ -2277,14 +2288,11 @@ def handle_panel_exposure(args: argparse.Namespace) -> CommandResult:
 def resolve_panel_token(
     args: argparse.Namespace, environ: dict | None = None,
 ) -> tuple[str, str | None]:
-    """Resolve the panel token and any warning about how it was supplied.
+    """Resolve the panel token from a file, environment, or generated value.
 
-    Highest precedence first: --token-file, WPFY_PANEL_TOKEN, --token, generated.
-
-    `--token` remains supported because removing it would break existing operator
-    scripts, but it places the token in the process command line, which is
-    world-readable via /proc at mode 444 for the lifetime of a long-running
-    panel. The two sources above it exist so that never has to happen.
+    Highest precedence first: --token-file, WPFY_PANEL_TOKEN, generated.
+    Raw --token values are refused because a running panel leaves them exposed
+    in the process command line.
     """
     environ = os.environ if environ is None else environ
 
@@ -2300,10 +2308,7 @@ def resolve_panel_token(
         return from_env, None
 
     if getattr(args, "token", None):
-        return args.token, (
-            "warning: --token places the panel token in this process's command line, "
-            "where any local user can read it; prefer --token-file or WPFY_PANEL_TOKEN"
-        )
+        raise ValueError("raw --token values are not accepted; use --token-file or WPFY_PANEL_TOKEN")
 
     return panel.generate_panel_token(), None
 
@@ -2442,7 +2447,11 @@ def handle_utility_htpasswd(args: argparse.Namespace) -> CommandResult:
         password = sys.stdin.readline().rstrip("\r\n")
         if not password:
             return CommandResult("password required on stdin", exit_code=2)
-    htpasswd = f"{username}:{site_security._htpasswd_sha(password)}"
+    try:
+        hashed_password, _scheme = site_security._htpasswd_hash(password)
+    except RuntimeError as exc:
+        return CommandResult(f"failed to generate htpasswd credential: {exc}", exit_code=3)
+    htpasswd = f"{username}:{hashed_password}"
     if generated:
         return CommandResult("\n".join([f"username: {username}", f"password: {password}", f"htpasswd: {htpasswd}"]))
     return CommandResult(f"htpasswd: {htpasswd}")
@@ -2455,20 +2464,25 @@ def _database_command_result(result: site_database.DatabaseResult) -> CommandRes
     return CommandResult("\n".join(lines), exit_code=result.exit_code)
 
 
-def _db_password_argument(value: str | None) -> tuple[str | None, CommandResult | None]:
+def _password_argument(
+    value: str | None,
+    *,
+    password_name: str = "database password",
+    prompt: str = "Database password: ",
+) -> tuple[str | None, CommandResult | None]:
     if value is None:
         return None, None
     if value == "-":
         password = sys.stdin.readline().rstrip("\r\n")
         if not password:
-            return None, CommandResult("database password required on stdin", exit_code=2)
+            return None, CommandResult(f"{password_name} required on stdin", exit_code=2)
         return password, None
     if value == "prompt":
         if not sys.stdin.isatty():
-            return None, CommandResult("database password prompt requires a TTY; use --password -", exit_code=2)
-        password = getpass.getpass("Database password: ")
+            return None, CommandResult(f"{password_name} prompt requires a TTY; use --password -", exit_code=2)
+        password = getpass.getpass(prompt)
         if not password:
-            return None, CommandResult("database password cannot be empty", exit_code=2)
+            return None, CommandResult(f"{password_name} cannot be empty", exit_code=2)
         return password, None
     return None, CommandResult("use --password - or --password prompt; raw passwords are not accepted", exit_code=2)
 
@@ -2490,14 +2504,14 @@ def handle_db(args: argparse.Namespace) -> CommandResult:
         if command == "grant":
             return _database_command_result(site_database.grant(domain, args.user, args.database))
         if command == "user-add":
-            password, error = _db_password_argument(args.password)
+            password, error = _password_argument(args.password)
             if error:
                 return error
             return _database_command_result(
                 site_database.create_user(domain, args.user, password=password, grants=args.database),
             )
         if command == "user-password":
-            password, error = _db_password_argument(args.password)
+            password, error = _password_argument(args.password)
             if error:
                 return error
             return _database_command_result(site_database.set_user_password(domain, args.user, password=password))
@@ -2883,8 +2897,8 @@ def add_site_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentPars
         ),
     )
     ssl.add_argument("domain")
-    ssl.add_argument("-le", "--letsencrypt", nargs="?", const="default")
-    ssl.add_argument("--dns")
+    ssl.add_argument("-le", "--letsencrypt", nargs="?", const="default", choices=LETSENCRYPT_MODES)
+    ssl.add_argument("--dns", choices=DNS_PROVIDERS)
     ssl.add_argument(
         "--proxied",
         action=argparse.BooleanOptionalAction,
@@ -2971,17 +2985,17 @@ def add_site_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentPars
     update.add_argument("--wpfastest", action="store_true")
     update.add_argument("--flyingpress", action="store_true")
     update.add_argument("--wpredis", action="store_true")
-    update.add_argument("-le", "--letsencrypt", nargs="?", const="default", default=None)
+    update.add_argument("-le", "--letsencrypt", nargs="?", const="default", default=None, choices=LETSENCRYPT_MODES)
     update.add_argument(
         "--proxied",
         action=argparse.BooleanOptionalAction,
         default=None,
         help="force proxied (HTTP-01) mode on/off; default keeps the current setting",
     )
-    update.add_argument("--password")
+    update.add_argument("--password", nargs="?", const="prompt", help="password, '-' for stdin, or prompt")
     update.add_argument("--wpsubdir", action="store_true")
     update.add_argument("--wpsubdomain", action="store_true")
-    update.add_argument("--dns")
+    update.add_argument("--dns", choices=DNS_PROVIDERS)
     update.set_defaults(handler=handle_site_update)
 
 
@@ -3071,14 +3085,26 @@ def add_sftp_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentPars
     parser.add_argument("--enable", action="store_true", help="enable SFTP access for the site")
     parser.add_argument("--disable", action="store_true", help="disable SFTP access for the site")
     parser.add_argument("--status", action="store_true", help="show SFTP container status")
-    parser.add_argument("--password", help="custom SFTP password (auto-generated if omitted)")
+    parser.add_argument(
+        "--password",
+        nargs="?",
+        const="prompt",
+        help="custom SFTP password: '-' for stdin, or prompt (auto-generated if omitted)",
+    )
     parser.set_defaults(handler=handle_sftp)
 
 
 def handle_sftp(args: argparse.Namespace) -> CommandResult:
     domain = args.domain
+    password, password_error = _password_argument(
+        args.password,
+        password_name="SFTP password",
+        prompt="SFTP password: ",
+    )
+    if password_error:
+        return password_error
     if args.enable:
-        result = sftp.ensure_sftp_container(domain, password=args.password)
+        result = sftp.ensure_sftp_container(domain, password=password)
     elif args.disable:
         result = sftp.remove_sftp_container(domain)
     elif args.status:
@@ -3487,6 +3513,15 @@ def _site_cache_selection(args: argparse.Namespace) -> tuple[str, str, str] | Co
 
 
 def handle_site_create(args: argparse.Namespace) -> CommandResult:
+    password, password_error = _password_argument(
+        args.wp_password,
+        password_name="WordPress admin password",
+        prompt="WordPress admin password: ",
+    )
+    if password_error:
+        return password_error
+    args.wp_password = password
+
     selection = _site_cache_selection(args)
     if isinstance(selection, CommandResult):
         return selection
@@ -3554,6 +3589,14 @@ def handle_site_create(args: argparse.Namespace) -> CommandResult:
 
 def handle_site_update(args: argparse.Namespace) -> CommandResult:
     domain = args.domain
+    password, password_error = _password_argument(
+        args.password,
+        password_name="WordPress admin password",
+        prompt="WordPress admin password: ",
+    )
+    if password_error:
+        return password_error
+
     page_flags = {
         "wpfc": "wpfc",
         "wpsc": "wp-super-cache",
@@ -3577,7 +3620,7 @@ def handle_site_update(args: argparse.Namespace) -> CommandResult:
         letsencrypt=args.letsencrypt,
         dns_provider=getattr(args, "dns", None),
         proxied_override=getattr(args, "proxied", None),
-        password=args.password,
+        password=password,
     )
     return _site_update_command_result(domain, request)
 
@@ -3728,6 +3771,7 @@ def _s3_config_summary(config: S3Config) -> list[str]:
         f"bucket: {config.bucket}",
         f"region: {config.region}",
         f"prefix: {config.prefix or '(none)'}",
+        f"insecure HTTP: {'allowed' if config.allow_insecure else 'refused'}",
         "access key: configured",
         "secret key: configured",
     ]
@@ -3765,9 +3809,13 @@ def handle_backup_storage(args: argparse.Namespace) -> CommandResult:
             prefix=args.prefix,
             access_key=args.access_key,
             secret_key=secret_key,
+            allow_insecure=args.allow_insecure,
         )
-        path = write_s3_config(config, profile)
-        stored = load_s3_config(profile)
+        try:
+            path = write_s3_config(config, profile)
+            stored = load_s3_config(profile)
+        except RuntimeError as exc:
+            return CommandResult(str(exc), exit_code=2)
         return CommandResult(
             _render_summary("backup storage", [*_s3_config_summary(stored), f"config: {path}"])
         )

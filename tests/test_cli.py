@@ -25,6 +25,11 @@ def test_build_parser_returns_parser():
     assert parser is not None
 
 
+def test_site_create_parser_rejects_unknown_letsencrypt_mode():
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(["site", "create", "example.com", "--letsencrypt", "wildcrad"])
+
+
 def test_stack_acme_email_persists_and_reports_pending_apply(tmp_wpfy_home, monkeypatch):
     import wpfy.cli as cli
 
@@ -334,6 +339,18 @@ def test_site_create_parser_has_wordpress_admin_flags():
     pytest.fail("site create parser not found")
 
 
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["site", "create", "example.com", "--wp", "--pass", "raw-password"],
+        ["site", "update", "example.com", "--password", "raw-password"],
+    ],
+)
+def test_site_password_flags_reject_raw_values(argv, capsys):
+    assert run(argv) == 2
+    assert capsys.readouterr().out == "use --password - or --password prompt; raw passwords are not accepted\n"
+
+
 def test_php_parsers_accept_84_and_default_to_84():
     parser = build_parser()
 
@@ -581,6 +598,23 @@ def test_backup_storage_set_writes_secret_from_stdin(tmp_wpfy_home, monkeypatch,
     assert "stored-secret" not in output
     assert "stored-access" not in output
     assert "secret key: configured" in output
+
+
+def test_backup_storage_set_requires_https_unless_explicitly_allowed(tmp_wpfy_home, monkeypatch, capsys):
+    import wpfy.cli as cli
+    import wpfy.s3_backup
+
+    importlib.reload(wpfy.s3_backup)
+    monkeypatch.setattr(sys, "stdin", io.StringIO("stored-secret\nstored-secret\n"))
+    args = [
+        "backup", "storage", "set", "--endpoint", "http://storage.example.test", "--bucket", "site-backups",
+        "--region", "auto", "--access-key", "stored-access", "--secret-key-stdin",
+    ]
+
+    assert cli.run(args) == 2
+    assert "--allow-insecure" in capsys.readouterr().out
+    assert cli.run([*args, "--allow-insecure"]) == 0
+    assert wpfy.s3_backup.load_s3_config().allow_insecure
 
 
 def test_backup_storage_profile_uses_profile_path(tmp_wpfy_home, monkeypatch, capsys):
@@ -1699,7 +1733,8 @@ def test_site_create_does_not_print_password_for_existing_wordpress_install(monk
         ),
     )
 
-    result = cli.run(["site", "create", "example.com", "--wp", "--pass", "do-not-print"])
+    monkeypatch.setattr(cli.sys, "stdin", io.StringIO("do-not-print\n"))
+    result = cli.run(["site", "create", "example.com", "--wp", "--pass", "-"])
     output = capsys.readouterr().out
 
     assert result == 0
@@ -3313,13 +3348,13 @@ def test_utility_htpasswd_generated_and_stdin(monkeypatch, capsys):
     assert result == 0
     assert "username: admin" in output
     assert "password: " in output
-    assert "htpasswd: admin:{SHA}" in output
+    assert "htpasswd: admin:$6$" in output
 
     monkeypatch.setattr(sys, "stdin", io.StringIO("stdin-secret\n"))
     result = run(["utility", "htpasswd", "--username", "admin", "--password-stdin"])
     output = capsys.readouterr().out
     assert result == 0
-    assert output.startswith("htpasswd: admin:{SHA}")
+    assert output.startswith("htpasswd: admin:$6$")
     assert "stdin-secret" not in output
 
     assert run(["utility", "htpasswd", "--username", "bad:name"]) == 2

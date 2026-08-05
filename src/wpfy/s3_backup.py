@@ -11,9 +11,9 @@ import re
 from types import TracebackType
 import xml.etree.ElementTree as ET
 from typing import BinaryIO, Final, Protocol
-from urllib.error import URLError
+from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlparse, urlunparse
-from urllib.request import Request, urlopen
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from .redaction import redact_values
 from .site_paths import read_env
@@ -48,6 +48,7 @@ class S3Config:
     prefix: str
     access_key: str
     secret_key: str
+    allow_insecure: bool = False
 
 
 class S3ConfigError(RuntimeError):
@@ -77,9 +78,25 @@ class Opener(Protocol):
         pass
 
 
+class _S3RedirectHandler(HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        source = urlparse(req.full_url)
+        target = urlparse(newurl)
+        if source.scheme != target.scheme or (source.hostname, source.port) != (target.hostname, target.port):
+            raise HTTPError(req.full_url, code, "refusing redirect to a different S3 host", headers, fp)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+_SAFE_OPENER = build_opener(_S3RedirectHandler())
+
+
+def _safe_urlopen(request: Request, *, timeout: int) -> Response:
+    return _SAFE_OPENER.open(request, timeout=timeout)
+
+
 class S3Uploader:
-    def __init__(self, opener: Opener = urlopen) -> None:
-        self._opener = opener
+    def __init__(self, opener: Opener | None = None) -> None:
+        self._opener = opener or _safe_urlopen
 
     def upload_archive(self, config: S3Config, archive_path: Path, domain: str) -> str:
         key = s3_object_key(config.prefix, domain, archive_path.name)
@@ -140,8 +157,8 @@ class S3Uploader:
                 content_length = headers.get("Content-Length")
                 expected_length = int(content_length) if content_length is not None else None
                 downloaded = 0
-                with destination.open("wb") as output:
-                    destination.chmod(0o600)
+                with os.fdopen(os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "wb") as output:
+                    os.fchmod(output.fileno(), 0o600)
                     while chunk := response.read(TRANSFER_CHUNK_SIZE):
                         output.write(chunk)
                         downloaded += len(chunk)
@@ -182,19 +199,22 @@ def s3_config_path(profile: str | None = None) -> Path:
 
 def write_s3_config(config: S3Config, profile: str | None = None) -> Path:
     path = s3_config_path(profile)
+    endpoint = _normalized_endpoint(config.endpoint, allow_insecure=config.allow_insecure)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        "\n".join([
-            f"WPFY_BACKUP_S3_ENDPOINT={_normalized_endpoint(config.endpoint)}",
-            f"WPFY_BACKUP_S3_BUCKET={config.bucket}",
-            f"WPFY_BACKUP_S3_REGION={config.region}",
-            f"WPFY_BACKUP_S3_PREFIX={config.prefix.strip('/')}",
-            f"WPFY_BACKUP_S3_ACCESS_KEY={config.access_key}",
-            f"WPFY_BACKUP_S3_SECRET_KEY={config.secret_key}",
-            "",
-        ]),
-        encoding="utf-8",
-    )
+    with os.fdopen(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w", encoding="utf-8") as output:
+        os.fchmod(output.fileno(), 0o600)
+        output.write(
+            "\n".join([
+                f"WPFY_BACKUP_S3_ENDPOINT={endpoint}",
+                f"WPFY_BACKUP_S3_BUCKET={config.bucket}",
+                f"WPFY_BACKUP_S3_REGION={config.region}",
+                f"WPFY_BACKUP_S3_PREFIX={config.prefix.strip('/')}",
+                f"WPFY_BACKUP_S3_ACCESS_KEY={config.access_key}",
+                f"WPFY_BACKUP_S3_SECRET_KEY={config.secret_key}",
+                f"WPFY_BACKUP_S3_ALLOW_INSECURE={'1' if config.allow_insecure else '0'}",
+                "",
+            ])
+        )
     path.chmod(0o600)
     return path
 
@@ -229,13 +249,15 @@ def _load_env_config() -> S3Config | None:
     missing = [key for key, value in values.items() if not value]
     if missing:
         raise S3ConfigError(f"missing {', '.join(missing)}")
+    allow_insecure = os.environ.get("WPFY_BACKUP_S3_ALLOW_INSECURE", "").strip() == "1"
     return S3Config(
-        endpoint=_normalized_endpoint(values["WPFY_BACKUP_S3_ENDPOINT"]),
+        endpoint=_normalized_endpoint(values["WPFY_BACKUP_S3_ENDPOINT"], allow_insecure=allow_insecure),
         bucket=values["WPFY_BACKUP_S3_BUCKET"],
         region=values["WPFY_BACKUP_S3_REGION"],
         prefix=os.environ.get("WPFY_BACKUP_S3_PREFIX", "").strip("/"),
         access_key=values["WPFY_BACKUP_S3_ACCESS_KEY"],
         secret_key=values["WPFY_BACKUP_S3_SECRET_KEY"],
+        allow_insecure=allow_insecure,
     )
 
 
@@ -250,20 +272,34 @@ def _load_stored_config(profile: str | None = None) -> S3Config | None:
     missing = [key for key in REQUIRED_ENV if not values.get(key)]
     if missing:
         raise S3ConfigError(f"missing {', '.join(missing)}")
+    allow_insecure = values.get("WPFY_BACKUP_S3_ALLOW_INSECURE", "").strip() == "1"
     return S3Config(
-        endpoint=_normalized_endpoint(values["WPFY_BACKUP_S3_ENDPOINT"]),
+        endpoint=_normalized_endpoint(values["WPFY_BACKUP_S3_ENDPOINT"], allow_insecure=allow_insecure),
         bucket=values["WPFY_BACKUP_S3_BUCKET"],
         region=values["WPFY_BACKUP_S3_REGION"],
         prefix=values.get("WPFY_BACKUP_S3_PREFIX", "").strip("/"),
         access_key=values["WPFY_BACKUP_S3_ACCESS_KEY"],
         secret_key=values["WPFY_BACKUP_S3_SECRET_KEY"],
+        allow_insecure=allow_insecure,
     )
 
 
-def _normalized_endpoint(endpoint: str) -> str:
+def _normalized_endpoint(endpoint: str, *, allow_insecure: bool = False) -> str:
     normalized = endpoint.strip()
     if "://" not in normalized:
         normalized = f"https://{normalized}"
+    parsed = urlparse(normalized)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise S3ConfigError("WPFY_BACKUP_S3_ENDPOINT must use http(s) and include a host")
+    if parsed.scheme == "http" and not allow_insecure:
+        raise S3ConfigError(
+            "plaintext S3 endpoint rejected; use HTTPS or explicitly pass --allow-insecure "
+            "(WPFY_BACKUP_S3_ALLOW_INSECURE=1)"
+        )
+    try:
+        parsed.port
+    except ValueError as exc:
+        raise S3ConfigError("WPFY_BACKUP_S3_ENDPOINT has an invalid port") from exc
     return normalized.rstrip("/")
 
 
@@ -301,9 +337,7 @@ def _signed_request(
     content_length: int | None = None,
     query: str = "",
 ) -> Request:
-    parsed = urlparse(config.endpoint)
-    if not parsed.scheme or not parsed.netloc:
-        raise S3ConfigError("invalid WPFY_BACKUP_S3_ENDPOINT")
+    parsed = urlparse(_normalized_endpoint(config.endpoint, allow_insecure=config.allow_insecure))
     now = datetime.now(timezone.utc)
     date_stamp = now.strftime("%Y%m%d")
     amz_date = now.strftime("%Y%m%dT%H%M%SZ")

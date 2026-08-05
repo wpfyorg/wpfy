@@ -10,6 +10,7 @@ import pytest
 
 @pytest.fixture
 def security_modules(tmp_wpfy_home, monkeypatch):
+    monkeypatch.setenv("WPFY_SKIP_RUNTIME", "1")
     monkeypatch.setenv("WPFY_TEST_TRAEFIK_NETWORK_CIDRS", "172.18.0.0/16")
     import wpfy.site_paths
     import wpfy.site_security
@@ -188,15 +189,50 @@ def test_invalid_user_agent_is_rejected_before_state_or_snippet_write(security_m
     assert after == before
 
 
-def test_htpasswd_helpers_moved_without_changing_output():
+def test_htpasswd_helpers_moved_and_new_hashes_are_salted(monkeypatch):
     import wpfy.cli as cli
     from wpfy import site_security
 
     assert not hasattr(cli, "_htpasswd_sha")
     assert not hasattr(cli, "_safe_htpasswd_username")
-    assert site_security._htpasswd_sha("secret") == "{SHA}5en6G6MezRroT3XKqkdPOmY/BfQ="
+    monkeypatch.setattr(site_security.secrets, "choice", lambda _alphabet: ".")
+    assert site_security._htpasswd_apr1("secret") == "$apr1$........$9SzY/TdPRPHQr/nVfsH1r/"
+
+    monkeypatch.undo()
+    first = site_security._htpasswd_apr1("secret")
+    second = site_security._htpasswd_apr1("secret")
+    assert first.startswith("$apr1$")
+    assert first != second
     assert site_security._safe_htpasswd_username("operator@example.com")
     assert not site_security._safe_htpasswd_username("bad:name")
+
+
+def test_htpasswd_hash_uses_openssl_stdin_and_records_apr1_fallback(monkeypatch):
+    from wpfy import site_security
+
+    seen = {}
+
+    class OpenSSL:
+        returncode = 0
+
+        def communicate(self, password):
+            seen["input"] = password
+            return "$6$salt$hash\n", ""
+
+    def openssl(argv, **kwargs):
+        seen["argv"] = argv
+        seen.update(kwargs)
+        return OpenSSL()
+
+    monkeypatch.setattr(site_security.subprocess, "Popen", openssl)
+    assert site_security._htpasswd_hash("secret") == ("$6$salt$hash", "sha512crypt")
+    assert seen["argv"] == ["openssl", "passwd", "-6", "-stdin"]
+    assert seen["input"] == "secret"
+
+    monkeypatch.setattr(site_security.subprocess, "Popen", lambda *args, **kwargs: (_ for _ in ()).throw(FileNotFoundError()))
+    hashed, scheme = site_security._htpasswd_hash("secret")
+    assert hashed.startswith("$apr1$")
+    assert scheme == "apr1"
 
 
 def test_real_ip_uses_edge_subnet_and_cloudflare_for_proxied_site(security_modules, monkeypatch):
@@ -294,6 +330,8 @@ def test_basic_auth_hashes_password_and_rotates_in_place(security_modules):
     assert first != second
     assert "first-secret" not in first
     assert "second-secret" not in second
+    assert first.startswith("operator:$6$")
+    assert second.startswith("operator:$6$")
     assert htpasswd.stat().st_mode & 0o777 == 0o640
     assert "password" not in security.load_security(domain)["basic_auth"]
     assert not list((site / "app").rglob("*htpasswd*"))
@@ -342,6 +380,38 @@ def test_login_rate_limit_renders_php_handler_and_updates_the_mounted_zone(secur
     assert zone_file.read_text(encoding="utf-8") == ""
     assert "wp-login" not in (site / "nginx" / "extra" / security.SECURITY_SNIPPET).read_text(encoding="utf-8")
     assert zone_file.stat().st_ino == before_inode
+
+
+def test_login_rate_limit_reports_staged_config_until_nginx_reload_succeeds(security_modules, monkeypatch):
+    layout, security = security_modules
+    domain = "security.example.com"
+    _site(layout, domain)
+    reloads = ["nginx rejected config", None]
+    monkeypatch.setattr(security, "_reload_web_service", lambda _domain: reloads.pop(0))
+
+    failed = security.set_login_rate_limit(domain, True)
+    retried = security.set_login_rate_limit(domain, True)
+
+    assert failed.exit_code != 0
+    assert "written but not applied" in failed.message
+    assert security.load_security(domain)["login_rate_limit"] is True
+    assert retried.exit_code == 0
+
+
+def test_cloudflare_only_reports_staged_labels_until_web_recreate_succeeds(security_modules, monkeypatch):
+    layout, security = security_modules
+    domain = "security.example.com"
+    _site(layout, domain)
+    recreates = ["docker unavailable", None]
+    monkeypatch.setattr(security, "_recreate_web_service", lambda _domain: recreates.pop(0))
+
+    failed = security.set_cloudflare_only(domain, True)
+    retried = security.set_cloudflare_only(domain, True)
+
+    assert failed.exit_code != 0
+    assert "written but not applied" in failed.message
+    assert security.load_security(domain)["cloudflare_only"] is True
+    assert retried.exit_code == 0
 
 
 def test_fail2ban_is_per_site_and_uses_docker_user_chain(security_modules, monkeypatch):

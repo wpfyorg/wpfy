@@ -3,6 +3,8 @@ from __future__ import annotations
 import importlib
 import json
 
+import pytest
+
 
 def test_event_redaction_and_filters(tmp_wpfy_home):
     import wpfy.events as events
@@ -20,6 +22,22 @@ def test_event_redaction_and_filters(tmp_wpfy_home):
     assert "secret-value" not in serialized
     assert "other-secret" not in serialized
     assert "REDACTED" in serialized
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("MYSQL_PWD=hunter2", "MYSQL_PWD=***REDACTED***"),
+        ('api_token="hunter 2"', "api_token=***REDACTED***"),
+        ("credential='hunter 2'", "credential=***REDACTED***"),
+        ("monkey=12", "monkey=12"),
+        ("authority=high", "authority=high"),
+    ],
+)
+def test_event_redaction_matches_secret_tokens_only(value, expected):
+    from wpfy.events import _redact
+
+    assert _redact(value) == expected
 
 
 def test_event_log_rotates(tmp_wpfy_home, monkeypatch):

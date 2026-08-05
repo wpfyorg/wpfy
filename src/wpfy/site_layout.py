@@ -502,13 +502,13 @@ def _merge_tree_safely(
         os.close(root_fd)
 
 
-def _write_text_safely(root: Path, name: str, content: str) -> None:
+def _write_text_safely(root: Path, name: str, content: str, mode: int = 0o644) -> None:
     root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     try:
         file_fd = os.open(
             name,
             os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW,
-            0o644,
+            mode,
             dir_fd=root_fd,
         )
         with os.fdopen(file_fd, "w", encoding="utf-8") as destination:
@@ -1206,7 +1206,9 @@ def _preserve_live_db_credentials(domain: str, live_env: dict[str, str]) -> Runt
     if merged == restored:
         return None
     try:
-        _write_text_safely(target, ".env", "\n".join(f"{key}={value}" for key, value in merged.items()) + "\n")
+        _write_text_safely(
+            target, ".env", "\n".join(f"{key}={value}" for key, value in merged.items()) + "\n", 0o600
+        )
         _chmod_file_safely(target, ".env", 0o600)
     except OSError as exc:
         return RuntimeResult(3, f"failed to preserve live database credentials: {exc}")
@@ -1218,6 +1220,10 @@ def _harden_restored_permissions(domain: str) -> RuntimeResult | None:
     try:
         try:
             _chmod_file_safely(target, ".env", 0o600)
+        except FileNotFoundError:
+            pass
+        try:
+            _chmod_file_safely(target / "nginx", site_security.HTPASSWD_FILE, 0o640)
         except FileNotFoundError:
             pass
         target_fd = os.open(target, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
@@ -1547,6 +1553,16 @@ def _apply_site_ownership(domain: str, uid: int) -> RuntimeResult:
                 return RuntimeResult(3, f"ownership failed: unsafe access-log symlink: {access_log.name}")
             os.chown(access_log, uid, uid, follow_symlinks=False)
             os.chmod(access_log, 0o640, follow_symlinks=False)
+        htpasswd = nginx_dir(domain) / site_security.HTPASSWD_FILE
+        try:
+            metadata = htpasswd.lstat()
+        except FileNotFoundError:
+            pass
+        else:
+            if stat.S_ISLNK(metadata.st_mode):
+                return RuntimeResult(3, f"ownership failed: unsafe htpasswd symlink: {htpasswd.name}")
+            os.chown(htpasswd, uid, uid, follow_symlinks=False)
+            os.chmod(htpasswd, 0o640, follow_symlinks=False)
     except PermissionError as exc:
         return RuntimeResult(0, f"ownership skipped (chown not permitted: {exc})", skipped=True)
     except OSError as exc:
@@ -1879,7 +1895,7 @@ def ensure_site_scaffold(spec: SiteSpec) -> list[str]:
     try:
         env_rendered = env_content(spec, existing_env)
         if _read_text_safely(site_root, env_file.name) != env_rendered:
-            _write_text_safely(site_root, env_file.name, env_rendered)
+            _write_text_safely(site_root, env_file.name, env_rendered, 0o600)
             touched.append(str(env_file))
         _chmod_file_safely(site_root, env_file.name, 0o600)
 

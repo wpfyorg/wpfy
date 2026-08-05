@@ -16,8 +16,10 @@ from urllib.parse import parse_qs, quote, unquote, urlparse
 from . import __version__, events, files, metrics, operational_inspection, panel_auth, panel_jobs, panel_setup, sftp
 from . import site_cache, site_cron, site_database
 from . import site_configuration, site_lifecycle, site_security
-from .php_runtime import DEFAULT_PHP_VERSION
+from .php_runtime import DEFAULT_PHP_VERSION, SUPPORTED_PHP_VERSIONS
 from .site_definition import (
+    DNS_PROVIDERS,
+    LETSENCRYPT_MODES,
     WORDPRESS_FLAVORS,
     SiteDefinition,
     validate_object_cache,
@@ -49,6 +51,7 @@ from .site_runtime import (
 from . import panel_exposure, traefik
 
 DEFAULT_PANEL_PORT = 8642
+PANEL_SOCKET_TIMEOUT = 30
 STATIC_DIR = Path(__file__).parent / "panel_static"
 _STATIC_TYPES = {
     ".html": "text/html; charset=utf-8",
@@ -174,6 +177,13 @@ class PanelError(Exception):
     def __init__(self, status: int, message: str) -> None:
         super().__init__(message)
         self.status = status
+
+
+class _PanelHTTPServer(ThreadingHTTPServer):
+    def get_request(self):
+        request, client_address = super().get_request()
+        request.settimeout(PANEL_SOCKET_TIMEOUT)
+        return request, client_address
 
 
 def generate_panel_token() -> str:
@@ -475,6 +485,12 @@ def api_site_config(domain: str, body: dict) -> tuple[int, dict]:
     for key in ("php_version", "letsencrypt", "password"):
         if body.get(key) is not None and not isinstance(body[key], str):
             raise PanelError(400, f"{key} must be a string")
+    for key, value, allowed in (
+        ("php_version", body.get("php_version"), SUPPORTED_PHP_VERSIONS),
+        ("letsencrypt", body.get("letsencrypt"), LETSENCRYPT_MODES),
+    ):
+        if value is not None and value not in allowed:
+            raise PanelError(400, f"invalid {key}: {value!r}; accepted values: {', '.join(allowed)}")
     try:
         result = site_lifecycle.update_site(site_lifecycle.UpdateSiteRequest(
             domain=domain,
@@ -929,14 +945,25 @@ def _put_security(principal, match, query, body):
         return 200, preview
 
     results = []
+    list_changed = False
     for cidr in sorted(set(current["deny_ips"]) - set(desired["deny_ips"])):
         results.append(site_security.remove_deny_ip(domain, cidr))
+        list_changed = True
     for cidr in sorted(set(desired["deny_ips"]) - set(current["deny_ips"])):
         results.append(site_security.add_deny_ip(domain, cidr))
+        list_changed = True
     for pattern in sorted(set(current["ua_blocks"]) - set(desired["ua_blocks"])):
         results.append(site_security.remove_ua_block(domain, pattern))
+        list_changed = True
     for pattern in sorted(set(desired["ua_blocks"]) - set(current["ua_blocks"])):
         results.append(site_security.add_ua_block(domain, pattern))
+        list_changed = True
+    if (
+        not list_changed
+        and {"deny_ips", "ua_blocks"}.intersection(requested)
+        and not {"basic_auth", "cloudflare_only", "login_rate_limit"}.intersection(requested)
+    ):
+        results.append(site_security.apply_security_runtime(domain))
     if "basic_auth" in body:
         results.append(site_security.set_basic_auth(
             domain,
@@ -944,9 +971,9 @@ def _put_security(principal, match, query, body):
             username=desired["basic_auth"]["username"],
             password=password,
         ))
-    if "cloudflare_only" in body and current["cloudflare_only"] != desired["cloudflare_only"]:
+    if "cloudflare_only" in body:
         results.append(site_security.set_cloudflare_only(domain, desired["cloudflare_only"]))
-    if "login_rate_limit" in body and current["login_rate_limit"] != desired["login_rate_limit"]:
+    if "login_rate_limit" in body:
         results.append(site_security.set_login_rate_limit(domain, desired["login_rate_limit"]))
 
     failed = next((result for result in results if result.exit_code != 0), None)
@@ -1417,6 +1444,14 @@ def _post_create_site(principal, match, query, body):
         raise PanelError(400, str(exc))
     if not isinstance(flavor, str) or flavor not in _ALLOWED_PANEL_FLAVORS:
         raise PanelError(400, f"unknown site flavor: {flavor}")
+    php_version = body.get("php_version") if body.get("php_version") is not None else DEFAULT_PHP_VERSION
+    for key, value, allowed in (
+        ("php_version", php_version, SUPPORTED_PHP_VERSIONS),
+        ("letsencrypt", body.get("letsencrypt"), LETSENCRYPT_MODES),
+        ("dns_provider", body.get("dns_provider"), DNS_PROVIDERS),
+    ):
+        if value is not None and (not isinstance(value, str) or value not in allowed):
+            raise PanelError(400, f"invalid {key}: {value!r}; accepted values: {', '.join(allowed)}")
     planned = _dry_run(body, [f"create {domain} ({flavor})"], [domain], "site")
     if planned:
         return planned
@@ -1429,7 +1464,7 @@ def _post_create_site(principal, match, query, body):
             return site_lifecycle.WordPressCredentials(admin_user, admin_email, generated_secret(), True)
         result = site_lifecycle.create_site(
             site_lifecycle.CreateSiteRequest(
-                domain=domain, flavor=flavor, php_version=body.get("php_version") or DEFAULT_PHP_VERSION,
+                domain=domain, flavor=flavor, php_version=php_version,
                 letsencrypt=body.get("letsencrypt"), dns_provider=body.get("dns_provider"),
             ),
             credentials=credentials,
@@ -1973,7 +2008,7 @@ def make_panel_server(config: PanelConfig) -> ThreadingHTTPServer:
         panel_exposure.validate_edge_bind(config.host)
     else:
         validate_loopback_host(config.host)
-    server = ThreadingHTTPServer((config.host, config.port), make_panel_handler(config))
+    server = _PanelHTTPServer((config.host, config.port), make_panel_handler(config))
     server.daemon_threads = True
     return server
 

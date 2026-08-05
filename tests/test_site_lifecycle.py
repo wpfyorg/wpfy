@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from wpfy.site_layout import RuntimeResult
 from wpfy.certificate_lifecycle import SSLPreflightResult
 
@@ -84,7 +86,7 @@ def test_create_site_runs_lifecycle_in_order(monkeypatch):
     )
 
     result = lifecycle.create_site(
-        lifecycle.CreateSiteRequest("example.com", "wp", letsencrypt="certbot"),
+        lifecycle.CreateSiteRequest("example.com", "wp", letsencrypt="default"),
         credentials=lambda: lifecycle.WordPressCredentials(
             "admin", "admin@example.com", "generated-password", password_generated=True
         ),
@@ -114,11 +116,25 @@ def test_create_site_stops_before_mutation_when_preflight_fails(monkeypatch):
 
     with pytest.raises(lifecycle.SiteLifecycleError, match="preflight failed") as exc:
         lifecycle.create_site(
-            lifecycle.CreateSiteRequest("example.com", "wp", letsencrypt="certbot"),
+            lifecycle.CreateSiteRequest("example.com", "wp", letsencrypt="default"),
             credentials=lambda: pytest.fail("credentials must not be requested"),
         )
 
     assert exc.value.preflight is True
+
+
+def test_create_site_rejects_invalid_vocabulary_before_preflight_or_scaffold(monkeypatch):
+    import pytest
+    import wpfy.site_lifecycle as lifecycle
+
+    monkeypatch.setattr(lifecycle, "preflight_ssl", lambda domain: pytest.fail("preflight must not run"))
+    monkeypatch.setattr(lifecycle, "ensure_site_scaffold", lambda spec: pytest.fail("scaffold must not run"))
+
+    with pytest.raises(lifecycle.SiteLifecycleError, match="accepted values: 7.4, 8.0, 8.1, 8.2, 8.3, 8.4"):
+        lifecycle.create_site(
+            lifecycle.CreateSiteRequest("example.com", "wp", php_version="9.9"),
+            credentials=lambda: pytest.fail("credentials must not be requested"),
+        )
 
 
 def test_create_site_stops_after_bootstrap_failure(monkeypatch):
@@ -290,6 +306,21 @@ def test_update_site_passes_authoritative_definition_to_scaffold(monkeypatch):
     assert captured["spec"].registry_metadata()["cache_type"] == "redis"
 
 
+def test_update_site_rejects_invalid_persisted_vocabulary_before_scaffold(monkeypatch):
+    import wpfy.site_lifecycle as lifecycle
+
+    monkeypatch.setattr(lifecycle, "site_info", lambda domain: {"domain": domain})
+    monkeypatch.setattr(
+        lifecycle,
+        "read_env",
+        lambda path: {"SITE_FLAVOR": "wp", "PHP_VERSION": "9.9"},
+    )
+    monkeypatch.setattr(lifecycle, "ensure_site_scaffold", lambda spec: pytest.fail("scaffold must not run"))
+
+    with pytest.raises(lifecycle.SiteLifecycleError, match="invalid php_version"):
+        lifecycle.update_site(lifecycle.UpdateSiteRequest("example.com", php_version="8.4"))
+
+
 def test_enable_ssl_preserves_existing_site_definition(monkeypatch):
     import wpfy.site_lifecycle as lifecycle
 
@@ -319,7 +350,7 @@ def test_enable_ssl_preserves_existing_site_definition(monkeypatch):
 
     monkeypatch.setattr(lifecycle, "compose_command", lambda domain, *args: calls.append(args) or Proc())
 
-    result = lifecycle.enable_ssl("example.com", letsencrypt="certbot")
+    result = lifecycle.enable_ssl("example.com", letsencrypt="default")
 
     assert result.spec.flavor == "wp"
     assert result.spec.php_version == "8.3"
@@ -354,7 +385,7 @@ def test_enable_ssl_returns_failure_when_wordpress_url_update_fails(monkeypatch)
 
     monkeypatch.setattr(lifecycle, "compose_command", lambda domain, *args: Proc())
 
-    result = lifecycle.enable_ssl("example.com", letsencrypt="certbot")
+    result = lifecycle.enable_ssl("example.com", letsencrypt="default")
 
     assert result.exit_code == 1
     assert result.wordpress_message == "FAIL database unavailable"
@@ -516,7 +547,7 @@ def test_create_site_requires_acme_email_before_preflight(monkeypatch):
 
     with pytest.raises(lifecycle.SiteLifecycleError, match="ACME contact email") as exc:
         lifecycle.create_site(
-            lifecycle.CreateSiteRequest("example.com", "wp", letsencrypt="certbot"),
+            lifecycle.CreateSiteRequest("example.com", "wp", letsencrypt="default"),
             credentials=lambda: pytest.fail("credentials must not be requested"),
         )
 
@@ -535,6 +566,6 @@ def test_enable_ssl_requires_acme_email(monkeypatch):
     )
 
     with pytest.raises(lifecycle.SiteLifecycleError, match="ACME contact email") as exc:
-        lifecycle.enable_ssl("example.com", letsencrypt="certbot")
+        lifecycle.enable_ssl("example.com", letsencrypt="default")
 
     assert exc.value.preflight is True

@@ -15,7 +15,17 @@ def _current_paths():
 
 
 _MAX_EVENT_BYTES = 1024 * 1024
-_SECRET_KEY = re.compile(r"PASSWORD|SECRET|TOKEN|KEY", re.IGNORECASE)
+_SECRET_KEY = re.compile(
+    r"(?<![A-Z0-9])(?:PASSWORD|SECRET|TOKEN|KEY|PWD|PASS|CREDENTIAL|AUTHORIZATION|AUTH)(?![A-Z0-9])",
+    re.IGNORECASE,
+)
+_SECRET_ASSIGNMENT = re.compile(
+    r"(?i)(?<![A-Z0-9])(PASSWORD|SECRET|TOKEN|KEY|PWD|PASS|CREDENTIAL|AUTHORIZATION|AUTH)(?![A-Z0-9])"
+    r"(\s*[=:]\s*)(?:\"[^\"]*\"|'[^']*'|[^\s,;]+)"
+)
+_AUTHORIZATION_ASSIGNMENT = re.compile(
+    r"(?i)(?<![A-Z0-9])(AUTHORIZATION)(?![A-Z0-9])(\s*[=:]\s*)(?:\"[^\"]*\"|'[^']*'|[^,;\r\n]+)"
+)
 
 
 def event_log_path() -> Path:
@@ -30,11 +40,8 @@ def _redact(value: Any, key: str = "") -> Any:
     if isinstance(value, (list, tuple)):
         return [_redact(item) for item in value]
     if isinstance(value, str):
-        return re.sub(
-            r"(?i)(PASSWORD|SECRET|TOKEN|KEY)(\s*[=:]\s*)([^\s,;]+)",
-            r"\1\2***REDACTED***",
-            value,
-        )
+        value = _AUTHORIZATION_ASSIGNMENT.sub(r"\1\2***REDACTED***", value)
+        return _SECRET_ASSIGNMENT.sub(r"\1\2***REDACTED***", value)
     return value
 
 

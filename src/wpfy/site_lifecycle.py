@@ -4,7 +4,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, replace
 
 from . import site_cache
-from .php_runtime import DEFAULT_PHP_VERSION
+from .php_runtime import DEFAULT_PHP_VERSION, SUPPORTED_PHP_VERSIONS
 from .redaction import redact_values
 from .site_layout import (
     SiteSpec,
@@ -22,7 +22,7 @@ from .site_runtime import RuntimeResult, compose_command, start_site_runtime, st
 from .events import record_event
 from .certificate_lifecycle import preflight_ssl
 from .dns import DNSConfigError, load_cloudflare_config
-from .site_definition import LEGACY_CACHE_FLAVORS, MYSQL_FLAVORS, WORDPRESS_FLAVORS
+from .site_definition import DNS_PROVIDERS, LETSENCRYPT_MODES, LEGACY_CACHE_FLAVORS, MYSQL_FLAVORS, WORDPRESS_FLAVORS
 from .traefik import acme_email_problem
 
 
@@ -126,6 +126,18 @@ class SiteLifecycleError(Exception):
         self.preflight = preflight
 
 
+def _validate_site_vocabularies(
+    *, php_version: str, letsencrypt: str | None, dns_provider: str | None,
+) -> None:
+    for name, value, allowed in (
+        ("php_version", php_version, SUPPORTED_PHP_VERSIONS),
+        ("letsencrypt", letsencrypt, LETSENCRYPT_MODES),
+        ("dns_provider", dns_provider, DNS_PROVIDERS),
+    ):
+        if value is not None and value not in allowed:
+            raise SiteLifecycleError(f"invalid {name}: {value!r}; accepted values: {', '.join(allowed)}")
+
+
 def _require_acme_email() -> None:
     problem = acme_email_problem()
     if problem:
@@ -202,11 +214,17 @@ def create_site(
     credentials: Callable[[], WordPressCredentials],
     progress: Callable[[str], None] | None = None,
 ) -> CreateSiteResult:
+    _validate_site_vocabularies(
+        php_version=request.php_version,
+        letsencrypt=request.letsencrypt,
+        dns_provider=request.dns_provider,
+    )
     report = progress or (lambda message: None)
     proxied = False
     preflight_message: str | None = None
+    letsencrypt = None if request.letsencrypt == "off" else request.letsencrypt
 
-    if request.letsencrypt:
+    if letsencrypt:
         report("preflight")
         _require_acme_email()
         preflight = preflight_ssl(request.domain)
@@ -214,7 +232,7 @@ def create_site(
             raise SiteLifecycleError(preflight.message, preflight=True)
         proxied = _resolve_proxied(request.proxied_override, preflight.mode)
         preflight_message = preflight.message
-        _require_wildcard_dns(request.letsencrypt, request.dns_provider)
+        _require_wildcard_dns(letsencrypt, request.dns_provider)
 
     spec = _site_spec(
         domain=request.domain,
@@ -222,7 +240,7 @@ def create_site(
         page_cache=request.page_cache,
         object_cache=request.object_cache,
         php_version=request.php_version,
-        letsencrypt=request.letsencrypt,
+        letsencrypt=letsencrypt,
         dns_provider=request.dns_provider,
         proxied=proxied,
     )
@@ -327,6 +345,11 @@ def create_site(
 
 
 def update_site(request: UpdateSiteRequest) -> UpdateSiteResult:
+    _validate_site_vocabularies(
+        php_version=request.php_version if request.php_version is not None else DEFAULT_PHP_VERSION,
+        letsencrypt=request.letsencrypt,
+        dns_provider=request.dns_provider,
+    )
     domain = request.domain
     try:
         site_info(domain)
@@ -340,6 +363,11 @@ def update_site(request: UpdateSiteRequest) -> UpdateSiteResult:
     except OSError as exc:
         raise SiteLifecycleError(f"unsafe site environment: {exc}") from exc
     current_spec = SiteSpec.from_env(domain, existing_env)
+    _validate_site_vocabularies(
+        php_version=current_spec.php_version,
+        letsencrypt=current_spec.letsencrypt,
+        dns_provider=current_spec.dns_provider,
+    )
     current_flavor = current_spec.flavor
     current_page_cache = current_spec.page_cache
     current_object_cache = current_spec.object_cache
@@ -368,6 +396,12 @@ def update_site(request: UpdateSiteRequest) -> UpdateSiteResult:
         new_letsencrypt = None
     else:
         new_letsencrypt = request.letsencrypt
+
+    _validate_site_vocabularies(
+        php_version=new_php,
+        letsencrypt=new_letsencrypt,
+        dns_provider=new_dns,
+    )
 
     changes: list[str] = []
     if new_php != current_php:
@@ -489,6 +523,13 @@ def enable_ssl(
     dns_provider: str | None = None,
     proxied_override: bool | None = None,
 ) -> EnableSSLResult:
+    _validate_site_vocabularies(
+        php_version=DEFAULT_PHP_VERSION,
+        letsencrypt=letsencrypt,
+        dns_provider=dns_provider,
+    )
+    if letsencrypt == "off":
+        raise SiteLifecycleError("letsencrypt off is only valid for site create or update")
     _require_acme_email()
     preflight = preflight_ssl(domain)
     if not preflight.passed:
@@ -507,6 +548,11 @@ def enable_ssl(
     except OSError as exc:
         raise SiteLifecycleError(f"unsafe site environment: {exc}") from exc
     current_spec = SiteSpec.from_env(domain, existing_env)
+    _validate_site_vocabularies(
+        php_version=current_spec.php_version,
+        letsencrypt=current_spec.letsencrypt,
+        dns_provider=current_spec.dns_provider,
+    )
     flavor = current_spec.flavor
     spec = _site_spec(
         domain=domain,

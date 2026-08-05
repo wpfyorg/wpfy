@@ -243,48 +243,61 @@ def ensure_panel_edge_network() -> RuntimeResult:
 
 
 def traefik_network_cidrs(network_name: str = TRAEFIK_NETWORK) -> tuple[str, ...]:
+    """Return trusted edge sources; name Traefik itself, never its subnet.
+
+    ``WPFY_TEST_TRAEFIK_NETWORK_CIDRS`` remains a test-only compatibility hook
+    for offline callers that cannot provide a Docker container.
+    """
     override = os.environ.get("WPFY_TEST_TRAEFIK_NETWORK_CIDRS")
     if override:
         raw_cidrs = [item.strip() for item in override.split(",") if item.strip()]
-    else:
-        if not docker_available():
-            raise RuntimeError("cannot determine wpfy edge network CIDR: Docker is unavailable")
-        proc = subprocess.run(
-            [
-                "docker", "network", "inspect", "--format",
-                "{{json .IPAM.Config}}", network_name,
-            ],
-            check=False,
-            capture_output=True,
-            text=True,
-        )
-        if proc.returncode != 0:
-            detail = proc.stderr.strip() or proc.stdout.strip() or "network inspect failed"
-            raise RuntimeError(f"cannot determine wpfy edge network CIDR: {detail}")
-        try:
-            configs = json.loads(proc.stdout.strip())
-        except json.JSONDecodeError as exc:
-            raise RuntimeError("cannot determine wpfy edge network CIDR: invalid Docker inspect output") from exc
-        if not isinstance(configs, list):
-            raise RuntimeError("cannot determine wpfy edge network CIDR: Docker reported no IPAM config")
-        raw_cidrs = [
-            item.get("Subnet", "")
-            for item in configs
-            if isinstance(item, dict) and isinstance(item.get("Subnet"), str)
-        ]
+        cidrs: list[str] = []
+        for raw in raw_cidrs:
+            try:
+                network = ipaddress.ip_network(raw, strict=False)
+            except ValueError as exc:
+                raise RuntimeError(f"cannot determine wpfy edge address: invalid test source {raw!r}") from exc
+            if network.prefixlen == 0:
+                raise RuntimeError("cannot determine wpfy edge address: wildcard test source refused")
+            cidrs.append(network.with_prefixlen)
+        if not cidrs:
+            raise RuntimeError("cannot determine wpfy edge address: no test source")
+        return tuple(sorted(set(cidrs)))
+    return traefik_edge_addresses(network_name)
 
-    cidrs: list[str] = []
-    for raw in raw_cidrs:
+
+def traefik_edge_addresses(network_name: str = TRAEFIK_NETWORK) -> tuple[str, ...]:
+    """Return only Traefik's host addresses on the shared edge network."""
+    if not docker_available():
+        raise RuntimeError("cannot determine wpfy edge address: Docker is unavailable")
+    proc = subprocess.run(
+        ["docker", "inspect", "--format", "{{json .NetworkSettings.Networks}}", TRAEFIK_CONTAINER],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode != 0:
+        detail = proc.stderr.strip() or proc.stdout.strip() or "container inspect failed"
+        raise RuntimeError(f"cannot determine wpfy edge address: {detail}")
+    try:
+        networks = json.loads(proc.stdout.strip())
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("cannot determine wpfy edge address: invalid Docker inspect output") from exc
+    network = networks.get(network_name) if isinstance(networks, dict) else None
+    if not isinstance(network, dict):
+        raise RuntimeError(f"cannot determine wpfy edge address: container is not on {network_name}")
+    addresses: list[str] = []
+    for raw in (network.get("IPAddress"), network.get("GlobalIPv6Address")):
+        if not isinstance(raw, str) or not raw:
+            continue
         try:
-            network = ipaddress.ip_network(raw, strict=False)
+            address = ipaddress.ip_address(raw)
         except ValueError as exc:
-            raise RuntimeError(f"cannot determine wpfy edge network CIDR: invalid subnet {raw!r}") from exc
-        if network.prefixlen == 0:
-            raise RuntimeError("cannot determine wpfy edge network CIDR: wildcard subnet refused")
-        cidrs.append(network.with_prefixlen)
-    if not cidrs:
-        raise RuntimeError("cannot determine wpfy edge network CIDR: Docker reported no subnet")
-    return tuple(sorted(set(cidrs)))
+            raise RuntimeError(f"cannot determine wpfy edge address: invalid address {raw!r}") from exc
+        addresses.append(f"{address}/{'32' if address.version == 4 else '128'}")
+    if not addresses:
+        raise RuntimeError("cannot determine wpfy edge address: container has no address on edge network")
+    return tuple(sorted(set(addresses)))
 
 
 def effective_acme_email() -> str:
@@ -512,6 +525,39 @@ def _wait_for_traefik_healthy() -> RuntimeResult:
     )
 
 
+def _refresh_managed_site_edge_trust() -> RuntimeResult:
+    """Re-render and reload site trust after Traefik receives new addresses."""
+    from . import site_security
+
+    sites_root = Path(settings.PATHS.sites_dir)
+    if not sites_root.is_dir():
+        return RuntimeResult(0, "no managed sites need edge trust refresh")
+    changed_domains: list[str] = []
+    for root in sorted(sites_root.iterdir(), key=lambda item: item.name):
+        if not root.is_dir():
+            continue
+        domain = root.name
+        try:
+            forwarded = site_security.render_forwarded_scheme(domain)
+            security = site_security.render_security(domain)
+        except (OSError, ValueError) as exc:
+            return RuntimeResult(3, f"edge trust refresh failed for {domain}: {exc}")
+        if forwarded.exit_code != 0 or security.exit_code != 0:
+            message = forwarded.message if forwarded.exit_code != 0 else security.message
+            return RuntimeResult(3, f"edge trust refresh failed for {domain}: {message}")
+        if not (forwarded.changed or security.changed):
+            continue
+        running = site_security._running_web_container(domain)
+        if running != "":
+            reload_error = site_security._reload_web_service(domain)
+            if reload_error:
+                return RuntimeResult(3, f"edge trust refresh did not apply to {domain}: {reload_error}")
+        changed_domains.append(domain)
+    if not changed_domains:
+        return RuntimeResult(0, "managed site edge trust unchanged")
+    return RuntimeResult(0, f"refreshed edge trust for {len(changed_domains)} managed site(s)", ran=True)
+
+
 def _start_traefik() -> RuntimeResult:
     """Apply desired static config. Caller holds the Traefik transaction."""
     was_running = traefik_running()
@@ -539,8 +585,13 @@ def _start_traefik() -> RuntimeResult:
     health = _wait_for_traefik_healthy()
     if health.exit_code != 0:
         return health
+    refreshed = _refresh_managed_site_edge_trust()
+    if refreshed.exit_code != 0:
+        return refreshed
     _record_applied_state(desired)
     message = proc.stdout.strip() or proc.stderr.strip() or "traefik started"
+    if refreshed.ran:
+        message += f"; {refreshed.message}"
     return RuntimeResult(0, message, ran=True)
 
 

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import base64
 from dataclasses import dataclass
 import hashlib
 import ipaddress
@@ -12,6 +11,7 @@ import secrets
 import shutil
 import stat
 import subprocess
+import time
 
 from . import cloudflare_ranges
 from .certificate_lifecycle import resolve_domain_ips
@@ -36,6 +36,7 @@ HTPASSWD_FILE = "htpasswd"
 HTPASSWD_CONTAINER_PATH = "/etc/nginx/wpfy-htpasswd"
 _SAFE_HTPASSWD_USERNAME_RE = re.compile(r"[A-Za-z0-9_.@-]+")
 _SAFE_UA_PATTERN_RE = re.compile(r"[A-Za-z0-9 ._/@:+*?^$|()\[\]-]{1,256}")
+_APR1_ALPHABET = "./0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
 _DEFAULT_SECURITY = {
     "basic_auth": {"enabled": False, "username": None},
     "cloudflare_only": False,
@@ -44,6 +45,7 @@ _DEFAULT_SECURITY = {
     "deny_ips": [],
     "ua_blocks": [],
 }
+_RECREATE_RETRY_REQUIRED: set[str] = set()
 
 
 @dataclass(frozen=True, slots=True)
@@ -191,6 +193,14 @@ def _install_text(root: Path, target: str, content: str, mode: int) -> bool:
     finally:
         if candidate:
             _cleanup(root, candidate)
+    return True
+
+
+def _install_text_in_place(root: Path, target: str, content: str, mode: int) -> bool:
+    """Update individually bind-mounted nginx files without replacing their inode."""
+    if _safe_read(root, target) == content:
+        return False
+    _safe_write_in_place(root, target, content, mode)
     return True
 
 
@@ -469,6 +479,90 @@ def _recreate_web_service(domain: str) -> str | None:
     return proc.stderr.strip() or proc.stdout.strip() or "web service recreate failed"
 
 
+def _running_web_container(domain: str) -> str | None:
+    from .site_runtime import compose_command, docker_available, runtime_skip_requested
+
+    if runtime_skip_requested() or not docker_available():
+        return None
+    try:
+        proc = compose_command(domain, "ps", "--status", "running", "-q", "web")
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    return proc.stdout.strip().splitlines()[0] if proc.stdout.strip() else ""
+
+
+def _running_web_labels(domain: str, container: str) -> dict[str, str] | None:
+    from .site_runtime import compose_command
+
+    try:
+        rendered = compose_command(domain, "config", "--format", "json")
+        if rendered.returncode != 0:
+            return None
+        expected = json.loads(rendered.stdout)["services"]["web"]["labels"]
+        if isinstance(expected, list):
+            expected = dict(item.split("=", 1) for item in expected)
+        if not isinstance(expected, dict):
+            return None
+        if any(not isinstance(key, str) or not key.startswith("traefik.") for key in expected):
+            return {}
+        inspected = subprocess.run(
+            ["docker", "inspect", "--format", "{{json .Config.Labels}}", container],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if inspected.returncode != 0:
+            return None
+        labels = json.loads(inspected.stdout)
+        if not isinstance(labels, dict):
+            return {}
+        running_traefik = {
+            key: value for key, value in labels.items() if isinstance(key, str) and key.startswith("traefik.")
+        }
+        return labels if running_traefik == expected else {}
+    except (AttributeError, KeyError, TypeError, ValueError, OSError, subprocess.SubprocessError):
+        return None
+
+
+def _reload_web_service(domain: str) -> str | None:
+    from .site_runtime import compose_command, docker_available, runtime_skip_requested
+
+    if runtime_skip_requested() or not docker_available():
+        return None
+    for attempt in range(3):
+        try:
+            proc = compose_command(domain, "exec", "-T", "web", "nginx", "-s", "reload")
+        except (OSError, subprocess.SubprocessError) as exc:
+            return str(exc)
+        if proc.returncode == 0:
+            return None
+        if attempt < 2:
+            time.sleep(0.5)
+    return proc.stderr.strip() or proc.stdout.strip() or "nginx reload failed"
+
+
+def apply_security_runtime(domain: str) -> SecurityResult:
+    forwarded = render_forwarded_scheme(domain)
+    if forwarded.exit_code != 0:
+        return forwarded
+    rendered = render_security(domain)
+    if rendered.exit_code != 0:
+        return rendered
+    running = _running_web_container(domain)
+    if running == "":
+        return SecurityResult(0, "security configuration staged; will apply when site starts", rendered.changed or forwarded.changed)
+    reload_error = _reload_web_service(domain)
+    if reload_error:
+        return SecurityResult(
+            3,
+            f"security configuration written but not applied; nginx reload failed: {reload_error}",
+            rendered.changed or forwarded.changed,
+        )
+    return SecurityResult(rendered.exit_code, rendered.message, rendered.changed or forwarded.changed)
+
+
 def _edge_network_cidrs() -> tuple[str, ...]:
     if os.environ.get("WPFY_SKIP_RUNTIME") == "1" and not os.environ.get("WPFY_TEST_TRAEFIK_NETWORK_CIDRS"):
         raise RuntimeError("wpfy edge network discovery skipped by WPFY_SKIP_RUNTIME")
@@ -477,7 +571,7 @@ def _edge_network_cidrs() -> tuple[str, ...]:
 
 def _forwarded_scheme_content(trusted_sources: tuple[str, ...]) -> str:
     lines = [
-        "# Generated by wpfy. Trust forwarded scheme only from the shared edge network.",
+        "# Generated by wpfy. Trust forwarded scheme only from the Traefik edge hop.",
         "geo $realip_remote_addr $wpfy_trusted_edge {",
         "    default 0;",
     ]
@@ -497,16 +591,19 @@ def _forwarded_scheme_content(trusted_sources: tuple[str, ...]) -> str:
 def render_forwarded_scheme(domain: str) -> SecurityResult:
     root = _require_site(domain) / "nginx"
     try:
-        trusted_sources = _edge_network_cidrs()
+        config = load_security(domain)
+        trusted_sources = list(_edge_network_cidrs())
+        if _cloudflare_trust_required(domain, config):
+            trusted_sources.extend(cloudflare_cidrs())
     except RuntimeError:
         # Fail closed when runtime discovery is unavailable: no forwarded header
-        # can assert HTTPS until a later refresh discovers the real edge CIDR.
-        trusted_sources = ("127.0.0.1/32",)
+        # can assert HTTPS until a later refresh discovers the real edge address.
+        trusted_sources = ["127.0.0.1/32"]
     try:
-        changed = _install_text(
+        changed = _install_text_in_place(
             root,
             FORWARDED_SCHEME_SNIPPET,
-            _forwarded_scheme_content(trusted_sources),
+            _forwarded_scheme_content(tuple(dict.fromkeys(trusted_sources))),
             0o644,
         )
     except OSError as exc:
@@ -635,7 +732,7 @@ def _update_list(domain: str, key: str, value: str, *, remove: bool) -> Security
         updated = dict(config)
         updated[key] = values
         save_security(domain, updated)
-    rendered = render_security(domain)
+    rendered = apply_security_runtime(domain)
     if rendered.exit_code != 0:
         return rendered
 
@@ -647,7 +744,10 @@ def _update_list(domain: str, key: str, value: str, *, remove: bool) -> Security
             detail=f"per-site {action} rule {'removed' if remove else 'added'}",
         )
     state = "removed" if remove and changed else "added" if changed else "unchanged"
-    return SecurityResult(0, f"{action} rule {state}", changed or rendered.changed)
+    message = f"{action} rule {state}"
+    if "staged" in rendered.message.lower():
+        message += f"; {rendered.message}"
+    return SecurityResult(0, message, changed or rendered.changed)
 
 
 def add_deny_ip(domain: str, cidr: str) -> SecurityResult:
@@ -670,9 +770,66 @@ def _safe_htpasswd_username(value: str) -> bool:
     return isinstance(value, str) and bool(_SAFE_HTPASSWD_USERNAME_RE.fullmatch(value))
 
 
-def _htpasswd_sha(password: str) -> str:
-    digest = hashlib.sha1(password.encode("utf-8")).digest()
-    return "{SHA}" + base64.b64encode(digest).decode("ascii")
+def _htpasswd_apr1(password: str) -> str:
+    """Return an Apache APR1 htpasswd hash using a fresh 48-bit salt."""
+    password_bytes = password.encode("utf-8")
+    salt = "".join(secrets.choice(_APR1_ALPHABET) for _ in range(8)).encode("ascii")
+    digest = hashlib.md5(password_bytes + salt + password_bytes).digest()
+    context = password_bytes + b"$apr1$" + salt
+    for offset in range(0, len(password_bytes), len(digest)):
+        context += digest[: min(len(digest), len(password_bytes) - offset)]
+    length = len(password_bytes)
+    while length:
+        context += b"\0" if length & 1 else password_bytes[:1]
+        length >>= 1
+    digest = hashlib.md5(context).digest()
+    for iteration in range(1000):
+        context = password_bytes if iteration & 1 else digest
+        if iteration % 3:
+            context += salt
+        if iteration % 7:
+            context += password_bytes
+        context += digest if iteration & 1 else password_bytes
+        digest = hashlib.md5(context).digest()
+
+    def encode(value: int, count: int) -> str:
+        chars = []
+        for _ in range(count):
+            chars.append(_APR1_ALPHABET[value & 0x3F])
+            value >>= 6
+        return "".join(chars)
+
+    encoded = "".join((
+        encode((digest[0] << 16) | (digest[6] << 8) | digest[12], 4),
+        encode((digest[1] << 16) | (digest[7] << 8) | digest[13], 4),
+        encode((digest[2] << 16) | (digest[8] << 8) | digest[14], 4),
+        encode((digest[3] << 16) | (digest[9] << 8) | digest[15], 4),
+        encode((digest[4] << 16) | (digest[10] << 8) | digest[5], 4),
+        encode(digest[11], 2),
+    ))
+    return f"$apr1${salt.decode('ascii')}${encoded}"
+
+
+def _htpasswd_hash(password: str) -> tuple[str, str]:
+    """Return a host-generated sha512crypt hash, or APR1 when OpenSSL is absent."""
+    try:
+        process = subprocess.Popen(
+            ["openssl", "passwd", "-6", "-stdin"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+    except FileNotFoundError:
+        return _htpasswd_apr1(password), "apr1"
+    stdout, stderr = process.communicate(password)
+    if process.returncode != 0:
+        message = stderr.strip() or stdout.strip() or "openssl passwd -6 failed"
+        raise RuntimeError(message)
+    hashed = stdout.strip()
+    if not hashed.startswith("$6$"):
+        raise RuntimeError("openssl passwd -6 did not return a sha512crypt hash")
+    return hashed, "sha512crypt"
 
 
 def _refresh_site_compose(domain: str) -> None:
@@ -697,6 +854,7 @@ def set_basic_auth(
     config = load_security(domain)
     current = config["basic_auth"]
     generated_password: str | None = None
+    credential_scheme: str | None = None
     htpasswd_root = root / "nginx"
 
     if enabled:
@@ -710,7 +868,15 @@ def set_basic_auth(
             generated_password = password
         if not isinstance(password, str) or not password:
             raise ValueError("basic-auth password must not be empty")
-        htpasswd_content = f"{username}:{_htpasswd_sha(password)}\n"
+        try:
+            hashed_password, credential_scheme = _htpasswd_hash(password)
+        except RuntimeError as exc:
+            return SecurityResult(
+                3,
+                f"failed to generate basic-auth credential: {exc}",
+                one_time_password=generated_password,
+            )
+        htpasswd_content = f"{username}:{hashed_password}\n"
         htpasswd_changed = _safe_read(htpasswd_root, HTPASSWD_FILE) != htpasswd_content
         if htpasswd_changed:
             _safe_write_in_place(htpasswd_root, HTPASSWD_FILE, htpasswd_content, 0o640)
@@ -729,7 +895,7 @@ def set_basic_auth(
         updated = dict(config)
         updated["basic_auth"] = desired
         save_security(domain, updated)
-    rendered = render_security(domain)
+    rendered = apply_security_runtime(domain)
     if rendered.exit_code != 0:
         return SecurityResult(
             rendered.exit_code,
@@ -742,7 +908,10 @@ def set_basic_auth(
         record_event(
             "site.security.basic-auth.on" if enabled else "site.security.basic-auth.off",
             domain=domain,
-            detail=f"per-site basic auth {'enabled' if enabled else 'disabled'}; credential redacted",
+            detail=(
+                f"per-site basic auth enabled; credential redacted; hash scheme={credential_scheme}"
+                if enabled else "per-site basic auth disabled; credential redacted"
+            ),
         )
     state = "enabled" if enabled else "disabled"
     return SecurityResult(0, f"basic auth {state}" if changed else f"basic auth already {state}", changed, generated_password)
@@ -765,6 +934,26 @@ def set_cloudflare_only(domain: str, enabled: bool) -> SecurityResult:
         _refresh_site_compose(domain)
     except (OSError, RuntimeError, ValueError) as exc:
         return SecurityResult(3, f"failed to render Cloudflare-only edge labels: {exc}", changed)
+    running = _running_web_container(domain)
+    if running == "":
+        return SecurityResult(
+            0,
+            "Cloudflare-only configuration staged; will apply when site starts",
+            changed or rendered.changed,
+        )
+    if changed or not running or domain in _RECREATE_RETRY_REQUIRED:
+        recreate_error = _recreate_web_service(domain)
+    else:
+        labels_match = bool(_running_web_labels(domain, running))
+        recreate_error = None if labels_match else _recreate_web_service(domain)
+    if recreate_error:
+        _RECREATE_RETRY_REQUIRED.add(domain)
+        return SecurityResult(
+            3,
+            f"Cloudflare-only edge labels written but not applied; web recreate failed: {recreate_error}",
+            changed or rendered.changed,
+        )
+    _RECREATE_RETRY_REQUIRED.discard(domain)
 
     if changed:
         record_event(
@@ -786,7 +975,7 @@ def set_login_rate_limit(domain: str, enabled: bool) -> SecurityResult:
         updated["login_rate_limit"] = enabled
         save_security(domain, updated)
 
-    rendered = render_security(domain)
+    rendered = apply_security_runtime(domain)
     if rendered.exit_code != 0:
         return rendered
     try:
