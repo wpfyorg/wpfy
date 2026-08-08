@@ -15,6 +15,7 @@ let currentCache = null;
 let pendingSecurity = null;
 let currentSecurity = null;
 let securityAuthDirty = false;
+let securityFail2banDirty = false;
 let securityRevision = 0;
 let oneTimeCopyText = "";
 let detailRequest = 0;
@@ -71,9 +72,13 @@ function isAdmin() {
 function applyPrincipal() {
   const admin = isAdmin();
   const label = principal ? `${principal.username} · ${principal.role}` : "temporary run access";
-  $("chip-principal").textContent = label;
+  $("chip-account-label").textContent = label;
+  $("account-name").textContent = principal ? principal.username : "";
+  $("account-role").textContent = principal ? principal.role : "";
   $("foot-principal").textContent = principal ? `wpfy panel · signed in as ${principal.username}` : "wpfy panel";
   $("btn-users")?.classList.toggle("hidden", !admin);
+  $("chip-health")?.classList.toggle("hidden", !admin);
+  $("chip-jobs")?.classList.toggle("hidden", !admin);
   ["metrics-panel", "services-panel", "diagnostics-panel"].forEach((id) =>
     $(id)?.classList.toggle("hidden", Boolean(principal) && !admin));
   $("stats")?.classList.toggle("hidden", Boolean(principal) && !admin);
@@ -177,6 +182,7 @@ async function finishSetup() {
   principal = await loadPrincipal();
   await refreshDashboard();
   showApp();
+  await handleRoute(location.pathname).catch(() => {});
 }
 
 async function verifySetupTotp() {
@@ -283,6 +289,70 @@ function toast(message, isError) {
   node.classList.remove("hidden");
   clearTimeout(toastTimer);
   toastTimer = setTimeout(() => node.classList.add("hidden"), 5000);
+}
+
+function confirmDialog({ title, message, confirmLabel = "Confirm", intent = "default" }) {
+  return new Promise((resolve) => {
+    const backdrop = document.createElement("div");
+    backdrop.className = "dialog-backdrop";
+    const dialog = document.createElement("div");
+    dialog.className = "dialog-panel";
+    dialog.setAttribute("role", "alertdialog");
+    dialog.setAttribute("aria-labelledby", "confirm-dialog-title");
+    dialog.innerHTML = `
+      <h2 id="confirm-dialog-title">${_esc(title)}</h2>
+      <p>${_esc(message)}</p>
+      <div class="dialog-actions">
+        <button class="btn btn-primary" data-result="confirm">${_esc(confirmLabel)}</button>
+        <button class="btn" data-result="cancel">Cancel</button>
+      </div>`;
+    backdrop.appendChild(dialog);
+    document.body.appendChild(backdrop);
+    const confirmBtn = dialog.querySelector("[data-result=confirm]");
+    const cancelBtn = dialog.querySelector("[data-result=cancel]");
+    function cleanup() { backdrop.remove(); }
+    confirmBtn.addEventListener("click", () => { cleanup(); resolve(true); });
+    cancelBtn.addEventListener("click", () => { cleanup(); resolve(false); });
+    backdrop.addEventListener("click", (e) => { if (e.target === backdrop) { cleanup(); resolve(false); } });
+    dialog.addEventListener("keydown", (e) => { if (e.key === "Escape") { cleanup(); resolve(false); } });
+    confirmBtn.focus();
+  });
+}
+
+function typedConfirm({ title, message, keyword, confirmLabel = "Confirm", inventory = null }) {
+  return new Promise((resolve) => {
+    const backdrop = document.createElement("div");
+    backdrop.className = "dialog-backdrop";
+    const dialog = document.createElement("div");
+    dialog.className = "dialog-panel";
+    dialog.setAttribute("role", "alertdialog");
+    dialog.setAttribute("aria-labelledby", "typed-confirm-title");
+    const invHtml = inventory ? `<dl class="kv dialog-inventory">${Object.entries(inventory).map(([k, v]) => `<dt>${_esc(k)}</dt><dd>${_esc(String(v))}</dd>`).join("")}</dl>` : "";
+    dialog.innerHTML = `
+      <h2 id="typed-confirm-title">${_esc(title)}</h2>
+      <p>${_esc(message)}</p>
+      ${invHtml}
+      <label class="confirm-field">Type <strong>${_esc(keyword)}</strong> to confirm
+        <input type="text" autocomplete="off" spellcheck="false" data-typed-input>
+      </label>
+      <div class="dialog-actions">
+        <button class="btn btn-danger-ghost" data-result="confirm" disabled>${_esc(confirmLabel)}</button>
+        <button class="btn" data-result="cancel">Cancel</button>
+      </div>`;
+    backdrop.appendChild(dialog);
+    document.body.appendChild(backdrop);
+    const input = dialog.querySelector("[data-typed-input]");
+    const confirmBtn = dialog.querySelector("[data-result=confirm]");
+    const cancelBtn = dialog.querySelector("[data-result=cancel]");
+    function cleanup() { backdrop.remove(); }
+    input.addEventListener("input", () => { confirmBtn.disabled = input.value !== keyword; });
+    input.addEventListener("keydown", (e) => { if (e.key === "Enter" && input.value === keyword) { cleanup(); resolve(true); } });
+    confirmBtn.addEventListener("click", () => { cleanup(); resolve(true); });
+    cancelBtn.addEventListener("click", () => { cleanup(); resolve(false); });
+    backdrop.addEventListener("click", (e) => { if (e.target === backdrop) { cleanup(); resolve(false); } });
+    dialog.addEventListener("keydown", (e) => { if (e.key === "Escape") { cleanup(); resolve(false); } });
+    input.focus();
+  });
 }
 
 async function withBusy(button, work) {
@@ -471,13 +541,16 @@ function renderUsers(users) {
   const tbody = table.querySelector("tbody");
   tbody.replaceChildren(...users.map((user) => {
     const row = document.createElement("tr");
-    const username = eventCell(user.username, "domain");
-    const role = eventCell(user.role);
+    const username = eventCell(user.username, "domain", "Username");
+    const role = eventCell(user.role, "", "Role");
     const sites = document.createElement("td");
+    sites.setAttribute("data-label", "Assigned sites");
     sites.append(userSites(user.sites));
     const totp = document.createElement("td");
+    totp.setAttribute("data-label", "TOTP");
     totp.append(badge(user.totp_enabled ? "enabled" : "not enrolled", Boolean(user.totp_enabled)));
     const actions = document.createElement("td");
+    actions.setAttribute("data-label", "Actions");
     const controls = document.createElement("div");
     controls.className = "user-actions";
     const roleSelect = document.createElement("select");
@@ -626,11 +699,6 @@ async function logout() {
 async function loadOverview() {
   const data = await api("/api/overview");
   $("chip-version").textContent = `wpfy ${data.version}`;
-  $("chip-docker").textContent = `docker: ${data.docker_version}`;
-  $("chip-traefik").textContent = `traefik: ${data.traefik}`;
-  $("chip-traefik").title = data.traefik;
-  $("chip-warnings").textContent = `warnings: ${data.warnings}`;
-  $("chip-warnings").classList.toggle("warn", data.warnings > 0);
 
   const stats = [
     { label: "managed sites", value: data.site_count },
@@ -652,46 +720,103 @@ async function loadOverview() {
   }));
 }
 
+let _sitesSort = { key: "domain", asc: true };
+const SITE_SORT_LABELS = {
+  domain: "Domain", flavor: "Type", php_version: "PHP", ssl: "SSL", cache: "Cache",
+};
+
 function renderSites() {
   const query = ($("sites-search")?.value || "").trim().toLowerCase();
-  const sites = allSites.filter((site) => String(site.domain || "").toLowerCase().includes(query));
-  $("sites-count").textContent = query ? `${sites.length} of ${allSites.length}` : `${allSites.length} total`;
+  const flavorFilter = $("sites-flavor-filter")?.value || "";
+  let sites = allSites.filter((site) => String(site.domain || "").toLowerCase().includes(query));
+  if (flavorFilter) sites = sites.filter((s) => s.flavor === flavorFilter || s.flavor?.startsWith(flavorFilter));
+  sites.sort((a, b) => {
+    let va = String(a[_sitesSort.key] ?? "").toLowerCase();
+    let vb = String(b[_sitesSort.key] ?? "").toLowerCase();
+    if (_sitesSort.key === "ssl") {
+      va = sslOn(a.ssl ?? a.ssl_enabled) ? "1" : "0";
+      vb = sslOn(b.ssl ?? b.ssl_enabled) ? "1" : "0";
+    }
+    if (va < vb) return _sitesSort.asc ? -1 : 1;
+    if (va > vb) return _sitesSort.asc ? 1 : -1;
+    return 0;
+  });
+  $("sites-count").textContent = query || flavorFilter ? `${sites.length} of ${allSites.length}` : `${allSites.length} total`;
   const empty = $("sites-empty");
   empty.textContent = allSites.length === 0
     ? "No managed sites yet. Select New site to create one."
-    : "No sites match this search.";
+    : "No sites match this filter.";
   empty.classList.toggle("hidden", sites.length > 0);
   $("sites-table").classList.toggle("hidden", sites.length === 0);
+
+  const thead = $("sites-table").querySelector("thead tr");
+  thead.replaceChildren(...Object.keys(SITE_SORT_LABELS).map((key) => {
+    const th = document.createElement("th");
+    th.style.cursor = "pointer";
+    th.textContent = SITE_SORT_LABELS[key];
+    if (_sitesSort.key === key) th.textContent += _sitesSort.asc ? " \u25B4" : " \u25BE";
+    th.addEventListener("click", () => {
+      if (_sitesSort.key === key) _sitesSort.asc = !_sitesSort.asc;
+      else { _sitesSort.key = key; _sitesSort.asc = true; }
+      renderSites();
+    });
+    return th;
+  }));
+  const actionTh = document.createElement("th");
+  thead.appendChild(actionTh);
 
   const tbody = $("sites-table").querySelector("tbody");
   tbody.replaceChildren(...sites.map((site) => {
     const tr = document.createElement("tr");
+    tr.style.cursor = "pointer";
+    tr.addEventListener("click", (e) => { if (!e.target.closest("button,a")) navigate(`/site/${encodeURIComponent(site.domain)}`); });
     const domainCell = document.createElement("td");
     domainCell.className = "domain";
+    domainCell.setAttribute("data-label", "Domain");
     domainCell.textContent = site.domain;
     const flavorCell = document.createElement("td");
+    flavorCell.setAttribute("data-label", "Type");
     flavorCell.textContent = site.flavor || "?";
     const phpCell = document.createElement("td");
+    phpCell.setAttribute("data-label", "PHP");
     phpCell.textContent = site.php_version || "–";
     const sslCell = document.createElement("td");
+    sslCell.setAttribute("data-label", "SSL");
     const enabled = sslOn(site.ssl ?? site.ssl_enabled);
     sslCell.append(badge(enabled ? "ssl" : "http", enabled));
     const cacheCell = document.createElement("td");
+    cacheCell.setAttribute("data-label", "Cache");
     cacheCell.textContent = site.cache_type || (String(site.redis) === "1" ? "redis" : "basic");
     const actionCell = document.createElement("td");
+    actionCell.setAttribute("data-label", "Actions");
     const manage = document.createElement("button");
     manage.className = "btn";
     manage.textContent = "Manage";
-    manage.addEventListener("click", () => runBusy(manage, () => openDetail(site.domain)));
+    manage.addEventListener("click", (e) => { e.stopPropagation(); navigate(`/site/${encodeURIComponent(site.domain)}`); });
     actionCell.append(manage);
     tr.append(domainCell, flavorCell, phpCell, sslCell, cacheCell, actionCell);
     return tr;
   }));
 }
 
+function _seedSiteFilters() {
+  const select = $("sites-flavor-filter");
+  if (!select) return;
+  const flavors = [...new Set(allSites.map((s) => s.flavor).filter(Boolean))].sort();
+  const current = select.value;
+  select.replaceChildren(...[{ value: "", label: "All types" }, ...flavors.map((f) => ({ value: f, label: f }))].map(({ value, label }) => {
+    const opt = document.createElement("option");
+    opt.value = value;
+    opt.textContent = label;
+    if (value === current) opt.selected = true;
+    return opt;
+  }));
+}
+
 async function loadSites() {
   const data = await api("/api/sites");
   allSites = data.sites || [];
+  _seedSiteFilters();
   renderSites();
 }
 
@@ -718,52 +843,66 @@ function syncRangeSelectors(ranges) {
   });
 }
 
+const _chartInstances = {};
+
+function _chartId(containerId) {
+  return `chart_${containerId}`;
+}
+
+function _destroyCharts(containerId) {
+  const key = _chartId(containerId);
+  if (_chartInstances[key]) {
+    _chartInstances[key].forEach((c) => c.destroy());
+    _chartInstances[key] = [];
+  }
+}
+
 function drawMetricChart(canvas, samples, metric) {
-  const width = Math.max(260, Math.floor(canvas.parentElement.clientWidth));
-  const height = 190;
-  const ratio = window.devicePixelRatio || 1;
-  canvas.width = width * ratio;
-  canvas.height = height * ratio;
-  canvas.style.width = `${width}px`;
-  canvas.style.height = `${height}px`;
-  const context = canvas.getContext("2d");
-  context.scale(ratio, ratio);
-  const padding = { top: 18, right: 14, bottom: 34, left: 46 };
-  const plotWidth = width - padding.left - padding.right;
-  const plotHeight = height - padding.top - padding.bottom;
+  if (typeof Chart === "undefined") return null;
+  const ctx = canvas.getContext("2d");
+  if (!ctx) return null;
+  const labels = samples.map((s) => new Date(Number(s.timestamp) * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }));
   const values = samples.map(metric.value);
-  const maximum = metric.bounded ? 100 : Math.max(metric.unit === "%" ? 100 : 1, ...values) * 1.1;
-  const first = Number(samples[0].timestamp) * 1000;
-  const last = Number(samples.at(-1).timestamp) * 1000;
-  const span = Math.max(last - first, 1);
-
-  context.font = "11px ui-monospace, monospace";
-  context.fillStyle = "#686874";
-  context.strokeStyle = "#d9d9dd";
-  context.lineWidth = 1;
-  [0, 0.5, 1].forEach((step) => {
-    const y = padding.top + plotHeight * step;
-    context.beginPath(); context.moveTo(padding.left, y); context.lineTo(width - padding.right, y); context.stroke();
-    const value = maximum * (1 - step);
-    context.fillText(`${value.toFixed(metric.unit === "%" ? 0 : 1)}${metric.unit}`, 4, y + 4);
+  const color = getComputedStyle(document.documentElement).getPropertyValue("--action-blue").trim() || "#1863dc";
+  const hairline = getComputedStyle(document.documentElement).getPropertyValue("--hairline").trim() || "#d9d9dd";
+  return new Chart(ctx, {
+    type: "line",
+    data: {
+      labels,
+      datasets: [{
+        label: metric.label,
+        data: values,
+        borderColor: color,
+        backgroundColor: `${color}15`,
+        fill: true,
+        tension: 0.3,
+        pointRadius: 0,
+        borderWidth: 2,
+      }],
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      animation: { duration: 300 },
+      interaction: { mode: "index", intersect: false },
+      plugins: {
+        legend: { display: false },
+        tooltip: {
+          titleFont: { family: "ui-monospace, monospace", size: 12 },
+          bodyFont: { family: "ui-monospace, monospace", size: 12 },
+        },
+      },
+      scales: {
+        x: { display: true, grid: { color: hairline }, ticks: { font: { family: "ui-monospace, monospace", size: 10 }, maxRotation: 0, maxTicksLimit: 6 } },
+        y: {
+          display: true,
+          grid: { color: hairline },
+          beginAtZero: false,
+          ticks: { font: { family: "ui-monospace, monospace", size: 10 }, callback: (v) => `${v}${metric.unit}` },
+        },
+      },
+    },
   });
-  context.fillText(new Date(first).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }), padding.left, height - 10);
-  const endLabel = new Date(last).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
-  context.fillText(endLabel, width - padding.right - context.measureText(endLabel).width, height - 10);
-
-  context.strokeStyle = "#1863dc";
-  context.lineWidth = 2;
-  context.lineJoin = "round";
-  context.beginPath();
-  values.forEach((value, index) => {
-    const x = padding.left + (((Number(samples[index].timestamp) * 1000) - first) / span) * plotWidth;
-    const y = padding.top + plotHeight - (Math.min(Math.max(value, 0), maximum) / maximum) * plotHeight;
-    if (index === 0) context.moveTo(x, y); else context.lineTo(x, y);
-  });
-  context.stroke();
-  const lastValue = values.at(-1);
-  context.fillStyle = "#212121";
-  context.fillText(`Latest ${lastValue.toFixed(metric.unit === "%" ? 1 : 2)}${metric.unit}`, padding.left, 12);
 }
 
 function renderMetricCharts(containerId, emptyId, samples) {
@@ -772,22 +911,30 @@ function renderMetricCharts(containerId, emptyId, samples) {
   if (!container || !empty) return;
   empty.classList.toggle("hidden", samples.length > 0);
   container.classList.toggle("hidden", samples.length === 0);
-  if (!samples.length) {
-    container.replaceChildren();
-    return;
-  }
-  container.replaceChildren(...METRIC_CHARTS.map((metric) => {
+  _destroyCharts(containerId);
+  if (!samples.length) { container.replaceChildren(); return; }
+  const charts = [];
+  const figures = METRIC_CHARTS.map((metric) => {
     const figure = document.createElement("figure");
     figure.className = "chart-card";
     const caption = document.createElement("figcaption");
     caption.textContent = metric.label;
+    const wrapper = document.createElement("div");
+    wrapper.className = "chart-wrapper";
+    wrapper.style.cssText = "position:relative;height:190px;width:100%";
     const canvas = document.createElement("canvas");
     canvas.setAttribute("role", "img");
-    canvas.setAttribute("aria-label", `${metric.label} over time with labelled value and time axes`);
-    figure.append(caption, canvas);
-    requestAnimationFrame(() => drawMetricChart(canvas, samples, metric));
+    canvas.setAttribute("aria-label", `${metric.label} over time`);
+    wrapper.appendChild(canvas);
+    figure.append(caption, wrapper);
+    requestAnimationFrame(() => {
+      const c = drawMetricChart(canvas, samples, metric);
+      if (c) charts.push(c);
+    });
     return figure;
-  }));
+  });
+  container.replaceChildren(...figures);
+  _chartInstances[_chartId(containerId)] = charts;
 }
 
 function renderMetricTable(samples) {
@@ -796,11 +943,11 @@ function renderMetricTable(samples) {
   tbody.replaceChildren(...samples.map((sample) => {
     const row = document.createElement("tr");
     row.append(
-      eventCell(new Date(Number(sample.timestamp) * 1000).toLocaleString()),
-      eventCell(Number(sample.cpu_percent || 0).toFixed(1)),
-      eventCell(`${formatBytes(sample.memory_used || 0)} / ${formatBytes(sample.memory_total || 0)}`),
-      eventCell(`${formatBytes(sample.disk_used || 0)} / ${formatBytes(sample.disk_total || 0)}`),
-      eventCell(Number(sample.load1 || 0).toFixed(2)),
+      eventCell(new Date(Number(sample.timestamp) * 1000).toLocaleString(), "", "Time"),
+      eventCell(Number(sample.cpu_percent || 0).toFixed(1), "", "CPU %"),
+      eventCell(`${formatBytes(sample.memory_used || 0)} / ${formatBytes(sample.memory_total || 0)}`, "", "Memory"),
+      eventCell(`${formatBytes(sample.disk_used || 0)} / ${formatBytes(sample.disk_total || 0)}`, "", "Disk"),
+      eventCell(Number(sample.load1 || 0).toFixed(2), "", "Load"),
     );
     return row;
   }));
@@ -952,6 +1099,7 @@ async function openDetail(domain) {
   pendingSecurity = null;
   currentSecurity = null;
   securityAuthDirty = false;
+  securityFail2banDirty = false;
   securityRevision += 1;
   currentFilesPath = "";
   openFilePath = null;
@@ -1013,12 +1161,16 @@ async function refreshBackups() {
     const tr = document.createElement("tr");
     const nameCell = document.createElement("td");
     nameCell.className = "domain";
+    nameCell.setAttribute("data-label", "Archive");
     nameCell.textContent = backup.name;
     const sizeCell = document.createElement("td");
+    sizeCell.setAttribute("data-label", "Size");
     sizeCell.textContent = formatBytes(backup.size_bytes);
     const dateCell = document.createElement("td");
+    dateCell.setAttribute("data-label", "Created");
     dateCell.textContent = new Date(backup.modified_at * 1000).toLocaleString();
     const actionCell = document.createElement("td");
+    actionCell.setAttribute("data-label", "Actions");
     const restore = document.createElement("button");
     restore.className = "btn btn-danger-ghost";
     restore.textContent = "Restore…";
@@ -1101,8 +1253,10 @@ function renderDatabases(databases) {
     const row = document.createElement("tr");
     const nameCell = document.createElement("td");
     nameCell.className = "domain";
+    nameCell.setAttribute("data-label", "Database");
     nameCell.textContent = name;
     const actionCell = document.createElement("td");
+    actionCell.setAttribute("data-label", "Type exact name to drop");
     actionCell.append(exactConfirmAction(name, "Drop database", async () => {
       const result = await api(
         `/api/sites/${encodeURIComponent(currentDomain)}/databases/${encodeURIComponent(name)}`,
@@ -1141,8 +1295,10 @@ function renderDbUsers(users) {
     const row = document.createElement("tr");
     const userCell = document.createElement("td");
     userCell.className = "domain";
+    userCell.setAttribute("data-label", "User");
     userCell.textContent = user;
     const passwordCell = document.createElement("td");
+    passwordCell.setAttribute("data-label", "Password");
     const rotate = document.createElement("button");
     rotate.type = "button";
     rotate.className = "btn";
@@ -1164,6 +1320,7 @@ function renderDbUsers(users) {
     }).finally(() => { $("db-user-job-status").textContent = ""; }));
     passwordCell.append(rotate);
     const actionCell = document.createElement("td");
+    actionCell.setAttribute("data-label", "Type exact name to drop");
     actionCell.append(exactConfirmAction(user, "Drop user", async () => {
       const result = await api(
         `/api/sites/${encodeURIComponent(currentDomain)}/db-users/${encodeURIComponent(user)}`,
@@ -1567,6 +1724,7 @@ function securityPayload() {
     cloudflare_only: $("security-cloudflare-only").checked,
     login_rate_limit: $("security-login-rate-limit").checked,
   };
+  if (securityFail2banDirty) payload.fail2ban = $("security-fail2ban").checked;
   if (securityAuthDirty) {
     const basicAuth = {
       enabled: $("security-basic-enabled").checked,
@@ -1595,8 +1753,99 @@ function syncSecurityFields(state) {
   securityAuthDirty = false;
   $("security-cloudflare-only").checked = Boolean(state.cloudflare_only);
   $("security-login-rate-limit").checked = Boolean(state.login_rate_limit);
+  $("security-fail2ban").checked = Boolean(state.fail2ban);
+  securityFail2banDirty = false;
   $("security-snippet-path").textContent = state.snippet_path || "not available";
   $("security-trusted-sources").textContent = (state.trusted_edge_sources || []).join(", ") || "not available";
+  renderLoginShield(state.login_shield, state.protected_surfaces);
+}
+
+function renderLoginShield(status, protectedSurfaces) {
+  const summary = $("login-shield-summary");
+  const scope = $("login-shield-ban-scope");
+  if (!summary || !scope) return;
+  scope.textContent = "";
+  if (!status) {
+    summary.replaceChildren();
+    return;
+  }
+  const items = [];
+  const enabled = Boolean(status.enabled);
+  items.push(checkItem({
+    name: "State",
+    state: enabled ? "pass" : "warn",
+    message: enabled ? "Login Shield enabled" : "Login Shield disabled",
+  }));
+
+  const hostInstalled = Boolean(status.host_fail2ban_installed);
+  const hostHealth = status.host_fail2ban_health || "unknown";
+  items.push(checkItem({
+    name: "Host service",
+    state: hostInstalled ? (hostHealth === "ok" ? "pass" : "fail") : "warn",
+    message: hostInstalled ? `fail2ban service ${hostHealth}` : "fail2ban not installed on host",
+  }));
+
+  const plugin = status.plugin || {};
+  if (plugin.active === true) {
+    const ownership = plugin.ownership ? ` (${plugin.ownership})` : "";
+    items.push(checkItem({
+      name: "Plugin",
+      ok: true,
+      message: `wp-fail2ban ${plugin.version || "active"}${ownership}`,
+    }));
+  } else {
+    items.push(checkItem({
+      name: "Plugin",
+      state: "warn",
+      message: plugin.slug ? "wp-fail2ban plugin inactive" : "wp-fail2ban plugin not installed",
+    }));
+  }
+
+  const logHealth = status.event_log_health || "unknown";
+  const matched = Number.isInteger(status.recent_matched_failures) ? `${status.recent_matched_failures} recent` : "no recent";
+  items.push(checkItem({
+    name: "Logging pipeline",
+    state: logHealth === "ok" ? "pass" : "warn",
+    message: `event log ${logHealth}; ${matched} matched failures`,
+  }));
+
+  const proxy = status.trusted_proxy_health || "edge-trust-unavailable";
+  items.push(checkItem({
+    name: "Trusted proxy",
+    state: proxy === "edge-trust-configured" ? "pass" : "warn",
+    message: proxy,
+  }));
+
+  items.push(checkItem({
+    name: "Last blocked attempt",
+    state: status.last_detected_failure ? "pass" : "warn",
+    message: status.last_detected_failure || "no blocked attempts recorded yet",
+  }));
+
+  if (Number.isInteger(status.recent_bans) || Number.isInteger(status.total_bans)) {
+    items.push(checkItem({
+      name: "Recent bans",
+      ok: true,
+      message: `${status.recent_bans ?? 0} currently banned; ${status.total_bans ?? 0} total`,
+    }));
+  } else {
+    items.push(checkItem({ name: "Recent bans", state: "warn", message: "unknown (runtime not probed)" }));
+  }
+
+  if (protectedSurfaces && protectedSurfaces.length) {
+    items.push(checkItem({ name: "Protected surfaces", ok: true, message: protectedSurfaces.join(", ") }));
+  }
+
+  if (status.health === "degraded") {
+    items.push(checkItem({
+      name: "Health",
+      state: "warn",
+      message: status.degraded_reason || "degraded; re-render required",
+    }));
+  }
+
+  summary.replaceChildren(...items);
+  if (status.ban_scope) scope.textContent = status.ban_scope;
 }
 
 async function refreshSecurity() {
@@ -1698,15 +1947,17 @@ function renderCronJobs(jobs) {
   const rowDomain = currentDomain;
   table.querySelector("tbody").replaceChildren(...jobs.map((job) => {
     const row = document.createElement("tr");
-    const schedule = eventCell(job.schedule, "domain");
-    const command = eventCell(job.command, "domain cron-command");
+    const schedule = eventCell(job.schedule, "domain", "Schedule");
+    const command = eventCell(job.command, "domain cron-command", "Command");
     command.title = job.command;
-    const service = eventCell(job.service, "domain");
+    const service = eventCell(job.service, "domain", "Service");
     const enabled = document.createElement("td");
+    enabled.setAttribute("data-label", "Enabled");
     enabled.append(badge(job.enabled ? "enabled" : "disabled", job.enabled));
-    const timeout = eventCell(`${job.timeout}s`);
-    const lastRun = eventCell(cronLastRunText(job.last_run), "cron-last-run");
+    const timeout = eventCell(`${job.timeout}s`, "", "Timeout");
+    const lastRun = eventCell(cronLastRunText(job.last_run), "cron-last-run", "Last run");
     const actions = document.createElement("td");
+    actions.setAttribute("data-label", "Actions");
     const wrap = document.createElement("div");
     wrap.className = "cron-actions";
     const run = cronActionButton("Run now", "btn", async () => {
@@ -1834,6 +2085,7 @@ function renderFileEntries(entries) {
     const path = joinFilePath(currentFilesPath, entry.name);
     const name = document.createElement("td");
     name.className = "domain";
+    name.setAttribute("data-label", "Name");
     if (["dir", "file"].includes(entry.type)) {
       const open = document.createElement("button");
       open.type = "button";
@@ -1844,11 +2096,12 @@ function renderFileEntries(entries) {
     } else {
       name.textContent = entry.name;
     }
-    const type = eventCell(entry.type);
-    const size = eventCell(entry.type === "dir" ? "—" : formatBytes(entry.size));
-    const mode = eventCell(entry.mode, "domain");
-    const modified = eventCell(new Date(entry.modified * 1000).toLocaleString());
+    const type = eventCell(entry.type, "", "Type");
+    const size = eventCell(entry.type === "dir" ? "—" : formatBytes(entry.size), "", "Size");
+    const mode = eventCell(entry.mode, "domain", "Mode");
+    const modified = eventCell(new Date(entry.modified * 1000).toLocaleString(), "", "Modified");
     const actions = document.createElement("td");
+    actions.setAttribute("data-label", "Actions");
     const wrap = document.createElement("div");
     wrap.className = "file-actions";
     if (entry.type === "file") {
@@ -2125,9 +2378,10 @@ function renderServices(services) {
   table.classList.toggle("hidden", services.length === 0);
   table.querySelector("tbody").replaceChildren(...services.map((service) => {
     const row = document.createElement("tr");
-    const name = eventCell(service.name, "domain");
-    const status = eventCell(service.status || "unknown");
+    const name = eventCell(service.name, "domain", "Service");
+    const status = eventCell(service.status || "unknown", "", "Status");
     const action = document.createElement("td");
+    action.setAttribute("data-label", "Action");
     const separator = service.name.indexOf(":");
     if (separator > 0) {
       const domain = service.name.slice(0, separator);
@@ -2171,9 +2425,10 @@ function eventOutcomeOk(outcome) {
   return ["ok", "succeeded", "success", "passed"].includes(String(outcome || "").toLowerCase());
 }
 
-function eventCell(text, className = "") {
+function eventCell(text, className = "", label = "") {
   const cell = document.createElement("td");
   if (className) cell.className = className;
+  if (label) cell.setAttribute("data-label", label);
   cell.textContent = text ?? "–";
   return cell;
 }
@@ -2187,14 +2442,14 @@ function renderEventRows(tableId, emptyId, events, includeDomain) {
   const tbody = table.querySelector("tbody");
   tbody.replaceChildren(...events.map((event) => {
     const tr = document.createElement("tr");
-    const outcomeCell = eventCell(event.outcome || "unknown");
+    const outcomeCell = eventCell(event.outcome || "unknown", "", includeDomain ? "Outcome" : "Outcome");
     outcomeCell.className = eventOutcomeOk(event.outcome) ? "check-pass event-outcome" : "check-fail event-outcome";
     const cells = [
-      eventCell(formatTime(event.timestamp)),
-      eventCell(event.action || "–", "domain"),
+      eventCell(formatTime(event.timestamp), "", "Time"),
+      eventCell(event.action || "–", "domain", "Action"),
     ];
-    if (includeDomain) cells.push(eventCell(event.domain || "–", "domain"));
-    cells.push(outcomeCell, eventCell(event.actor || "–"), eventCell(event.job_id || "–", "domain"));
+    if (includeDomain) cells.push(eventCell(event.domain || "–", "domain", "Domain"));
+    cells.push(outcomeCell, eventCell(event.actor || "–", "", "Actor"), eventCell(event.job_id || "–", "domain", "Job"));
     tr.append(...cells);
     return tr;
   }));
@@ -2212,8 +2467,178 @@ async function loadEvents() {
 
 async function refreshDashboard() {
   const work = [loadSites(), loadEvents()];
-  if (!principal || isAdmin()) work.push(loadOverview(), loadHostMetrics(), loadServices());
+  if (!principal || isAdmin()) work.push(loadOverview(), loadHostMetrics(), loadServices(), loadHealth(), loadJobsTray());
   await Promise.all(work);
+}
+
+async function loadHealth() {
+  try {
+    const data = await api("/api/system/services");
+    const services = data.services || [];
+    const degraded = services.filter((s) => s.status !== "running").length;
+    const dot = $("chip-health")?.querySelector(".dot");
+    if (dot) {
+      dot.className = `dot ${degraded === 0 ? "green" : services.length === degraded ? "red" : "amber"}`;
+    }
+    $("chip-health-text").textContent = degraded === 0 ? "Healthy" : `${degraded} degraded`;
+    $("chip-health").title = services.map((s) => `${s.name}: ${s.status}`).join(", ");
+    const degradedNames = services.filter((s) => s.status !== "running").map((s) => s.name);
+    $("degraded-banner").classList.toggle("hidden", degraded === 0);
+    if (degraded > 0) $("degraded-banner-text").textContent = `${degraded} service${degraded === 1 ? "" : "s"} degraded: ${degradedNames.join(", ")}.`;
+  } catch (error) {
+    $("chip-health-text").textContent = "–";
+  }
+}
+
+async function loadOnboarding() {
+  if (!principal || !isAdmin()) return;
+  if (localStorage.getItem("wpfy-onboarding-dismissed")) return;
+  if (allSites.length > 0) { $("onboarding-panel")?.classList.add("hidden"); return; }
+  $("onboarding-panel")?.classList.remove("hidden");
+}
+
+async function loadBackupsSummary() {
+  if (!principal || !isAdmin()) return;
+  try {
+    let allBackups = [];
+    for (const site of allSites) {
+      try {
+        const data = await api(`/api/sites/${encodeURIComponent(site.domain)}/backups`);
+        if (data.backups && data.backups.length) {
+          allBackups.push({ domain: site.domain, latest: data.backups[0] });
+        }
+      } catch (e) { /* skip sites where backups fail */ }
+    }
+    $("backups-summary-panel").classList.toggle("hidden", allBackups.length === 0);
+    $("backups-summary-empty").classList.toggle("hidden", allBackups.length > 0);
+    const tbody = $("backups-summary-table").querySelector("tbody");
+    tbody.replaceChildren(...allBackups.map(({ domain, latest }) => {
+      const tr = document.createElement("tr");
+      tr.innerHTML = `
+        <td class="domain" data-label="Site"><a href="/site/${encodeURIComponent(domain)}/backups" data-route="true">${_esc(domain)}</a></td>
+        <td data-label="Latest backup">${new Date(latest.modified_at * 1000).toLocaleString()}</td>
+        <td data-label="Size">${formatBytes(latest.size_bytes)}</td>
+        <td data-label=""><a class="btn" href="/site/${encodeURIComponent(domain)}/backups" data-route="true">Manage</a></td>`;
+      return tr;
+    }));
+  } catch (e) {
+    // non-critical
+  }
+}
+
+async function refreshDashboard() {
+  const work = [loadSites(), loadEvents()];
+  if (!principal || isAdmin()) work.push(loadOverview(), loadHostMetrics(), loadServices(), loadHealth(), loadJobsTray());
+  await Promise.all(work);
+  if (isAdmin()) {
+    await loadOnboarding();
+    loadBackupsSummary().catch(() => {});
+  }
+}
+
+let _jobsPollTimer = 0;
+
+async function loadJobsTray() {
+  try {
+    const data = await api("/api/jobs");
+    const active = (data.jobs || []).filter((j) => j.state === "running" || j.state === "pending").length;
+    $("chip-jobs-text").textContent = active === 0 ? "0 jobs" : `${active} job${active === 1 ? "" : "s"}`;
+    $("chip-jobs")?.querySelector(".spinner")?.classList.toggle("hidden", active === 0);
+    if (active === 0 && _jobsPollTimer) { clearInterval(_jobsPollTimer); _jobsPollTimer = 0; }
+    if (active > 0 && !_jobsPollTimer) _jobsPollTimer = setInterval(loadJobsTray, 10000);
+  } catch (error) {
+    $("chip-jobs-text").textContent = "–";
+  }
+}
+
+/* ---- dark mode ---- */
+
+function initTheme() {
+  const stored = localStorage.getItem("wpfy-panel-theme") || "auto";
+  applyTheme(stored);
+  const control = $("theme-control");
+  if (control) {
+    control.querySelectorAll("button").forEach((btn) => {
+      btn.classList.toggle("active", btn.dataset.theme === stored);
+      btn.addEventListener("click", () => {
+        const value = btn.dataset.theme;
+        localStorage.setItem("wpfy-panel-theme", value);
+        applyTheme(value);
+        control.querySelectorAll("button").forEach((b) => b.classList.toggle("active", b.dataset.theme === value));
+      });
+    });
+  }
+}
+
+function applyTheme(value) {
+  if (value === "dark") document.documentElement.setAttribute("data-theme", "dark");
+  else if (value === "light") document.documentElement.setAttribute("data-theme", "light");
+  else document.documentElement.removeAttribute("data-theme");
+}
+
+/* ---- account menu ---- */
+
+function wireAccountMenu() {
+  const chip = $("chip-account");
+  const menu = $("account-menu");
+  if (!chip || !menu) return;
+  chip.addEventListener("click", (event) => {
+    event.stopPropagation();
+    menu.classList.toggle("hidden");
+  });
+  document.addEventListener("click", (event) => {
+    if (!chip.contains(event.target) && !menu.contains(event.target)) menu.classList.add("hidden");
+  });
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") menu.classList.add("hidden");
+  });
+  menu.querySelectorAll("a[data-route]").forEach((a) => {
+    a.addEventListener("click", () => menu.classList.add("hidden"));
+  });
+}
+
+/* ---- hamburger nav ---- */
+
+function wireHamburger() {
+  const toggle = $("nav-toggle");
+  const nav = $("topnav");
+  if (!toggle || !nav) return;
+  toggle.addEventListener("click", () => {
+    const open = nav.classList.toggle("open");
+    toggle.setAttribute("aria-expanded", String(open));
+    if (open) {
+      const overlay = document.createElement("div");
+      overlay.className = "nav-overlay";
+      overlay.id = "nav-overlay";
+      overlay.addEventListener("click", closeHamburger);
+      document.body.appendChild(overlay);
+    } else {
+      closeHamburger();
+    }
+  });
+  nav.addEventListener("click", (event) => {
+    if (event.target.closest("a")) closeHamburger();
+  });
+}
+
+function closeHamburger() {
+  const nav = $("topnav");
+  const toggle = $("nav-toggle");
+  if (nav) nav.classList.remove("open");
+  if (toggle) toggle.setAttribute("aria-expanded", "false");
+  $("nav-overlay")?.remove();
+}
+
+/* ---- breadcrumbs ---- */
+
+function renderSiteBreadcrumbs(domain) {
+  $("route-breadcrumb").replaceChildren(
+    linkEl("/dashboard", "Dashboard"),
+    crumbSep(),
+    linkEl("/sites", "Sites"),
+    crumbSep(),
+    document.createTextNode(domain),
+  );
 }
 
 async function refreshActivity() {
@@ -2240,6 +2665,10 @@ function wire() {
   });
 
   listen("btn-refresh", "click", (event) => runBusy(event.currentTarget, refreshDashboard));
+  listen("btn-onboarding-dismiss", "click", () => {
+    localStorage.setItem("wpfy-onboarding-dismissed", "1");
+    $("onboarding-panel")?.classList.add("hidden");
+  });
   listen("btn-users", "click", () => setUsersOpen($("users-panel")?.classList.contains("hidden")));
   listen("btn-users-close", "click", () => setUsersOpen(false));
   listen("user-create-form", "submit", (event) => {
@@ -2268,9 +2697,7 @@ function wire() {
     $("one-time-copy-status").textContent = "copied";
   }));
 
-  listen("btn-new-site", "click", (event) => runBusy(event.currentTarget, async () => {
-    setNewSiteOpen($("new-site-panel").classList.contains("hidden"));
-  }));
+  listen("btn-new-site", "click", () => navigate("/sites/new"));
   listen("btn-new-site-close", "click", (event) => runBusy(event.currentTarget, async () => setNewSiteOpen(false)));
   listen("new-flavor", "change", updateCreateFields);
   listen("new-site-panel", "submit", (event) => {
@@ -2278,6 +2705,7 @@ function wire() {
     runBusy($("btn-create-site"), createSite);
   });
   listen("sites-search", "input", renderSites);
+  listen("sites-flavor-filter", "change", renderSites);
 
   listen("detail-close", "click", (event) => runBusy(event.currentTarget, async () => closeDetail()));
 
@@ -2449,6 +2877,11 @@ function wire() {
   });
   ["security-cloudflare-only", "security-login-rate-limit"].forEach((id) =>
     listen(id, "change", () => { securityRevision += 1; clearSecurityPreview(); }));
+  listen("security-fail2ban", "change", () => {
+    securityFail2banDirty = true;
+    securityRevision += 1;
+    clearSecurityPreview();
+  });
 
   listen("cron-add-form", "submit", (event) => {
     event.preventDefault();
@@ -2567,6 +3000,7 @@ async function boot() {
     principal = await loadPrincipal();
     await refreshDashboard();
     showApp();
+    await handleRoute(location.pathname).catch(() => {});
   } catch (error) {
     if (error.status === 401 || error.message === "unauthorized") {
       showGate(true);
@@ -2577,6 +3011,746 @@ async function boot() {
   }
 }
 
+/* ---- add-site wizard ---- */
+
+const WIZARD_STORAGE_PREFIX = "wpfy.wizard.";
+const WIZARD_STEPS = [
+  { n: 1, label: "Basics" },
+  { n: 2, label: "Runtime" },
+  { n: 3, label: "Cache" },
+  { n: 4, label: "SSL" },
+  { n: 5, label: "Notify" },
+  { n: 6, label: "Security" },
+  { n: 7, label: "Review" },
+];
+
+function _wizKey(domain) { return WIZARD_STORAGE_PREFIX + (domain || ""); }
+
+function getWizardState(domain) {
+  const raw = sessionStorage.getItem(_wizKey(domain));
+  return raw ? JSON.parse(raw) : null;
+}
+
+function saveWizardState(state) {
+  if (state.domain) sessionStorage.setItem(_wizKey(state.domain), JSON.stringify(state));
+}
+
+function clearWizardState(domain) {
+  sessionStorage.removeItem(_wizKey(domain));
+}
+
+function _wizDefault(domain) {
+  return { step: 1, domain: domain || "", flavor: "wp", php_version: "8.4", multisite_type: null, object_cache: "none", page_cache: null, letsencrypt: "default", dns_provider: null, dns_preflight_passed: false, notification_channel: "off", enable_backups: false, backup_retention: 7, enable_sftp: false, admin_user: null, admin_email: null, job_id: null };
+}
+
+function renderWizard(state) {
+  showSection("stub");
+  const body = $("route-stub-body");
+  $("route-stub-title").textContent = "Create a site";
+  $("route-stub-text").textContent = "";
+  $("route-breadcrumb").replaceChildren(linkEl("/dashboard", "Dashboard"), crumbSep(), linkEl("/sites", "Sites"), crumbSep(), document.createTextNode("New site"));
+  const html = `<div class="wizard">
+    <nav class="wizard-steps" aria-label="Wizard progress"><ol>${WIZARD_STEPS.map((s) => {
+      const cls = s.n === state.step ? "active" : s.n < state.step ? "done" : "";
+      return `<li class="wizard-step ${cls}" data-step="${s.n}"><span>${s.n}</span> ${s.label}</li>`;
+    }).join("")}</ol></nav>
+    <div class="wizard-body" id="wizard-body"></div>
+    <div class="wizard-actions" id="wizard-actions"></div>
+  </div>`;
+  body.innerHTML = html;
+  document.querySelectorAll(".wizard-step.done").forEach((el) => {
+    el.addEventListener("click", () => {
+      const step = parseInt(el.dataset.step, 10);
+      if (step < state.step) { state.step = step; renderWizard(state); }
+    });
+  });
+  renderWizardStep(state);
+}
+
+function renderWizardStep(state) {
+  const wbody = $("wizard-body");
+  const wactions = $("wizard-actions");
+  if (!wbody || !wactions) return;
+  switch (state.step) {
+    case 1: _renderStep1(state, wbody, wactions); break;
+    case 2: _renderStep2(state, wbody, wactions); break;
+    case 3: _renderStep3(state, wbody, wactions); break;
+    case 4: _renderStep4(state, wbody, wactions); break;
+    case 5: _renderStep5(state, wbody, wactions); break;
+    case 6: _renderStep6(state, wbody, wactions); break;
+    case 7: _renderStep7(state, wbody, wactions); break;
+  }
+}
+
+function _wizButtons(wactions, state, nextEnabled) {
+  wactions.innerHTML = state.step > 1
+    ? `<button class="btn" id="btn-wiz-back">Back</button><button class="btn btn-primary" id="btn-wiz-next"${nextEnabled ? "" : " disabled"}>Next</button>`
+    : `<button class="btn btn-primary" id="btn-wiz-next"${nextEnabled ? "" : " disabled"}>Next</button>`;
+  $("btn-wiz-next")?.addEventListener("click", () => { state.step++; saveWizardState(state); renderWizard(state); });
+  $("btn-wiz-back")?.addEventListener("click", () => { state.step--; saveWizardState(state); renderWizard(state); });
+}
+
+function _renderStep1(state, wbody, wactions) {
+  wbody.innerHTML = `<div class="form-grid">
+    <label>Domain<input id="wiz-domain" type="text" inputmode="url" autocomplete="off" placeholder="example.com" value="${_esc(state.domain)}"></label>
+    <label>Site type<select id="wiz-flavor">${_flavorOptions(state.flavor)}</select></label>
+    <label>PHP version<select id="wiz-php">${_phpOptions(state.php_version)}</select></label>
+  </div>`;
+  _wizButtons(wactions, state, true);
+  $("wiz-domain")?.addEventListener("keydown", (e) => { if (e.key === "Enter") $("btn-wiz-next")?.click(); });
+  $("btn-wiz-next")?.addEventListener("click", () => {
+    const domain = $("wiz-domain").value.trim();
+    if (!domain) { toast("Enter a domain name.", true); return; }
+    state.domain = domain;
+    state.flavor = $("wiz-flavor").value;
+    state.php_version = $("wiz-php").value;
+    state.step++; saveWizardState(state); renderWizard(state);
+  }, { once: true });
+}
+
+function _renderStep2(state, wbody, wactions) {
+  let extra = "";
+  if (isWordPressFlavor(state.flavor)) {
+    extra = `<label>Multisite type<select id="wiz-multisite"><option value="">Standard install</option><option value="subdir"${state.multisite_type === "subdir" ? " selected" : ""}>Subdirectory</option><option value="subdomain"${state.multisite_type === "subdomain" ? " selected" : ""}>Subdomain</option></select></label>`;
+  }
+  wbody.innerHTML = `<div class="form-grid">
+    ${extra}
+    <label>Object cache<select id="wiz-object-cache"><option value="none"${state.object_cache === "none" ? " selected" : ""}>None</option><option value="redis"${state.object_cache === "redis" ? " selected" : ""}>Redis</option></select></label>
+  </div>`;
+  _wizButtons(wactions, state, true);
+}
+
+function _renderStep3(state, wbody, wactions) {
+  const flavorCacheMap = { wpfc: "FastCGI cache", wprocket: "WP Rocket", wpsc: "Super Cache", wpce: "cache-enabler", wpredis: "Redis page cache", wp: "Nginx FastCGI cache" };
+  const cacheLabel = flavorCacheMap[state.flavor] || "Nginx FastCGI cache";
+  wbody.innerHTML = `<dl class="kv">
+    <dt>Page cache</dt><dd>${_esc(cacheLabel)} <span class="badge on">recommended</span></dd>
+    <dt>Object cache</dt><dd>${state.object_cache === "redis" ? "Redis" : "None"}</dd>
+  </dl><p class="hint">Cache options are determined by your site type. You can change the page-cache integration later in Site Settings.</p>`;
+  _wizButtons(wactions, state, true);
+}
+
+function _renderStep4(state, wbody, wactions) {
+  wbody.innerHTML = `<div class="form-grid">
+    <label>Let’s Encrypt mode<select id="wiz-letsencrypt"><option value="default"${state.letsencrypt === "default" ? " selected" : ""}>Default</option><option value="wildcard"${state.letsencrypt === "wildcard" ? " selected" : ""}>Wildcard</option><option value="off"${state.letsencrypt === "off" ? " selected" : ""}>Off</option></select></label>
+    <label>DNS provider<select id="wiz-dns"><option value="">None</option><option value="cloudflare"${state.dns_provider === "cloudflare" ? " selected" : ""}>Cloudflare</option></select></label>
+  </div>
+  <p class="hint" id="wiz-dns-note">DNS preflight runs on the server during site creation. Ensure the domain resolves to this server’s public IP.</p>
+  <div id="wiz-preflight-result"></div>`;
+  _wizButtons(wactions, state, true);
+}
+
+function _renderStep5(state, wbody, wactions) {
+  wbody.innerHTML = `<div class="form-grid">
+    <label>Notifications<select id="wiz-notify"><option value="off"${state.notification_channel === "off" ? " selected" : ""}>Off</option><option value="email" disabled>Email (coming soon)</option><option value="webhook" disabled>Webhook (coming soon)</option></select></label>
+  </div><p class="hint">Notification channels are configured per-site and can be changed later.</p>`;
+  _wizButtons(wactions, state, true);
+}
+
+function _renderStep6(state, wbody, wactions) {
+  wbody.innerHTML = `<div class="form-grid">
+    <label class="toggle-field"><input id="wiz-backups" type="checkbox"${state.enable_backups ? " checked" : ""}><span>Enable backups</span></label>
+    <label>Retention (days)<input id="wiz-retention" type="number" min="1" max="90" value="${state.backup_retention}"></label>
+    <label class="toggle-field"><input id="wiz-sftp" type="checkbox"${state.enable_sftp ? " checked" : ""}><span>Enable SFTP</span></label>
+    <label>Admin user<span class="optional">optional</span><input id="wiz-admin-user" type="text" autocomplete="username" value="${_esc(state.admin_user || "")}"></label>
+    <label>Admin email<span class="optional">optional</span><input id="wiz-admin-email" type="email" autocomplete="email" value="${_esc(state.admin_email || "")}"></label>
+  </div>`;
+  _wizButtons(wactions, state, true);
+}
+
+function _renderStep7(state, wbody, wactions) {
+  const letsencryptLabel = state.letsencrypt === "default" ? "Default" : state.letsencrypt === "wildcard" ? "Wildcard" : "Off";
+  wbody.innerHTML = `<div class="wizard-summary">
+    <h3>Review your site</h3>
+    <dl>
+      <dt>Domain</dt><dd>${_esc(state.domain)} <span class="edit-link" data-goto="1">edit</span></dd>
+      <dt>Site type</dt><dd>${_esc(state.flavor)} <span class="edit-link" data-goto="1">edit</span></dd>
+      <dt>PHP version</dt><dd>${_esc(state.php_version)} <span class="edit-link" data-goto="1">edit</span></dd>
+      <dt>Object cache</dt><dd>${state.object_cache === "redis" ? "Redis" : "None"} <span class="edit-link" data-goto="2">edit</span></dd>
+      <dt>Let’s Encrypt</dt><dd>${letsencryptLabel} <span class="edit-link" data-goto="4">edit</span></dd>
+      <dt>DNS provider</dt><dd>${state.dns_provider || "none"} <span class="edit-link" data-goto="4">edit</span></dd>
+      <dt>Notifications</dt><dd>${state.notification_channel} <span class="edit-link" data-goto="5">edit</span></dd>
+      <dt>Backups</dt><dd>${state.enable_backups ? `Enabled · ${state.backup_retention}d retention` : "Disabled"} <span class="edit-link" data-goto="6">edit</span></dd>
+      <dt>SFTP</dt><dd>${state.enable_sftp ? "Enabled" : "Disabled"} <span class="edit-link" data-goto="6">edit</span></dd>
+      <dt>Admin user</dt><dd>${state.admin_user || "admin (default)"} <span class="edit-link" data-goto="6">edit</span></dd>
+      <dt>Admin email</dt><dd>${state.admin_email || `admin@${state.domain}`} <span class="edit-link" data-goto="6">edit</span></dd>
+    </dl>
+  </div>`;
+  wactions.innerHTML = `<button class="btn" id="btn-wiz-back">Back</button><button class="btn btn-primary" id="btn-wiz-create">Create site</button>`;
+  $("btn-wiz-back")?.addEventListener("click", () => { state.step--; saveWizardState(state); renderWizard(state); });
+  wbody.querySelectorAll(".edit-link").forEach((link) => {
+    link.addEventListener("click", () => { state.step = parseInt(link.dataset.goto, 10); saveWizardState(state); renderWizard(state); });
+  });
+  $("btn-wiz-create")?.addEventListener("click", async () => {
+    const payload = { domain: state.domain, flavor: state.flavor, php_version: state.php_version, letsencrypt: state.letsencrypt === "off" ? "disabled" : "enabled" };
+    if (state.dns_provider) payload.dns_provider = state.dns_provider;
+    if (state.object_cache === "redis") payload.object_cache = state.object_cache;
+    if (state.admin_user) payload.admin_user = state.admin_user;
+    if (state.admin_email) payload.admin_email = state.admin_email;
+    try {
+      const accepted = await api("/api/sites", { method: "POST", body: JSON.stringify(payload) });
+      state.job_id = accepted.job_id;
+      saveWizardState(state);
+      navigate(`/sites/new/progress/${encodeURIComponent(accepted.job_id)}`);
+    } catch (error) {
+      toast(error.message || "Site creation failed", true);
+    }
+  });
+}
+
+function renderWizardProgress(jobId) {
+  showSection("stub");
+  const body = $("route-stub-body");
+  $("route-stub-title").textContent = "Creating site…";
+  $("route-stub-text").textContent = "";
+  $("route-breadcrumb").replaceChildren(linkEl("/dashboard", "Dashboard"), crumbSep(), linkEl("/sites", "Sites"), crumbSep(), document.createTextNode("Creating site"));
+  body.innerHTML = `<div class="wizard-progress">
+    <div class="wizard-progress-bar"><div class="fill" id="wiz-progress-fill" style="width:0%"></div></div>
+    <p class="hint" id="wiz-progress-status">Starting job…</p>
+    <ul class="wizard-stages" id="wiz-stages"></ul>
+    <p class="hint" id="wiz-elapsed"></p>
+  </div>
+  <div class="row"><button class="btn btn-ghost" id="btn-wiz-cancel">Cancel</button></div>`;
+  $("btn-wiz-cancel")?.addEventListener("click", () => navigate("/sites"));
+  const start = Date.now();
+  pollJob(jobId, (steps) => {
+    const pct = Math.min(95, Math.round((steps.length / 10) * 100));
+    $("wiz-progress-fill").style.width = `${pct}%`;
+    $("wiz-progress-status").textContent = `Stage ${steps.length}: ${stepText(steps[steps.length - 1])}`;
+    $("wiz-stages").innerHTML = steps.map((s) => {
+      const t = stepText(s);
+      const cls = s.state === "failed" ? "fail" : "ok";
+      return `<li class="wizard-stage"><span class="stage-name">${_esc(t)}</span><span class="stage-state ${cls}">${_esc(s.state || "running")}</span></li>`;
+    }).join("");
+    $("wiz-elapsed").textContent = `Elapsed: ${Math.round((Date.now() - start) / 1000)}s`;
+  }).then((job) => {
+    if (job.state === "failed") {
+      $("wiz-progress-fill").style.width = "100%";
+      $("wiz-progress-status").textContent = job.result?.error || "Site creation failed";
+      return;
+    }
+    $("wiz-progress-fill").style.width = "100%";
+    navigate(`/sites/new/success/${encodeURIComponent(jobId)}`);
+  }).catch((error) => {
+    toast(error.message || "The operation is taking longer than expected.", true);
+  });
+}
+
+function renderWizardSuccess(jobId) {
+  showSection("stub");
+  const body = $("route-stub-body");
+  $("route-stub-title").textContent = "Site created";
+  $("route-stub-text").textContent = "";
+  $("route-breadcrumb").replaceChildren(linkEl("/dashboard", "Dashboard"), crumbSep(), linkEl("/sites", "Sites"), crumbSep(), document.createTextNode("Success"));
+  body.innerHTML = `<div class="wizard-success">
+    <p>Your site has been created. Below are one-time credentials. Copy them now — they will not be shown again.</p>
+    <div id="wiz-credentials"></div>
+    <ul class="checklist">
+      <li><span class="checkmark">&#x2713;</span> Site files written</li>
+      <li><span class="checkmark">&#x2713;</span> Docker containers started</li>
+      <li><span class="checkmark">&#x2713;</span> Let’s Encrypt configured</li>
+      <li><span class="checkmark">&#x2713;</span> Site health check passed</li>
+    </ul>
+    <div class="row">
+      <a class="btn" href="/site/${encodeURIComponent(jobId)}" data-route="true">Manage site</a>
+      <button class="btn btn-primary" id="btn-wiz-dismiss">Done</button>
+    </div>
+  </div>`;
+  api(`/api/jobs/${encodeURIComponent(jobId)}`).then((job) => {
+    if (job.one_time) {
+      const creds = flattenOneTime(job.one_time);
+      const container = $("wiz-credentials");
+      if (container && creds.length) {
+        const dl = document.createElement("dl");
+        dl.className = "kv";
+        creds.forEach(([key, value]) => {
+          const dt = document.createElement("dt"); dt.textContent = key.replaceAll("_", " ");
+          const dd = document.createElement("dd"); dd.className = "credential-value"; dd.textContent = value;
+          dl.append(dt, dd);
+        });
+        const copyBtn = document.createElement("button");
+        copyBtn.className = "btn";
+        copyBtn.textContent = "Copy credentials";
+        copyBtn.addEventListener("click", async () => {
+          await navigator.clipboard.writeText(creds.map(([k, v]) => `${k.replaceAll("_", " ")}: ${v}`).join("\n"));
+          copyBtn.textContent = "Copied";
+        });
+        container.append(dl, copyBtn);
+      }
+    }
+  }).catch(() => {});
+  $("btn-wiz-dismiss")?.addEventListener("click", () => {
+    const domain = jobId.split("_").slice(1).join("_") || "";
+    if (domain) clearWizardState(domain);
+    loadSites().then(() => navigate("/sites"));
+  });
+}
+
+function _esc(s) { return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;"); }
+
+function _flavorOptions(selected) {
+  const opts = [
+    ["wp", "WordPress"], ["wpfc", "WordPress + FastCGI cache"], ["wpredis", "WordPress + Redis"],
+    ["wpsc", "WordPress + Super Cache"], ["wprocket", "WordPress + WP Rocket"], ["wpce", "WordPress cache-enabled"],
+    ["wpsubdir", "WordPress multisite (subdir)"], ["wpsubdomain", "WordPress multisite (subdomain)"],
+    ["php", "PHP site"], ["html", "Static HTML"],
+  ];
+  return opts.map(([v, label]) => `<option value="${v}"${v === selected ? " selected" : ""}>${label}</option>`).join("");
+}
+
+function _phpOptions(selected) {
+  return ["7.4", "8.0", "8.1", "8.2", "8.3", "8.4"].map((v) => `<option${v === selected ? " selected" : ""}>${v}</option>`).join("");
+}
+
+/* ---- file manager workspace ---- */
+
+let _fmDomain = null;
+let _fmState = "disabled";
+let _fmLeaseTimer = 0;
+let _fmStatePollTimer = 0;
+
+function renderFileManager(domain) {
+  _fmDomain = domain;
+  _clearFmPolling();
+  $("file-manager-workspace")?.classList.remove("hidden");
+  $("fm-domain").textContent = domain;
+  $("fm-root").textContent = "Loading…";
+  _fetchFmStatus();
+  _fmStatePollTimer = setInterval(_fetchFmStatus, 5000);
+}
+
+async function _fetchFmStatus() {
+  if (!_fmDomain) return;
+  try {
+    const data = await api(`/api/sites/${encodeURIComponent(_fmDomain)}/file-manager`);
+    _fmTransition(data.state, data);
+  } catch (error) {
+    if (error.message === "unauthorized") return;
+    _fmTransition("disabled", {});
+  }
+}
+
+function _fmTransition(newState, data) {
+  if (newState === _fmState) return;
+  _fmState = newState;
+  ["fm-disabled", "fm-starting", "fm-ready", "fm-warning", "fm-failed"].forEach((id) => $(id)?.classList.add("hidden"));
+  $(`fm-${newState}`)?.classList.remove("hidden");
+  $("fm-status-badge").textContent = newState;
+  $("fm-status-badge").className = `badge ${newState === "ready" ? "on" : "off"}`;
+  if (data.root) $("fm-root").textContent = data.root;
+  if (data.error) $("fm-error-text").textContent = data.error;
+  if (newState === "ready") {
+    _startFmLease();
+    $("fm-iframe").src = `/api/sites/${encodeURIComponent(_fmDomain)}/file-manager/proxy/`;
+  }
+  if (newState === "disabled" || newState === "failed") _stopFmLease();
+}
+
+function _startFmLease() {
+  _stopFmLease();
+  _sendFmLease();
+  _fmLeaseTimer = setInterval(_sendFmLease, 60000);
+  document.addEventListener("visibilitychange", _onFmVisibility);
+}
+
+function _stopFmLease() {
+  clearInterval(_fmLeaseTimer);
+  _fmLeaseTimer = 0;
+  document.removeEventListener("visibilitychange", _onFmVisibility);
+}
+
+function _clearFmPolling() {
+  clearInterval(_fmStatePollTimer);
+  _fmStatePollTimer = 0;
+  _stopFmLease();
+}
+
+async function _sendFmLease() {
+  if (!_fmDomain || document.hidden) return;
+  try {
+    const data = await api(`/api/sites/${encodeURIComponent(_fmDomain)}/file-manager/lease`, { method: "POST", body: "{}" });
+    $("fm-idle-label").textContent = data.idle_expires_at ? `Idle until ${new Date(data.idle_expires_at).toLocaleTimeString()}` : "";
+  } catch (error) {
+    // lease failures are non-fatal
+  }
+}
+
+function _onFmVisibility() {
+  if (!document.hidden) _sendFmLease();
+}
+
+async function _enableFm() {
+  if (!_fmDomain) return;
+  _fmTransition("starting", {});
+  try {
+    const data = await api(`/api/sites/${encodeURIComponent(_fmDomain)}/file-manager/enable`, { method: "POST", body: "{}" });
+    if (data.state === "ready") _fmTransition("ready", data);
+  } catch (error) {
+    _fmTransition("failed", { error: error.message });
+  }
+}
+
+async function _disableFm() {
+  if (!_fmDomain) return;
+  try {
+    await api(`/api/sites/${encodeURIComponent(_fmDomain)}/file-manager`, { method: "DELETE" });
+    _fmTransition("disabled", {});
+  } catch (error) {
+    toast(error.message, true);
+  }
+}
+
+function wireFm() {
+  listen("btn-fm-enable", "click", () => runBusy($("btn-fm-enable"), _enableFm));
+  listen("btn-fm-retry", "click", () => runBusy($("btn-fm-retry"), _enableFm));
+  listen("btn-fm-disable", "click", () => runBusy($("btn-fm-disable"), _disableFm));
+  listen("btn-fm-disable-now", "click", () => runBusy($("btn-fm-disable-now"), _disableFm));
+  listen("btn-fm-keep", "click", () => _sendFmLease());
+  listen("btn-fm-keep-warn", "click", () => { _sendFmLease(); _fmTransition("ready", {}); });
+}
+
+/* ---- router (MPA) ---- */
+
+const NAV_LINKS = [
+  { href: "/dashboard", label: "Dashboard", scope: "global" },
+  { href: "/sites", label: "Sites", scope: "global" },
+  { href: "/events", label: "Events", scope: "global" },
+  { href: "/admin/users", label: "Users", scope: "admin" },
+  { href: "/admin/jobs", label: "Jobs", scope: "admin" },
+  { href: "/admin/services", label: "Services", scope: "admin" },
+  { href: "/admin/settings", label: "Settings", scope: "admin" },
+  { href: "/account/settings", label: "Account", scope: "session" },
+];
+
+const CLIENT_ROUTE_PREFIXES = [
+  "/dashboard", "/sites", "/site/", "/events", "/notifications", "/account/", "/admin/",
+];
+
+const SECTION_IDS = {
+  dashboard: ["stats", "metrics-panel", "sites-panel", "services-panel", "events-panel", "diagnostics-panel"],
+  sites: ["sites-panel"],
+  events: ["events-panel"],
+  account: ["account-panel"],
+  users: ["users-panel"],
+  detail: ["detail"],
+  stub: [],
+};
+
+function showSection(name) {
+  const visible = new Set(SECTION_IDS[name] || []);
+  Object.values(SECTION_IDS).flat().forEach((id) => {
+    const node = $(id);
+    if (node) node.classList.toggle("hidden", !visible.has(id));
+  });
+  $("route-stub")?.classList.toggle("hidden", name !== "stub");
+}
+
+function renderRouteStub(title, text, bodyHtml = "") {
+  showSection("stub");
+  $("route-stub-title").textContent = title;
+  $("route-stub-text").textContent = text;
+  const body = $("route-stub-body");
+  body.replaceChildren();
+  if (bodyHtml) body.insertAdjacentHTML("beforeend", bodyHtml);
+  $("route-breadcrumb").replaceChildren(
+    linkEl("/dashboard", "Dashboard"),
+    crumbSep(), document.createTextNode(title),
+  );
+}
+
+function renderNotFound() {
+  renderRouteStub(
+    "Not found",
+    "This page does not exist. Check the address or return to the dashboard.",
+    `<a class="btn" href="/dashboard" data-route="true">Return to dashboard</a>`,
+  );
+}
+
+function renderForbidden() {
+  renderRouteStub(
+    "Not allowed",
+    "Your account does not have permission to view this page.",
+    `<a class="btn" href="/dashboard" data-route="true">Return to dashboard</a>`,
+  );
+}
+
+function crumbSep() {
+  const span = document.createElement("span");
+  span.className = "crumb-sep";
+  span.textContent = " / ";
+  return span;
+}
+
+function linkEl(href, label, route = true) {
+  const a = document.createElement("a");
+  a.href = href;
+  a.textContent = label;
+  if (route) a.dataset.route = "true";
+  return a;
+}
+
+function renderTopnav() {
+  const nav = $("topnav");
+  if (!nav) return;
+  nav.replaceChildren(...NAV_LINKS.filter((link) => {
+    if (link.scope === "admin") return isAdmin();
+    return true;
+  }).map((link) => {
+    const a = linkEl(link.href, link.label);
+    a.dataset.routerLink = "true";
+    return a;
+  }));
+}
+
+function routeActive(path) {
+  document.querySelectorAll("#topnav a[data-router-link]").forEach((a) => {
+    const href = a.getAttribute("href");
+    const active = href === path || (href !== "/" && href !== "/dashboard" && path.startsWith(`${href}/`)) || (href === "/dashboard" && path === "/");
+    a.classList.toggle("active", active);
+    if (active) a.setAttribute("aria-current", "page"); else a.removeAttribute("aria-current");
+  });
+}
+
+const TAB_ALIASES = {
+  "overview": "overview", "logs": "logs", "backups": "backups", "sftp": "sftp",
+  "wp-cli": "wp", "databases": "databases", "php": "php", "vhost": "vhost",
+  "cache": "cache", "security": "security", "cron": "cron", "files": "files",
+  "config": "config", "activity": "activity", "settings": "config",
+  "metrics": "activity", "runtime": "overview", "ssl": "overview", "access": "sftp",
+  "danger": "overview",
+};
+
+const SITE_STUB_PAGES = new Set([]);
+
+function tabFromPath(part) {
+  return TAB_ALIASES[part] || null;
+}
+
+const VALID_TABS = new Set(Object.values(TAB_ALIASES).filter((v) => v !== "settings"));
+
+async function renderSiteRoute(match) {
+  const domain = decodeURIComponent(match[1]);
+  const tab = match[2] ? tabFromPath(match[2]) : "overview";
+  if (match[2] && SITE_STUB_PAGES.has(match[2])) {
+    showSection("stub");
+    renderSiteBreadcrumbs(domain);
+    $("detail")?.classList.add("hidden");
+    const labels = { metrics: "Metrics", runtime: "Runtime", ssl: "SSL", danger: "Danger zone", access: "Access" };
+    renderRouteStub(labels[match[2]], `${labels[match[2]]} page for ${domain} lands in a later phase.`);
+    return;
+  }
+  if (tab === "files") {
+    showSection("stub");
+    renderSiteBreadcrumbs(domain);
+    $("detail")?.classList.add("hidden");
+    renderFileManager(domain);
+    return;
+  }
+  showSection("detail");
+  renderSiteBreadcrumbs(domain);
+  await openDetail(domain);
+  if (tab && VALID_TABS.has(tab)) selectTab(tab);
+  $("detail").scrollIntoView({ block: "start" });
+}
+
+async function handleRoute(path) {
+  renderTopnav();
+  routeActive(path);
+
+  const siteMatch = /^\/site\/([^/]+)(?:\/([a-z0-9-]+))?\/?$/.exec(path);
+  if (siteMatch) {
+    await renderSiteRoute(siteMatch);
+    return;
+  }
+
+  if (path === "/dashboard" || path === "/" || path === "/index.html") {
+    showSection("dashboard");
+    applyPrincipal();
+    return;
+  }
+  if (path === "/sites" || path === "/sites/") {
+    showSection("sites");
+    return;
+  }
+  if (path === "/events" || path === "/events/") {
+    showSection("events");
+    return;
+  }
+  if (path === "/account/settings") {
+    showSection("account");
+    return;
+  }
+  if (path === "/account/security") {
+    renderRouteStub("Security", "Two-factor authentication management moves here in a later phase.");
+    return;
+  }
+  if (path === "/notifications") {
+    renderRouteStub("Notifications", "The notification center arrives in a later phase.");
+    return;
+  }
+  if (path === "/sites/new" || path === "/sites/new/") {
+    const state = _wizDefault("");
+    renderWizard(state);
+    return;
+  }
+  const progressMatch = /^\/sites\/new\/progress\/([^/]+)\/?$/.exec(path);
+  if (progressMatch) {
+    renderWizardProgress(decodeURIComponent(progressMatch[1]));
+    return;
+  }
+  const successMatch = /^\/sites\/new\/success\/([^/]+)\/?$/.exec(path);
+  if (successMatch) {
+    renderWizardSuccess(decodeURIComponent(successMatch[1]));
+    return;
+  }
+  if (path === "/admin/users") {
+    if (!isAdmin()) { renderForbidden(); return; }
+    showSection("users");
+    return;
+  }
+  if (path === "/admin/events") {
+    if (!isAdmin()) { renderForbidden(); return; }
+    showSection("events");
+    return;
+  }
+  if (path === "/admin/services") {
+    if (!isAdmin()) { renderForbidden(); return; }
+    showSection("services");
+    loadServices();
+    return;
+  }
+  if (path === "/admin/jobs" || path === "/admin/jobs/") {
+    if (!isAdmin()) { renderForbidden(); return; }
+    renderAdminJobs();
+    return;
+  }
+  const jobDetailMatch = /^\/admin\/jobs\/([^/]+)\/?$/.exec(path);
+  if (jobDetailMatch) {
+    if (!isAdmin()) { renderForbidden(); return; }
+    renderAdminJobDetail(decodeURIComponent(jobDetailMatch[1]));
+    return;
+  }
+  if (path.startsWith("/admin/")) {
+    if (!isAdmin()) { renderForbidden(); return; }
+    renderAdminStub(adminPageTitle(path));
+    return;
+  }
+
+  renderNotFound();
+}
+
+function adminPageTitle(path) {
+  const parts = path.split("/").filter(Boolean).slice(1);
+  if (!parts.length) return "Admin";
+  const labels = {
+    jobs: "Jobs", services: "Services", instance: "Instance", "remote-backup": "Remote backup",
+    firewall: "Firewall", "basic-auth": "Basic auth", settings: "Settings",
+    hetzner: "Hetzner", notifications: "Notifications", users: "Users",
+  };
+  return labels[parts[0]] || parts[0];
+}
+
+function renderAdminStub(title) {
+  renderRouteStub(
+    title,
+    `${title} page lands in a later phase.`,
+    `<a class="btn" href="/dashboard" data-route="true">Return to dashboard</a>`,
+  );
+}
+
+async function renderAdminJobs() {
+  showSection("stub");
+  const body = $("route-stub-body");
+  $("route-stub-title").textContent = "Jobs";
+  $("route-stub-text").textContent = "Active and recent panel jobs.";
+  $("route-breadcrumb").replaceChildren(
+    linkEl("/dashboard", "Dashboard"),
+    crumbSep(),
+    linkEl("/admin/services", "Admin"),
+    crumbSep(),
+    document.createTextNode("Jobs"),
+  );
+  try {
+    const data = await api("/api/jobs");
+    const jobs = data.jobs || [];
+    const rows = jobs.map((j) => `<tr>
+      <td class="domain" data-label="Job"><a href="/admin/jobs/${_esc(j.job_id)}" data-route="true">${_esc(j.job_id)}</a></td>
+      <td data-label="Action">${_esc(j.action || "")}</td>
+      <td data-label="Site">${_esc(j.domain || "")}</td>
+      <td data-label="State">${_esc(j.state || "")}</td>
+      <td data-label="Progress">${j.progress != null ? j.progress + "%" : "–"}</td>
+      <td data-label="Started">${j.started_at ? new Date(j.started_at).toLocaleString() : "–"}</td>
+    </tr>`).join("");
+    body.innerHTML = `<div class="table-wrap"><table><thead><tr><th>Job</th><th>Action</th><th>Site</th><th>State</th><th>Progress</th><th>Started</th></tr></thead><tbody>${rows || "<tr><td colspan='6'>No jobs recorded.</td></tr>"}</tbody></table></div>`;
+  } catch (err) {
+    body.innerHTML = `<p class="error">${_esc(err.message)}</p>`;
+  }
+}
+
+async function renderAdminJobDetail(jobId) {
+  showSection("stub");
+  const body = $("route-stub-body");
+  $("route-stub-title").textContent = `Job ${jobId}`;
+  $("route-stub-text").textContent = "";
+  $("route-breadcrumb").replaceChildren(
+    linkEl("/dashboard", "Dashboard"),
+    crumbSep(),
+    linkEl("/admin/jobs", "Jobs"),
+    crumbSep(),
+    document.createTextNode(jobId),
+  );
+  try {
+    const job = await api(`/api/jobs/${encodeURIComponent(jobId)}`);
+    const stages = (job.stages || []).map((s) => `<li class="wizard-step ${s.completed ? "done" : s.active ? "active" : ""}"><span>${_esc(s.label)}</span></li>`).join("");
+    body.innerHTML = `<dl class="kv">
+      <dt>State</dt><dd>${_esc(job.state || "–")}</dd>
+      <dt>Action</dt><dd>${_esc(job.action || "–")}</dd>
+      <dt>Site</dt><dd>${_esc(job.domain || "–")}</dd>
+      <dt>Started</dt><dd>${job.started_at ? new Date(job.started_at).toLocaleString() : "–"}</dd>
+      <dt>Ended</dt><dd>${job.ended_at ? new Date(job.ended_at).toLocaleString() : "–"}</dd>
+    </dl>
+    ${stages ? `<h3>Stages</h3><ol class="wizard-stages" style="list-style:none;display:flex;gap:1em;flex-wrap:wrap">${stages}</ol>` : ""}
+    ${job.result?.error ? `<p class="error">${_esc(job.result.error)}</p>` : ""}
+    <div class="row"><a class="btn" href="/admin/jobs" data-route="true">Back to jobs</a></div>`;
+  } catch (err) {
+    body.innerHTML = `<p class="error">${_esc(err.message)}</p><a class="btn" href="/admin/jobs" data-route="true">Back to jobs</a>`;
+  }
+}
+
+async function navigate(path) {
+  if (path !== location.pathname) {
+    history.pushState({ path }, "", path);
+  }
+  await handleRoute(path);
+}
+
+function isClientRoute(href) {
+  return CLIENT_ROUTE_PREFIXES.some((prefix) => href === prefix || href.startsWith(prefix));
+}
+
+function wireRouter() {
+  document.addEventListener("click", (event) => {
+    const anchor = event.target.closest("a[href]");
+    if (!anchor) return;
+    const href = anchor.getAttribute("href");
+    if (!href || href.startsWith("http") || href.startsWith("/api") || href.startsWith("#")) return;
+    if (!isClientRoute(href)) return;
+    event.preventDefault();
+    navigate(href).catch((error) => toast(error.message || "Unable to navigate.", true));
+  });
+
+  window.addEventListener("popstate", () => {
+    handleRoute(location.pathname).catch((error) => toast(error.message || "Unable to navigate.", true));
+  });
+
+  renderTopnav();
+}
+
 wire();
+wireRouter();
+wireAccountMenu();
+wireHamburger();
+wireFm();
+initTheme();
 token = readTokenFromHash();
 boot();

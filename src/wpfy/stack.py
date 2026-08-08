@@ -5,6 +5,7 @@ from dataclasses import dataclass
 import subprocess
 
 from . import traefik
+from .fail2ban_host import ensure_fail2ban_host
 from .php_runtime import DEFAULT_PHP_VERSION, PHP_IMAGE_REPOSITORY, php_image
 from .site_layout import MARIADB_IMAGE, REDIS_IMAGE
 from .site_runtime import RuntimeResult
@@ -115,10 +116,19 @@ def install(
             pulled = pull_image(image)
             facts.append(StackFact("wp-cli", pulled.status, f"{pulled.message} (bundled)", pulled.exit_code))
 
+    if request.install_all or request.nginx or "fail2ban" in request.host_tools:
+        notify("Ensuring host-level fail2ban...")
+        f2b = ensure_fail2ban_host()
+        if f2b.exit_code == 0:
+            status_name = "SKIP" if not f2b.changed and f2b.health_ok else "OK"
+            facts.append(StackFact("fail2ban", status_name, f2b.message, 0))
+        else:
+            facts.append(StackFact("fail2ban", "FAIL", f2b.message, f2b.exit_code))
+
     facts.extend(
         StackFact(tool, "WARN", "not applicable in Docker-first wpfy (use host-level tooling separately)")
         for tool in request.host_tools
-        if tool in HOST_TOOLS
+        if tool in HOST_TOOLS and tool != "fail2ban"
     )
     for helper in request.helpers:
         image = HELPER_IMAGES.get(helper)

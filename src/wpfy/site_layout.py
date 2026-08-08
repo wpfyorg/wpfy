@@ -17,6 +17,7 @@ import tempfile
 from urllib.request import urlopen
 
 from . import registry
+from . import site_event_pipeline
 from . import site_security
 from .events import record_event
 from .php_runtime import PHP_IMAGE_REPOSITORY as _PHP_IMAGE_REPOSITORY, php_image
@@ -287,6 +288,10 @@ def compose_content(spec: SiteSpec) -> str:
         "      - ./app:/var/www/html",
         "      - ./php/zz-wpfy.ini:/usr/local/etc/php/conf.d/zz-wpfy.ini:ro",
         "      - ./php/custom.ini:/usr/local/etc/php/conf.d/zzz-custom.ini:ro",
+        f"      - ./security/{site_event_pipeline.AUTH_LOG_FILE}:"
+        f"{site_event_pipeline.AUTH_LOG_CONTAINER_PATH}",
+        f"      - ./security/{site_event_pipeline.BRIDGE_MU_FILE}:"
+        f"{site_event_pipeline.BRIDGE_CONTAINER_PATH}:ro",
         "    healthcheck:",
         "      test: [\"CMD-SHELL\", \"php -v >/dev/null 2>&1\"]",
         "      interval: 30s",
@@ -371,6 +376,7 @@ def compose_content(spec: SiteSpec) -> str:
         "      - ./app:/var/www/html",
         "      - ./php/zz-wpfy.ini:/usr/local/etc/php/conf.d/zz-wpfy.ini:ro",
         "      - ./php/custom.ini:/usr/local/etc/php/conf.d/zzz-custom.ini:ro",
+        "      - ./security:/security:ro",
     ])
     if spec.use_mysql:
         lines.extend([
@@ -1420,8 +1426,9 @@ def remove_site_scaffold(domain: str) -> bool:
         registry.remove_site(domain)
     try:
         rotation_removed = site_security._remove_access_log_rotation(domain)
+        auth_rotation_removed = site_event_pipeline._remove_auth_log_rotation(domain)
         configs_changed = site_security._render_fail2ban_configs(skip_invalid=True)
-        if (rotation_removed or configs_changed) and site_security.fail2ban_available():
+        if (rotation_removed or auth_rotation_removed or configs_changed) and site_security.fail2ban_available():
             reload_error = site_security._reload_fail2ban()
             if reload_error:
                 record_event(
@@ -1563,6 +1570,18 @@ def _apply_site_ownership(domain: str, uid: int) -> RuntimeResult:
                 return RuntimeResult(3, f"ownership failed: unsafe htpasswd symlink: {htpasswd.name}")
             os.chown(htpasswd, uid, uid, follow_symlinks=False)
             os.chmod(htpasswd, 0o640, follow_symlinks=False)
+        for pipeline_path, mode, label in (
+            (site_event_pipeline.auth_log_path(domain), site_event_pipeline.AUTH_LOG_MODE, "auth-log"),
+            (site_event_pipeline.bridge_path(domain), site_event_pipeline.BRIDGE_MODE, "bridge"),
+        ):
+            try:
+                metadata = pipeline_path.lstat()
+            except FileNotFoundError:
+                continue
+            if stat.S_ISLNK(metadata.st_mode):
+                return RuntimeResult(3, f"ownership failed: unsafe {label} symlink: {pipeline_path.name}")
+            os.chown(pipeline_path, uid, uid, follow_symlinks=False)
+            os.chmod(pipeline_path, mode, follow_symlinks=False)
     except PermissionError as exc:
         return RuntimeResult(0, f"ownership skipped (chown not permitted: {exc})", skipped=True)
     except OSError as exc:
@@ -1784,6 +1803,9 @@ def ensure_site_scaffold(spec: SiteSpec) -> list[str]:
         site_root / "php",
         site_root / "php" / "zz-wpfy.ini",
         site_root / "php" / "custom.ini",
+        site_root / "security",
+        site_root / "security" / site_event_pipeline.AUTH_LOG_FILE,
+        site_root / "security" / site_event_pipeline.BRIDGE_MU_FILE,
         site_root / "backups",
         site_root / "cache-data",
         site_root / "app",
@@ -1814,6 +1836,7 @@ def ensure_site_scaffold(spec: SiteSpec) -> list[str]:
         nginx_dir(spec.domain),
         nginx_dir(spec.domain) / "extra",
         php_dir(spec.domain),
+        site_root / "security",
         backups_dir(spec.domain),
         site_root / "cache-data" if spec.page_cache == "wpfc" else None,
         db_data_dir(spec.domain) if spec.use_mysql else None,
@@ -1924,6 +1947,7 @@ def ensure_site_scaffold(spec: SiteSpec) -> list[str]:
             _write_text_safely(nginx_root, site_security.HTPASSWD_FILE, "")
             touched.append(str(nginx_root / site_security.HTPASSWD_FILE))
         _chmod_file_safely(nginx_root, site_security.HTPASSWD_FILE, 0o640)
+        touched.extend(site_event_pipeline.ensure_event_pipeline_files(spec.domain))
         extra_root = nginx_root / "extra"
         if not _file_exists_safely(extra_root, "custom.conf"):
             _write_text_safely(extra_root, "custom.conf", "")

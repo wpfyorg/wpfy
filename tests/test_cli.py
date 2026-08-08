@@ -1470,6 +1470,7 @@ def test_stack_install_explicit_php_pulls_only_requested_version(monkeypatch):
 
 def test_stack_install_all_pulls_only_default_php(monkeypatch):
     import wpfy.cli as cli
+    from wpfy.fail2ban_host import HostFail2banResult
     from wpfy.site_layout import RuntimeResult
 
     calls = []
@@ -1485,6 +1486,11 @@ def test_stack_install_all_pulls_only_default_php(monkeypatch):
 
     monkeypatch.setattr(cli.stack.traefik, "start_traefik", lambda: RuntimeResult(0, "started", ran=True))
     monkeypatch.setattr(cli.stack.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        cli.stack,
+        "ensure_fail2ban_host",
+        lambda: HostFail2banResult(0, "fail2ban healthy", installed=True, health_ok=True),
+    )
 
     result = cli.run(["stack", "install", "--all"])
     pulled = [cmd for cmd in calls if cmd[:2] == ["docker", "pull"]]
@@ -1498,6 +1504,7 @@ def test_stack_install_all_pulls_only_default_php(monkeypatch):
 
 def test_stack_install_shows_tty_progress(monkeypatch, capsys):
     import wpfy.cli as cli
+    from wpfy.fail2ban_host import HostFail2banResult
     from wpfy.site_layout import RuntimeResult
 
     class Proc:
@@ -1508,6 +1515,11 @@ def test_stack_install_shows_tty_progress(monkeypatch, capsys):
     monkeypatch.setattr(cli.sys.stderr, "isatty", lambda: True)
     monkeypatch.setattr(cli.stack.traefik, "start_traefik", lambda: RuntimeResult(0, "started", ran=True))
     monkeypatch.setattr(cli.stack.subprocess, "run", lambda *args, **kwargs: Proc())
+    monkeypatch.setattr(
+        cli.stack,
+        "ensure_fail2ban_host",
+        lambda: HostFail2banResult(0, "fail2ban healthy", installed=True, health_ok=True),
+    )
 
     result = cli.run(["stack", "install", "--all"])
     progress = capsys.readouterr().err
@@ -3491,3 +3503,49 @@ def test_make_site_handler_rejects_unknown_name():
 
     with pytest.raises(ValueError, match="unsupported site handler"):
         cli.make_site_handler("scaffold")
+
+
+def test_stack_install_all_mocks_host_fail2ban(monkeypatch, capsys):
+    """t08 wave-2 pin: --all never attempts a real host apt install in tests."""
+    import wpfy.cli as cli
+    from wpfy.fail2ban_host import HostFail2banResult
+
+    class Proc:
+        returncode = 0
+        stdout = "ok"
+        stderr = ""
+
+    monkeypatch.setattr(cli.stack.traefik, "start_traefik", lambda: cli.stack.RuntimeResult(0, "started", ran=True))
+    monkeypatch.setattr(cli.stack.subprocess, "run", lambda *args, **kwargs: Proc())
+    monkeypatch.setattr(
+        cli.stack,
+        "ensure_fail2ban_host",
+        lambda: HostFail2banResult(0, "fail2ban healthy", installed=True, health_ok=True),
+    )
+
+    result = cli.run(["stack", "install", "--all"])
+
+    assert result == 0
+    assert "fail2ban:" in capsys.readouterr().out
+
+
+def test_stack_install_fail2ban_flag_ensures_host(monkeypatch, capsys):
+    """t08 pin: wpfy stack install --fail2ban ensures host fail2ban."""
+    import wpfy.cli as cli
+    from wpfy.fail2ban_host import HostFail2banResult
+
+    called = []
+    monkeypatch.setattr(
+        cli.stack,
+        "ensure_fail2ban_host",
+        lambda: called.append(True)
+        or HostFail2banResult(0, "fail2ban healthy", installed=True, health_ok=True),
+    )
+
+    result = cli.run(["stack", "install", "--fail2ban"])
+
+    assert result == 0
+    assert called == [True]
+    output = capsys.readouterr().out
+    assert "fail2ban:" in output
+    assert "not applicable" not in output

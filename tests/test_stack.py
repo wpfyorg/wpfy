@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from wpfy import stack
+from wpfy.fail2ban_host import HostFail2banResult
 from wpfy.site_runtime import RuntimeResult
 
 
@@ -24,10 +25,15 @@ def test_install_all_uses_one_pull_contract_and_keeps_going(monkeypatch):
 
     monkeypatch.setattr(stack.traefik, "start_traefik", lambda: RuntimeResult(0, "started", ran=True))
     monkeypatch.setattr(stack.subprocess, "run", run)
+    monkeypatch.setattr(
+        stack,
+        "ensure_fail2ban_host",
+        lambda: HostFail2banResult(0, "fail2ban healthy", installed=True, health_ok=True),
+    )
 
     result = stack.install(stack.StackInstallRequest(install_all=True))
 
-    assert [fact.name for fact in result.facts] == ["Traefik", "PHP 8.4", "MariaDB", "Redis"]
+    assert [fact.name for fact in result.facts] == ["Traefik", "PHP 8.4", "MariaDB", "Redis", "fail2ban"]
     assert result.exit_code == 7
     assert [command[-1] for command in calls] == [
         "ghcr.io/wpfyorg/php-fpm:8.4",
@@ -49,10 +55,15 @@ def test_install_wpcli_reuses_selected_default_php(monkeypatch):
 def test_install_reports_traefik_and_helper_failures(monkeypatch):
     monkeypatch.setattr(stack.traefik, "start_traefik", lambda: RuntimeResult(5, "start failed", ran=True))
     monkeypatch.setattr(stack.subprocess, "run", lambda *args, **kwargs: Proc(7, stderr="pull failed"))
+    monkeypatch.setattr(
+        stack,
+        "ensure_fail2ban_host",
+        lambda: HostFail2banResult(0, "fail2ban healthy", installed=True, health_ok=True),
+    )
 
     result = stack.install(stack.StackInstallRequest(nginx=True, helpers=("adminer",)))
 
-    assert [fact.exit_code for fact in result.facts] == [5, 7]
+    assert [fact.exit_code for fact in result.facts] == [5, 0, 7]
     assert result.exit_code == 7
 
 
@@ -174,3 +185,21 @@ def test_status_preserves_component_failures(monkeypatch):
     assert result.exit_code == 5
     assert result.docker_error == "daemon down"
     assert result.images_error == "images failed"
+
+
+def test_install_fail2ban_flag_ensures_host(monkeypatch):
+    """t08: --fail2ban host tool triggers ensure_fail2ban_host, no WARN path."""
+    called = []
+    monkeypatch.setattr(
+        stack,
+        "ensure_fail2ban_host",
+        lambda: called.append(True)
+        or HostFail2banResult(0, "fail2ban healthy", installed=True, health_ok=True),
+    )
+
+    result = stack.install(stack.StackInstallRequest(host_tools=("fail2ban",)))
+
+    assert called == [True]
+    fail2ban_fact = next(fact for fact in result.facts if fact.name == "fail2ban")
+    assert fail2ban_fact.status != "WARN"
+    assert fail2ban_fact.exit_code == 0

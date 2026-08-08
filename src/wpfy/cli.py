@@ -321,6 +321,7 @@ def build_parser() -> argparse.ArgumentParser:
     add_info_parser(subparsers)
     add_log_parser(subparsers)
     add_secure_parser(subparsers)
+    add_security_parser(subparsers)
     add_maintenance_parser(subparsers)
     add_update_parser(subparsers)
     add_debug_parser(subparsers)
@@ -2602,6 +2603,18 @@ def handle_site_security(args: argparse.Namespace) -> CommandResult:
         elif args.security_command == "login-rate-limit":
             result = site_security.set_login_rate_limit(args.domain, args.security_action == "on")
         elif args.security_command == "fail2ban":
+            if args.security_action == "status":
+                return CommandResult(
+                    _render_login_shield_status(site_security.login_shield_status(args.domain))
+                )
+            if args.security_action == "reset":
+                if not _privileged_cli():
+                    return CommandResult(
+                        "site fail2ban reset requires local privileged CLI access (root or the wpfy wrapper)",
+                        exit_code=2,
+                    )
+                result = site_security.reset_login_shield(args.domain)
+                return CommandResult(result.message, exit_code=result.exit_code)
             result = site_security.set_fail2ban(args.domain, args.security_action == "on")
         elif args.security_command == "cf-only":
             enabled = args.security_action == "on"
@@ -2632,6 +2645,119 @@ def handle_site_security(args: argparse.Namespace) -> CommandResult:
     if result.one_time_password:
         message += f"\ngenerated password (shown once): {result.one_time_password}"
     return CommandResult(message, exit_code=result.exit_code)
+
+
+def _privileged_cli() -> bool:
+    """True when running as root or via the privileged wpfy wrapper.
+
+    Host-level ``unban`` and per-site ``reset`` mutate fail2ban ban state / the
+    host firewall and require local privileged CLI access (plan Phase 7, line
+    971). The env override exists for the root-wrapper and test paths.
+    """
+    if os.environ.get("WPFY_SKIP_PRIVILEGE_CHECK") == "1":
+        return True
+    return bool(hasattr(os, "geteuid") and os.geteuid() == 0)
+
+
+def _render_login_shield_status(status: dict) -> str:
+    """Render the Login Shield status surface (per-site or host-level).
+
+    Field list matches lifecycle-status-schema.md section 6 plus the t15
+    additions: recent bans, chain attachment, and the aggregate health line
+    (degraded while the Docker action is stale, IPv6 capability changed).
+    """
+    plugin = status.get("plugin") or {}
+    if status.get("site"):
+        lines = [f"Site: {status['site']}"]
+        title = None
+    else:
+        lines = []
+        title = "Host fail2ban status"
+    lines.extend([
+        f"Login Shield: {'enabled' if status.get('enabled') else 'disabled'}",
+        f"WP fail2ban installed: {plugin.get('slug') or 'no'}",
+        f"WP fail2ban active: {plugin.get('active') or False}",
+        f"WP fail2ban ownership: {plugin.get('ownership') or 'none'}",
+        f"Host Fail2ban installed: {status.get('host_fail2ban_installed')}",
+        f"Host Fail2ban service health: {status.get('host_fail2ban_health')}",
+        f"Relevant jail: {status.get('jail_name')}",
+        f"Jail active: {status.get('jail_active')}",
+        f"Event log path: {status.get('event_log_path')}",
+        f"Event log health: {status.get('event_log_health')}",
+        f"Last detected authentication failure: {status.get('last_detected_failure') or 'none'}",
+        f"Recent matched failures: {status.get('recent_matched_failures')}",
+        f"Recent bans: {status.get('recent_bans') if status.get('recent_bans') is not None else 'unknown'}",
+        f"Ban scope: {status.get('ban_scope')}",
+        f"Trusted proxy health: {status.get('trusted_proxy_health')}",
+        f"IPv4 protection: {'active' if status.get('ipv4_protection') else 'inactive'}",
+        f"IPv6 protection: {'active' if status.get('ipv6_protection') else 'inactive'}",
+        f"Configuration validation: {status.get('config_validation')}",
+    ])
+    health = status.get("health")
+    if health:
+        reason = status.get("degraded_reason")
+        lines.append(f"Health: {health}" + (f": {reason}" if reason else ""))
+    if title:
+        return _render_summary(title, lines)
+    return "\n".join(lines)
+
+
+def handle_security(args: argparse.Namespace) -> CommandResult:
+    try:
+        if args.fail2ban_command == "status":
+            return CommandResult(_render_login_shield_status(site_security.host_fail2ban_status()))
+        if args.fail2ban_command == "repair":
+            result = site_security.repair_host_login_shield()
+            return CommandResult(result.message, exit_code=result.exit_code)
+        if args.fail2ban_command == "test":
+            result = site_security.test_host_login_shield()
+            return CommandResult(result.message, exit_code=result.exit_code)
+        if args.fail2ban_command == "unban":
+            if not _privileged_cli():
+                return CommandResult(
+                    "unban requires local privileged CLI access (root or the wpfy wrapper)",
+                    exit_code=2,
+                )
+            result = site_security.unban_fail2ban(args.ip)
+            return CommandResult(result.message, exit_code=result.exit_code)
+        return CommandResult("fail2ban command required", exit_code=2)
+    except (ValueError, TypeError, OSError, RuntimeError) as exc:
+        return CommandResult(str(exc), exit_code=2)
+
+
+def add_security_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+    parser = _add_parser(
+        subparsers,
+        "security",
+        help=(
+            "Manage host-level security services (fail2ban). "
+            "Distinct from 'secure' (read-only audit) and 'site security' (per-site)."
+        ),
+    )
+    fail2ban = _add_parser(
+        parser.add_subparsers(dest="security_group"),
+        "fail2ban",
+        help="Operate the shared fail2ban service (status/repair/test/unban).",
+    )
+    commands = fail2ban.add_subparsers(dest="fail2ban_command")
+    _add_parser(commands, "status", help="Show host fail2ban status.").set_defaults(
+        handler=handle_security,
+    )
+    _add_parser(commands, "repair", help="Repair the shared fail2ban service (idempotent).").set_defaults(
+        handler=handle_security,
+    )
+    _add_parser(
+        commands,
+        "test",
+        help="Run a controlled fixture-level filter/jail test.",
+    ).set_defaults(handler=handle_security)
+    unban = _add_parser(
+        commands,
+        "unban",
+        help="Unban an IP from all WPFY fail2ban jails (requires root or the wpfy wrapper).",
+    )
+    unban.add_argument("ip")
+    unban.set_defaults(handler=handle_security)
 
 
 def add_site_security_parser(site_subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
@@ -2673,11 +2799,19 @@ def add_site_security_parser(site_subparsers: argparse._SubParsersAction[argpars
         child = _add_parser(login_rate_limit_actions, action, help=f"Turn WordPress login rate limiting {action}.")
         child.set_defaults(handler=handle_site_security)
 
-    fail2ban = _add_parser(commands, "fail2ban", help="Enable or disable WordPress fail2ban protection.")
+    fail2ban = _add_parser(commands, "fail2ban", help="Enable, disable, inspect, or reset WordPress fail2ban protection.")
     fail2ban_actions = fail2ban.add_subparsers(dest="security_action")
     for action in ("on", "off"):
         child = _add_parser(fail2ban_actions, action, help=f"Turn WordPress fail2ban protection {action}.")
         child.set_defaults(handler=handle_site_security)
+    status_child = _add_parser(fail2ban_actions, "status", help="Show per-site Login Shield status.")
+    status_child.set_defaults(handler=handle_site_security)
+    reset_child = _add_parser(
+        fail2ban_actions,
+        "reset",
+        help="Clear WPFY jail bans and rebuild this site's fail2ban config (requires root or the wpfy wrapper).",
+    )
+    reset_child.set_defaults(handler=handle_site_security)
 
     cf_only = _add_parser(commands, "cf-only", help="Enforce Cloudflare-only access at Traefik.")
     cf_actions = cf_only.add_subparsers(dest="security_action")

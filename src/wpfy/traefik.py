@@ -300,6 +300,28 @@ def traefik_edge_addresses(network_name: str = TRAEFIK_NETWORK) -> tuple[str, ..
     return tuple(sorted(set(addresses)))
 
 
+def _network_gateway(network_name: str = TRAEFIK_NETWORK) -> str | None:
+    """Return the gateway IP of a Docker network, or None if unavailable."""
+    if not docker_available():
+        return None
+    proc = subprocess.run(
+        ["docker", "network", "inspect", "--format", "{{range .IPAM.Config}}{{.Gateway}}{{end}}", network_name],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode != 0:
+        return None
+    gateway = proc.stdout.strip()
+    if not gateway:
+        return None
+    try:
+        ipaddress.ip_address(gateway)
+    except ValueError:
+        return None
+    return gateway
+
+
 def effective_acme_email() -> str:
     with traefik_transaction():
         return resolve_acme_email().email

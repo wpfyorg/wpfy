@@ -9,6 +9,11 @@
 <link rel="icon" href="data:,">
 </head>
 <body>
+<noscript>
+  <div class="noscript-banner" role="alert">
+    <strong>JavaScript is required.</strong> The wpfy panel is a client-side application; enable JavaScript to sign in and manage sites.
+  </div>
+</noscript>
 <div id="setup" class="gate hidden">
   <main class="setup-shell" aria-labelledby="setup-title">
     <div class="wordmark">wpfy <span class="mono-label">first-run setup</span></div>
@@ -74,19 +79,56 @@
 <div id="app" class="app hidden">
   <header class="topbar">
     <div class="wordmark">wpfy <span class="mono-label">control panel</span></div>
+    <button class="btn" id="nav-toggle" type="button" aria-label="Toggle navigation" aria-expanded="false">&#9776;</button>
+    <nav class="topnav" id="topnav" aria-label="Primary"></nav>
     <div class="chips">
       <span class="chip" id="chip-version">–</span>
-      <span class="chip" id="chip-docker">docker: –</span>
-      <span class="chip" id="chip-traefik">traefik: –</span>
-      <span class="chip" id="chip-warnings">warnings: –</span>
-      <span class="chip" id="chip-principal">signed out</span>
-      <button class="btn btn-ghost hidden" id="btn-users" type="button" aria-expanded="false" aria-controls="users-panel">Users</button>
-      <button class="btn btn-ghost" id="btn-refresh">Refresh</button>
-      <button class="btn btn-ghost" id="btn-lock">Sign out</button>
+      <span class="chip interactive" id="chip-health" title="Service health">
+        <span class="dot"></span>
+        <span id="chip-health-text">–</span>
+      </span>
+      <span class="chip interactive" id="chip-jobs" title="Active jobs">
+        <span class="spinner"></span>
+        <span id="chip-jobs-text">0 jobs</span>
+      </span>
+      <span class="chip interactive" id="chip-notifications" title="Notifications">
+        &#x1f514;
+        <span class="badge-count" id="chip-notifications-count">0</span>
+      </span>
+      <span class="chip interactive" id="chip-account">
+        <span id="chip-account-label">signed out</span>
+      </span>
+      <div class="account-menu hidden" id="account-menu">
+        <div class="account-header">
+          <div class="name" id="account-name"></div>
+          <div class="role-label" id="account-role"></div>
+        </div>
+        <a href="/dashboard" data-route="true">Dashboard</a>
+        <a href="/account/settings" data-route="true">Settings</a>
+        <a href="/account/security" data-route="true">Security</a>
+        <div class="menu-sep"></div>
+        <div class="theme-toggle">
+          <span>Appearance</span>
+          <div class="theme-control" id="theme-control" role="radiogroup" aria-label="Color theme">
+            <button data-theme="light" aria-label="Light theme">&#x2600;</button>
+            <button data-theme="dark" aria-label="Dark theme">&#x263e;</button>
+            <button data-theme="auto" aria-label="System theme">&#x2699;</button>
+          </div>
+        </div>
+        <div class="menu-sep"></div>
+        <button class="btn btn-ghost" id="btn-lock" type="button">Sign out</button>
+        <button class="btn btn-ghost hidden" id="btn-users" type="button" aria-expanded="false" aria-controls="users-panel">Users</button>
+        <button class="btn btn-ghost" id="btn-refresh">Refresh</button>
+      </div>
     </div>
   </header>
 
-  <main>
+  <main id="route-root">
+    <div class="degraded-banner hidden" id="degraded-banner" role="alert">
+      <span class="degraded-banner-icon">&#x26A0;</span>
+      <span id="degraded-banner-text">Some services are degraded.</span>
+      <a href="/admin/services" data-route="true">View services</a>
+    </div>
     <section class="stats" id="stats"></section>
 
     <section class="panel" id="metrics-panel">
@@ -105,6 +147,38 @@
         <summary>Accessible data table</summary>
         <div class="table-wrap"><table id="host-metrics-table"><thead><tr><th>Time</th><th>CPU %</th><th>Memory</th><th>Disk</th><th>Load</th></tr></thead><tbody></tbody></table></div>
       </details>
+    </section>
+
+    <section class="panel hidden" id="onboarding-panel">
+      <div class="panel-head">
+        <div>
+          <h2>Getting started</h2>
+          <p class="hint">Complete these steps to get your server into production shape.</p>
+        </div>
+        <button class="btn btn-ghost" id="btn-onboarding-dismiss" type="button">Dismiss</button>
+      </div>
+      <ul class="checks" id="onboarding-checklist">
+        <li><span class="check-name">Add your first site</span> <span class="check-msg"><a href="/sites/new" data-route="true">Create site</a></span></li>
+        <li><span class="check-name">Configure backups</span> <span class="check-msg">Enable automatic site backups in site settings.</span></li>
+        <li><span class="check-name">Enable SSL</span> <span class="check-msg">Issue Let’s Encrypt certificates for your sites.</span></li>
+        <li><span class="check-name">Set up your account</span> <span class="check-msg"><a href="/account/security" data-route="true">Enroll a second factor</a></span></li>
+      </ul>
+    </section>
+
+    <section class="panel hidden" id="backups-summary-panel">
+      <div class="panel-head">
+        <div>
+          <h2>Recent backups</h2>
+          <p class="hint">Latest backup state across all sites.</p>
+        </div>
+      </div>
+      <div class="table-wrap">
+        <table id="backups-summary-table">
+          <thead><tr><th>Site</th><th>Latest backup</th><th>Size</th><th></th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <p id="backups-summary-empty" class="empty hidden">No backups recorded yet. Create a site and enable backups to see them here.</p>
     </section>
 
     <section class="panel" id="account-panel">
@@ -182,7 +256,7 @@
       </div>
     </section>
 
-    <section class="panel">
+    <section class="panel" id="sites-panel">
       <div class="panel-head sites-head">
         <div class="panel-title-row">
           <h2>Sites</h2>
@@ -192,6 +266,9 @@
           <label class="search-field" for="sites-search">
             <span class="hidden-label">Search sites</span>
             <input id="sites-search" type="search" placeholder="Search domains" autocomplete="off">
+          </label>
+          <label class="search-field">
+            <select id="sites-flavor-filter" aria-label="Filter by type"><option value="">All types</option></select>
           </label>
           <button class="btn btn-primary" id="btn-new-site" type="button" aria-expanded="false" aria-controls="new-site-panel">New site</button>
         </div>
@@ -613,6 +690,23 @@
               <button class="btn btn-danger-ghost hidden" id="btn-security-acknowledge" type="button">Acknowledge warning and apply</button>
             </div>
           </section>
+
+          <section class="management-section">
+            <div class="section-head">
+              <div>
+                <h3>Login Shield</h3>
+                <p class="hint">Protect WordPress authentication using WP fail2ban and the server's Fail2ban service.</p>
+              </div>
+              <span class="mono-label" id="login-shield-status" role="status"></span>
+            </div>
+            <label class="toggle-field">
+              <input id="security-fail2ban" type="checkbox">
+              <span>Protect WordPress authentication with Fail2ban</span>
+            </label>
+            <ul class="checks" id="login-shield-summary" aria-live="polite"></ul>
+            <p class="operator-note" id="login-shield-ban-scope"></p>
+            <p class="operator-note">The panel's own fail2ban jail is host-managed and cannot be disabled here.</p>
+          </section>
         </form>
 
         <div id="security-preview" class="preview-box hidden" aria-live="polite">
@@ -889,12 +983,54 @@
       </div>
       <ul class="checks" id="sysdiag-result"></ul>
     </section>
+
+    <section class="route-stub panel hidden" id="route-stub" aria-live="polite">
+      <div class="route-stub-head">
+        <nav class="breadcrumb" id="route-breadcrumb" aria-label="Breadcrumb"></nav>
+      </div>
+      <h2 id="route-stub-title"></h2>
+      <p class="hint" id="route-stub-text"></p>
+      <div id="route-stub-body"></div>
+    </section>
+
+    <section class="panel file-manager-panel hidden" id="file-manager-workspace">
+      <div class="panel-head fm-head">
+        <h2>File Manager</h2>
+        <span id="fm-status-badge" class="badge off">disabled</span>
+      </div>
+      <div id="fm-disabled" class="fm-state">
+        <p class="hint">The file manager runs only when needed and is automatically disabled after 15 minutes of inactivity.</p>
+        <dl class="kv fm-info"><dt>Site</dt><dd id="fm-domain">–</dd><dt>Directory</dt><dd id="fm-root">–</dd></dl>
+        <button class="btn btn-primary" id="btn-fm-enable">Enable File Manager</button>
+      </div>
+      <div id="fm-starting" class="fm-state hidden">
+        <p>Starting File Manager…</p>
+        <ol id="fm-stages" class="wizard-stages"></ol>
+        <div class="wizard-progress-bar"><div class="fill" id="fm-start-bar"></div></div>
+      </div>
+      <div id="fm-ready" class="fm-state hidden">
+        <iframe id="fm-iframe" src="" sandbox="allow-scripts allow-same-origin allow-forms allow-downloads" title="File Manager"></iframe>
+        <div class="row fm-actions">
+          <button class="btn" id="btn-fm-keep">Keep Enabled</button>
+          <button class="btn btn-danger-ghost" id="btn-fm-disable">Disable File Manager</button>
+          <span class="mono-label" id="fm-idle-label"></span>
+        </div>
+      </div>
+      <div id="fm-warning" class="fm-state hidden">
+        <p class="warning">File Manager will be disabled in 2 minutes because it is inactive. <button class="btn" id="btn-fm-keep-warn">Keep Enabled</button> <button class="btn btn-danger-ghost" id="btn-fm-disable-now">Disable Now</button></p>
+      </div>
+      <div id="fm-failed" class="fm-state hidden">
+        <p class="error" id="fm-error-text"></p>
+        <button class="btn" id="btn-fm-retry">Retry</button>
+      </div>
+    </section>
   </main>
 
   <footer class="foot mono-label" id="foot-principal">wpfy panel</footer>
 </div>
 
 <div id="toast" class="toast hidden" role="status" aria-live="polite"></div>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js" crossorigin="anonymous"></script>
 <script src="/qrcode.min.js"></script>
 <script src="/panel.js"></script>
 </body>

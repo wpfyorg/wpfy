@@ -92,26 +92,18 @@ def validate_edge_bind(host) -> str:
         raise ValueError("panel edge bind must be an IP address") from exc
     if address.is_unspecified:
         raise ValueError("panel edge bind cannot be a wildcard address")
-
-    for raw_cidr in traefik.traefik_network_cidrs(PANEL_EDGE_NETWORK):
-        network = ipaddress.ip_network(raw_cidr, strict=False)
-        if address.version != network.version or address not in network:
-            continue
-        if address == network.network_address or (
-            network.version == 4 and address == network.broadcast_address
-        ):
-            break
-        return str(address)
-    raise ValueError(f"panel edge bind {host!r} is outside {PANEL_EDGE_NETWORK}")
+    if address.is_loopback:
+        raise ValueError("panel edge bind cannot be a loopback address")
+    return str(address)
 
 
 def edge_bind_address() -> str:
-    for raw_cidr in traefik.traefik_network_cidrs(PANEL_EDGE_NETWORK):
-        network = ipaddress.ip_network(raw_cidr, strict=False)
+    gateway = traefik._network_gateway(PANEL_EDGE_NETWORK)
+    if gateway is not None:
         try:
-            return validate_edge_bind(str(next(network.hosts())))
-        except (StopIteration, ValueError):
-            continue
+            return validate_edge_bind(gateway)
+        except ValueError:
+            pass
     raise RuntimeError(f"cannot determine a gateway address for {PANEL_EDGE_NETWORK}")
 
 

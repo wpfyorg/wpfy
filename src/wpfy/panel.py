@@ -1,22 +1,39 @@
 from __future__ import annotations
 
 import hmac
+import http.client
 import ipaddress
 import json
 import logging
+import os
 import re
 import secrets
 import subprocess
 import threading
+import time
 from dataclasses import asdict, dataclass, replace
+from datetime import datetime, timezone
+from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, quote, unquote, urlparse
 
-from . import __version__, events, files, metrics, operational_inspection, panel_auth, panel_jobs, panel_setup, sftp
+from . import __version__, certificate_lifecycle, events, files, metrics, operational_inspection, panel_auth, panel_jobs, panel_setup, sftp
 from . import site_cache, site_cron, site_database
 from . import site_configuration, site_lifecycle, site_security
 from .php_runtime import DEFAULT_PHP_VERSION, SUPPORTED_PHP_VERSIONS
+
+# Login Shield presentation labels (t17). Enforcement lives in
+# fail2ban_host.wordpress_auth_failregex(); this list only describes the
+# protected WordPress authentication surfaces for the panel Security tab.
+LOGIN_SHIELD_PROTECTED_SURFACES = (
+    "wp_login",
+    "xmlrpc",
+    "rest",
+    "password_reset",
+    "user_enum",
+    "app_password",
+)
 from .site_definition import (
     DNS_PROVIDERS,
     LETSENCRYPT_MODES,
@@ -49,6 +66,8 @@ from .site_runtime import (
     stop_site_runtime,
 )
 from . import panel_exposure, traefik
+from . import file_manager as panel_file_manager
+from .file_manager_providers import quantum as quantum_provider
 
 DEFAULT_PANEL_PORT = 8642
 PANEL_SOCKET_TIMEOUT = 30
@@ -59,9 +78,19 @@ _STATIC_TYPES = {
     ".js": "application/javascript; charset=utf-8",
     ".svg": "image/svg+xml",
 }
+_CLIENT_ROUTE_PREFIXES = (
+    "/dashboard",
+    "/sites",
+    "/site/",
+    "/events",
+    "/notifications",
+    "/account/",
+    "/admin/",
+)
 _LOG_SERVICES = {"web", "app", "db", "redis", "sftp"}
 _LOGGER = logging.getLogger(__name__)
 _MAX_BODY_BYTES = 64 * 1024
+_FM_PROXY_MAX_BODY = files.MAX_UPLOAD_BYTES  # ponytail: reuse existing upload ceiling
 _MAX_LOG_LINES = 2000
 RUN_TOKEN_ADMIN = "run-token-admin"
 _ALLOWED_PANEL_FLAVORS = frozenset({"php", "html", *WORDPRESS_FLAVORS})
@@ -71,7 +100,20 @@ _SITE_MANAGER_ALLOWED_ACTIONS = frozenset({
 })
 
 _TRUSTED_EDGE_LOCK = threading.Lock()
-_TRUSTED_EDGE_NETWORKS: tuple[str, ...] | None = None
+# Short TTL so a recreated Traefik with a new container IP is picked up by
+# the panel before the next failed-login attempt can be misclassified. A
+# failure is deliberately not cached: a transient Docker outage then degrades
+# to the shared bucket for one request instead of pinning that degradation for
+# the panel's lifetime.
+_TRUSTED_EDGE_TTL_SECONDS = 30
+_TRUSTED_EDGE_CACHE: tuple[tuple[str, ...], float] | None = None
+# Sentinel for a client address that cannot be determined (trusted edge with
+# no usable forwarded chain). The trusted proxy endpoints themselves are in
+# the never-ban set: recording the proxy's own IP as a client would let a
+# later fail2ban stage take the entire panel edge offline.
+_UNKNOWN_CLIENT = "0.0.0.0"
+_FM_PROXY_TICKETS: dict[str, tuple[str, str, float]] = {}
+_FM_PROXY_TICKETS_LOCK = threading.Lock()
 
 
 def _address_in_networks(address: object, networks: tuple[str, ...]) -> bool:
@@ -101,12 +143,15 @@ def resolve_client_address(peer: str, forwarded: object, trusted: tuple[str, ...
 
     Mirrors the site-level handling in `site_security` — trust only the edge,
     walk the chain right-to-left past our own hops (`real_ip_recursive`), and
-    fail closed to the peer when no edge is known.
+    fail closed to the peer when no edge is known. When the peer IS a trusted
+    edge but no untrusted client can be determined (no forwarded header, an
+    empty or malformed chain, or a chain of only trusted hops), resolve to the
+    unknown sentinel: the proxy's own address is never emitted as a client.
     """
     if not _address_in_networks(peer, trusted):
         return peer
     if not isinstance(forwarded, str):
-        return peer
+        return _UNKNOWN_CLIENT
     for candidate in reversed(forwarded.split(",")):
         candidate = candidate.strip()
         if not candidate:
@@ -117,27 +162,31 @@ def resolve_client_address(peer: str, forwarded: object, trusted: tuple[str, ...
             continue
         if not _address_in_networks(candidate, trusted):
             return candidate
-    return peer
+    return _UNKNOWN_CLIENT
 
 
 def trusted_edge_networks() -> tuple[str, ...]:
     """CIDRs whose peers may assert a forwarded client address.
 
     Consulted on every sign-in, and discovery shells out to Docker, so a
-    successful result is cached for the process. A failure is deliberately not
-    cached: a transient Docker outage then degrades to the shared bucket for one
-    request instead of pinning that degradation for the panel's lifetime.
+    successful result is cached for at most ``_TRUSTED_EDGE_TTL_SECONDS``
+    seconds (using ``time.monotonic`` so clock changes cannot extend the
+    cache). A failure is deliberately not cached: a transient Docker outage
+    then degrades to the shared bucket for one request instead of pinning that
+    degradation for the panel's lifetime, and the next request re-discovers.
     """
-    global _TRUSTED_EDGE_NETWORKS
+    global _TRUSTED_EDGE_CACHE
+    now = time.monotonic()
     with _TRUSTED_EDGE_LOCK:
-        if _TRUSTED_EDGE_NETWORKS is not None:
-            return _TRUSTED_EDGE_NETWORKS
+        cached = _TRUSTED_EDGE_CACHE
+        if cached is not None and cached[1] > now:
+            return cached[0]
     try:
         discovered = tuple(traefik.traefik_network_cidrs(panel_exposure.PANEL_EDGE_NETWORK))
     except (RuntimeError, OSError, ValueError, subprocess.SubprocessError):
         return ()
     with _TRUSTED_EDGE_LOCK:
-        _TRUSTED_EDGE_NETWORKS = discovered
+        _TRUSTED_EDGE_CACHE = (discovered, time.monotonic() + _TRUSTED_EDGE_TTL_SECONDS)
     return discovered
 
 
@@ -166,6 +215,13 @@ class RawBody:
 
 
 @dataclass(frozen=True, slots=True)
+class _FileManagerProxyResponse:
+    response: http.client.HTTPResponse
+    connection: http.client.HTTPConnection
+    headers: dict[str, str]
+
+
+@dataclass(frozen=True, slots=True)
 class Route:
     method: str
     pattern: re.Pattern[str]
@@ -174,16 +230,27 @@ class Route:
 
 
 class PanelError(Exception):
-    def __init__(self, status: int, message: str) -> None:
+    def __init__(self, status: int, message: str, headers: dict[str, str] | None = None) -> None:
         super().__init__(message)
         self.status = status
+        self.headers = headers or {}
 
 
 class _PanelHTTPServer(ThreadingHTTPServer):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # t19: reaper stop signal so a closed panel server never leaks a
+        # forever-looping daemon thread into the process (full-suite race).
+        self._reaper_stop = threading.Event()
+
     def get_request(self):
         request, client_address = super().get_request()
         request.settimeout(PANEL_SOCKET_TIMEOUT)
         return request, client_address
+
+    def server_close(self):
+        self._reaper_stop.set()
+        super().server_close()
 
 
 def generate_panel_token() -> str:
@@ -201,6 +268,76 @@ def validate_loopback_host(host: str) -> None:
         f"panel host must be a loopback address, got {host!r}; "
         "for remote access use an SSH tunnel: ssh -L <port>:127.0.0.1:<port> <server>"
     )
+
+
+def _idle_reap_once() -> None:
+    stopped = 0
+    for entry in list_sites():
+        if stopped >= 5:
+            break
+        try:
+            domain = entry["domain"]
+            state = panel_file_manager.get_file_manager_state(domain)
+            if state.state not in {"ready", "idle-warning"} or not state.idle_expires_at:
+                continue
+            if datetime.fromisoformat(state.idle_expires_at).timestamp() >= datetime.now(timezone.utc).timestamp():
+                continue
+            with panel_file_manager._get_lock(domain):
+                state = panel_file_manager.get_file_manager_state(domain)
+                if state.state not in {"ready", "idle-warning"} or not state.idle_expires_at:
+                    continue
+                if datetime.fromisoformat(state.idle_expires_at).timestamp() >= datetime.now(timezone.utc).timestamp():
+                    continue
+            panel_file_manager.disable_file_manager(domain, quantum_provider)
+            events.record_event("file_manager.auto_stopped", domain=domain, actor="system")
+            stopped += 1
+        except Exception:  # noqa: BLE001, BROAD_EXCEPT_OK
+            _LOGGER.exception("file-manager idle reap failed")
+
+
+def _idle_reap_loop(stop_event: threading.Event) -> None:
+    while not stop_event.is_set():
+        try:
+            _idle_reap_once()
+        except Exception:  # noqa: BLE001, BROAD_EXCEPT_OK
+            _LOGGER.exception("file-manager idle reaper tick failed")
+        stop_event.wait(30)
+
+
+def _rediscover_file_managers() -> None:
+    if runtime_skip_requested():
+        return
+    try:
+        result = subprocess.run(
+            ["docker", "ps", "--format", '{{.Label "wpfy.site"}}', "--filter", "label=wpfy.kind=file-manager"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        _LOGGER.warning("file-manager rediscovery failed: %s", exc)
+        return
+    if result.returncode != 0:
+        _LOGGER.warning("file-manager rediscovery returned status %s", result.returncode)
+        return
+    known_domains = {entry["domain"] for entry in list_sites() if "domain" in entry}
+    for domain in set(result.stdout.splitlines()) & known_domains:
+        try:
+            if panel_file_manager.get_file_manager_state(domain).state in {"starting", "failed"}:
+                panel_file_manager.mark_ready(domain)
+        except Exception:  # noqa: BLE001, BROAD_EXCEPT_OK
+            _LOGGER.exception("file-manager rediscovery state update failed")
+
+
+def _revoke_fm_for_logout(domain: str, username: str) -> None:
+    try:
+        holders = panel_file_manager.lease_holder_usernames(domain)
+        if username in holders and len(holders) <= 1:
+            panel_file_manager.disable_file_manager(domain, quantum_provider)
+            events.record_event("file_manager.stopped", domain=domain, actor=username)
+    except Exception:  # noqa: BLE001, BROAD_EXCEPT_OK
+        _LOGGER.exception("file-manager logout revocation failed")
 
 
 def _run_token_principal() -> dict[str, object]:
@@ -221,6 +358,33 @@ def _principal_username(principal) -> str:
 
 def _principal_is_manager(principal) -> bool:
     return isinstance(principal, dict) and principal.get("role") == panel_auth.ROLE_SITE_MANAGER
+
+
+def _assert_same_origin(headers, host_header: str) -> None:
+    try:
+        request_host = urlparse(f"//{host_header}").hostname
+    except ValueError:
+        request_host = None
+    origin = headers.get("Origin")
+    referer = headers.get("Referer")
+    if origin is not None:
+        try:
+            parsed = urlparse(origin)
+        except ValueError:
+            raise PanelError(403, "cross-origin request denied") from None
+        if parsed.scheme not in {"http", "https"} or parsed.hostname is None or request_host is None:
+            raise PanelError(403, "cross-origin request denied")
+        if parsed.hostname.lower() != request_host.lower():
+            raise PanelError(403, "cross-origin request denied")
+    elif referer is not None:
+        try:
+            parsed = urlparse(referer)
+        except ValueError:
+            raise PanelError(403, "cross-origin request denied") from None
+        if parsed.hostname is None or request_host is None:
+            raise PanelError(403, "cross-origin request denied")
+        if parsed.hostname.lower() != request_host.lower():
+            raise PanelError(403, "cross-origin request denied")
 
 
 def authorize(principal, meta: RouteMeta, domain: str | None) -> None:
@@ -249,6 +413,52 @@ def _known_domain(domain: str) -> str:
     if not site_exists(domain):
         raise PanelError(404, f"site not found: {domain}")
     return domain
+
+
+def _file_manager_enabled() -> bool:
+    return os.environ.get("WPFY_FM_ENABLED", "0") == "1"
+
+
+def _file_manager_gate() -> None:
+    if not _file_manager_enabled():
+        raise PanelError(404, "file manager disabled")
+
+
+def _file_manager_error(exc: panel_file_manager.FileManagerError) -> tuple[int, dict]:
+    messages = {
+        "site_not_found": "site not found",
+        "app_dir_missing": "application directory unavailable",
+        "limit_reached": panel_file_manager._LIMIT_MESSAGE,
+        "config_failed": "file manager failed to start",
+        "start_failed": "file manager failed to start",
+        "health_failed": "file manager failed to start",
+    }
+    status = 429 if exc.code == "limit_reached" else 404 if exc.code == "site_not_found" else 500
+    return status, {"state": "failed", "error": {"code": exc.code, "message": messages.get(exc.code, "file manager failed")}}
+
+
+def _file_manager_cookie(domain: str, username: str) -> str:
+    token = secrets.token_urlsafe(32)
+    with _FM_PROXY_TICKETS_LOCK:
+        now = time.time()
+        _FM_PROXY_TICKETS.update({key: value for key, value in _FM_PROXY_TICKETS.items() if value[2] > now})
+        _FM_PROXY_TICKETS[token] = (domain, username, now + 60)
+    return f"wpfy_fm={token}; Path=/api/sites/{domain}/file-manager/proxy/; HttpOnly; SameSite=Strict; Max-Age=60"
+
+
+def _validate_file_manager_cookie(headers, domain: str, username: str) -> None:
+    cookie = SimpleCookie()
+    cookie.load(headers.get("Cookie", ""))
+    morsel = cookie.get("wpfy_fm")
+    token = morsel.value if morsel is not None else ""
+    with _FM_PROXY_TICKETS_LOCK:
+        now = time.time()
+        expired = [key for key, value in _FM_PROXY_TICKETS.items() if value[2] <= now]
+        for key in expired:
+            _FM_PROXY_TICKETS.pop(key, None)
+        ticket = _FM_PROXY_TICKETS.get(token)
+    if ticket is None or ticket[0] != domain or ticket[1] != username:
+        raise PanelError(403, "file manager proxy session required")
 
 
 def _runtime_payload(result: RuntimeResult) -> dict:
@@ -839,6 +1049,9 @@ def _security_state_payload(domain: str, config: dict | None = None) -> dict:
         "basic_auth": dict(config["basic_auth"]),
         "cloudflare_only": config["cloudflare_only"],
         "login_rate_limit": config["login_rate_limit"],
+        "fail2ban": config["fail2ban"] is True,
+        "login_shield": site_security.login_shield_status(domain),
+        "protected_surfaces": list(LOGIN_SHIELD_PROTECTED_SURFACES),
         "snippet_path": str(nginx_dir(domain) / "extra" / site_security.SECURITY_SNIPPET),
         "rate_limit_path": str(nginx_dir(domain) / site_security.RATELIMIT_SNIPPET),
         "trusted_edge_sources": list(dict.fromkeys(trusted_sources)),
@@ -868,6 +1081,9 @@ def _security_changes(current: dict, desired: dict, *, basic_auth_requested: boo
     if current["login_rate_limit"] != desired["login_rate_limit"]:
         state = "enable" if desired["login_rate_limit"] else "disable"
         changes.append(f"{state} WordPress login rate limit")
+    if current["fail2ban"] != desired["fail2ban"]:
+        state = "enable" if desired["fail2ban"] else "disable"
+        changes.append(f"{state} WordPress fail2ban login shield")
     return changes
 
 
@@ -879,14 +1095,14 @@ def _put_security(principal, match, query, body):
     domain = _known_domain(match.group("domain"))
     allowed = {
         "deny_ips", "ua_blocks", "basic_auth", "cloudflare_only", "login_rate_limit",
-        "dry_run", "acknowledge_warnings",
+        "fail2ban", "dry_run", "acknowledge_warnings",
     }
     if any(key not in allowed for key in body):
         raise PanelError(400, "security update contains an unsupported field")
     for key in ("dry_run", "acknowledge_warnings"):
         if key in body and not isinstance(body[key], bool):
             raise PanelError(400, f"{key} must be a boolean")
-    requested = {"deny_ips", "ua_blocks", "basic_auth", "cloudflare_only", "login_rate_limit"} & set(body)
+    requested = {"deny_ips", "ua_blocks", "basic_auth", "cloudflare_only", "login_rate_limit", "fail2ban"} & set(body)
     if not requested:
         raise PanelError(400, "security update requires at least one security field")
 
@@ -897,6 +1113,7 @@ def _put_security(principal, match, query, body):
         "basic_auth": body.get("basic_auth", current["basic_auth"]),
         "cloudflare_only": body.get("cloudflare_only", current["cloudflare_only"]),
         "login_rate_limit": body.get("login_rate_limit", current["login_rate_limit"]),
+        "fail2ban": body.get("fail2ban", current["fail2ban"]),
     }
     basic_auth = desired["basic_auth"]
     if not isinstance(basic_auth, dict):
@@ -961,7 +1178,7 @@ def _put_security(principal, match, query, body):
     if (
         not list_changed
         and {"deny_ips", "ua_blocks"}.intersection(requested)
-        and not {"basic_auth", "cloudflare_only", "login_rate_limit"}.intersection(requested)
+        and not {"basic_auth", "cloudflare_only", "login_rate_limit", "fail2ban"}.intersection(requested)
     ):
         results.append(site_security.apply_security_runtime(domain))
     if "basic_auth" in body:
@@ -975,6 +1192,8 @@ def _put_security(principal, match, query, body):
         results.append(site_security.set_cloudflare_only(domain, desired["cloudflare_only"]))
     if "login_rate_limit" in body:
         results.append(site_security.set_login_rate_limit(domain, desired["login_rate_limit"]))
+    if "fail2ban" in body:
+        results.append(site_security.set_fail2ban(domain, desired["fail2ban"]))
 
     failed = next((result for result in results if result.exit_code != 0), None)
     payload = {
@@ -1220,11 +1439,16 @@ def _get_setup_status(principal, match, query, body):
 def _post_setup(principal, match, query, body):
     client = body.pop("_socket_client", None)
     edge_bind = body.pop("_edge_bind", False) is True
+    setup_username = body.get("username", "") if isinstance(body.get("username"), str) else ""
     try:
         token, user = panel_setup.create_account(body, client=client, edge_bind=edge_bind)
     except panel_auth.ClientThrottleError as exc:
-        raise PanelError(429, str(exc)) from exc
+        panel_auth._append_panel_auth_failure("setup", client, setup_username, "throttled")
+        retry_after = panel_auth.client_retry_after(client)
+        headers = {"Retry-After": str(retry_after)} if retry_after > 0 else {}
+        raise PanelError(429, str(exc), headers) from exc
     except ValueError as exc:
+        panel_auth._append_panel_auth_failure("setup", client, setup_username, "invalid_credentials")
         status = 403 if edge_bind else 400
         raise PanelError(status, str(exc)) from exc
     return 201, {
@@ -1250,6 +1474,8 @@ def _post_setup_totp(principal, match, query, body):
         try:
             panel_auth.complete_totp_enrollment(username, body.get("code"))
         except ValueError as exc:
+            client = body.get("_socket_client")
+            panel_auth._append_panel_auth_failure("setup_totp", client, username, "totp_failed")
             raise PanelError(400, str(exc)) from exc
         panel_auth.finish_setup_session(principal.get("_session_token"))
         events.record_event("panel.totp.enrolled", actor=username)
@@ -1272,7 +1498,9 @@ def _post_auth_login(principal, match, query, body):
     result = panel_auth.login(body.get("username"), body.get("password"), body.get("totp"), client=client)
     if result is None:
         if panel_auth.client_throttled(client):
-            raise PanelError(429, "too many failed login attempts; try again later")
+            retry_after = panel_auth.client_retry_after(client)
+            headers = {"Retry-After": str(retry_after)} if retry_after > 0 else {}
+            raise PanelError(429, "too many failed login attempts; try again later", headers)
         raise PanelError(401, "invalid credentials")
     token, user = result
     return 200, {
@@ -1284,7 +1512,17 @@ def _post_auth_login(principal, match, query, body):
 
 
 def _post_auth_logout(principal, match, query, body):
+    username = principal.get("username") if isinstance(principal, dict) else None
     panel_auth.logout(principal.get("_session_token") if isinstance(principal, dict) else None)
+    if isinstance(username, str):
+        for entry in list_sites():
+            domain = entry.get("domain")
+            if isinstance(domain, str):
+                threading.Thread(
+                    target=_revoke_fm_for_logout,
+                    args=(domain, username),
+                    daemon=True,
+                ).start()
     return 200, {"ok": True}
 
 
@@ -1595,6 +1833,163 @@ def _post_wp(principal, match, query, body): return api_site_wp(match.group("dom
 def _post_config(principal, match, query, body): return api_site_config(match.group("domain"), body)
 
 
+def _post_ssl_preflight(principal, match, query, body):
+    domain = match.group("domain")
+    _known_domain(domain)
+    result = certificate_lifecycle.preflight_ssl(domain)
+    return 200, {
+        "domain": result.domain,
+        "passed": result.passed,
+        "mode": result.mode,
+        "message": result.message,
+        "a_records": list(result.a_records),
+        "aaaa_records": list(result.aaaa_records),
+        "public_ipv4": list(result.public_ipv4),
+        "public_ipv6": list(result.public_ipv6),
+    }
+
+
+def _get_admin_file_managers(principal, match, query, body):
+    _file_manager_gate()
+    from .site_layout import list_sites as _list_site_dirs
+    domains = _list_site_dirs()
+    result = []
+    for entry in domains:
+        try:
+            domain = entry["domain"]
+            state = panel_file_manager.get_file_manager_state(domain)
+            if state.state in ("ready", "starting", "idle-warning"):
+                result.append({
+                    "domain": domain,
+                    "state": state.state,
+                    "provider": state.provider,
+                    "enabled_at": state.enabled_at,
+                    "last_lease_at": state.last_lease_at,
+                    "idle_expires_at": state.idle_expires_at,
+                    "active_leases": state.active_leases,
+                    "health": state.health,
+                })
+        except (KeyError, OSError, TypeError, ValueError):
+            continue
+    return 200, result
+
+
+# ---- file-manager routes ----
+
+def _get_file_manager_status(principal, match, query, body):
+    _file_manager_gate()
+    domain = match.group("domain")
+    _known_domain(domain)
+    state = panel_file_manager.get_file_manager_state(domain)
+    return 200, {
+        "state": state.state,
+        "provider": state.provider,
+        "health": state.health,
+        "enabled_at": state.enabled_at,
+        "last_lease_at": state.last_lease_at,
+        "idle_expires_at": state.idle_expires_at,
+        "active_leases": state.active_leases,
+        "error": state.error,
+    }
+
+
+def _post_file_manager_enable(principal, match, query, body):
+    _file_manager_gate()
+    domain = match.group("domain")
+    _known_domain(domain)
+    username = _principal_username(principal)
+    if not panel_auth.fm_enable_allowed(username):
+        return 429, {"error": "file manager enable rate limit reached; try again later"}
+    try:
+        result = panel_file_manager.enable_file_manager(domain, username, quantum_provider)
+    except panel_file_manager.FileManagerError as exc:
+        return _file_manager_error(exc)
+    panel_auth.register_fm_enable(username)
+    return 200, result, {"Set-Cookie": _file_manager_cookie(domain, username)}
+
+
+def _post_file_manager_lease(principal, match, query, body):
+    _file_manager_gate()
+    domain = match.group("domain")
+    _known_domain(domain)
+    state = panel_file_manager.get_file_manager_state(domain)
+    if state.state != "ready":
+        raise PanelError(409, "file manager is not ready")
+    username = _principal_username(principal)
+    try:
+        result = panel_file_manager.create_lease(domain, username)
+    except panel_file_manager.FileManagerError as exc:
+        return _file_manager_error(exc)
+    return 200, result, {"Set-Cookie": _file_manager_cookie(domain, username)}
+
+
+def _delete_file_manager(principal, match, query, body):
+    _file_manager_gate()
+    domain = match.group("domain")
+    _known_domain(domain)
+    try:
+        result = panel_file_manager.disable_file_manager(domain, quantum_provider)
+    except panel_file_manager.FileManagerError as exc:
+        return _file_manager_error(exc)
+    return 200, result
+
+
+def _delete_file_manager_metadata(principal, match, query, body):
+    _file_manager_gate()
+    domain = _known_domain(match.group("domain"))
+    if body.get("confirm") != "reset file manager metadata":
+        raise PanelError(400, "metadata reset requires confirmation")
+    quantum_provider.reset_metadata(domain)
+    events.record_event("file_manager.reset", domain=domain, actor=_principal_username(principal))
+    return 200, {"ok": True}
+
+
+def _proxy_file_manager(request, principal, match, query, body):
+    _file_manager_gate()
+    domain = _known_domain(match.group("domain"))
+    _validate_file_manager_cookie(request.headers, domain, _principal_username(principal))
+    port = quantum_provider.provider_port(domain)
+    upstream_path = "/" + unquote(match.group("path")).lstrip("/")
+    parsed_query = urlparse(request.path).query
+    if parsed_query:
+        upstream_path += "?" + parsed_query
+    connection = http.client.HTTPConnection("127.0.0.1", port, timeout=PANEL_SOCKET_TIMEOUT)
+    try:
+        connection.putrequest(request.command, upstream_path, skip_host=True, skip_accept_encoding=True)
+        forwarded = {"content-type", "content-length", "content-disposition", "range"}
+        forwarded.update(name for name in request.headers if name.lower().startswith("if-"))
+        for name, value in request.headers.items():
+            lower = name.lower()
+            if lower in forwarded:
+                connection.putheader(name, value)
+        connection.putheader("X-Forwarded-User", _principal_username(principal))
+        connection.putheader("X-Forwarded-Proto", "http")
+        connection.endheaders()
+        if isinstance(body, RawBody):
+            remaining = body.content_length
+            while remaining:
+                chunk = body.stream.read(min(1024 * 1024, remaining))
+                if not chunk:
+                    break
+                connection.send(chunk)
+                remaining -= len(chunk)
+        response = connection.getresponse()
+    except (http.client.HTTPException, OSError, TimeoutError):
+        connection.close()
+        raise PanelError(502, "file manager proxy unavailable") from None
+    response_headers = {}
+    for name in ("Content-Type", "Content-Length", "Content-Disposition"):
+        value = response.getheader(name)
+        if value is not None:
+            response_headers[name] = value
+    location = response.getheader("Location")
+    if location is not None:
+        response_headers["Location"] = location.replace(
+            f"http://127.0.0.1:{port}", f"/api/sites/{domain}/file-manager/proxy",
+        )
+    return response.status, _FileManagerProxyResponse(response, connection, response_headers)
+
+
 _SETUP_ROUTES = (
     Route("GET", re.compile(r"^/api/setup/status$"), _get_setup_status, RouteMeta("setup.status", "setup")),
     Route("POST", re.compile(r"^/api/setup$"), _post_setup, RouteMeta("setup.create", "setup", True)),
@@ -1692,6 +2087,16 @@ _ROUTES = (
     Route("POST", re.compile(r"^/api/sites/(?P<domain>[^/]+)/files/rename$"), _post_file_rename, RouteMeta("site.files.rename", "site", True)),
     Route("POST", re.compile(r"^/api/sites/(?P<domain>[^/]+)/files/chmod$"), _post_file_chmod, RouteMeta("site.files.chmod", "site", True)),
     Route("DELETE", re.compile(r"^/api/sites/(?P<domain>[^/]+)/files$"), _delete_file, RouteMeta("site.files.delete", "site", True, True)),
+    Route("GET", re.compile(r"^/api/sites/(?P<domain>[^/]+)/file-manager$"), _get_file_manager_status, RouteMeta("file_manager.status", "site")),
+    Route("POST", re.compile(r"^/api/sites/(?P<domain>[^/]+)/file-manager/enable$"), _post_file_manager_enable, RouteMeta("file_manager.enable", "site", True)),
+    Route("POST", re.compile(r"^/api/sites/(?P<domain>[^/]+)/file-manager/lease$"), _post_file_manager_lease, RouteMeta("file_manager.lease", "site", True)),
+    Route("DELETE", re.compile(r"^/api/sites/(?P<domain>[^/]+)/file-manager/metadata$"), _delete_file_manager_metadata, RouteMeta("file_manager.metadata_reset", "system", True, True)),
+    Route("GET", re.compile(r"^/api/sites/(?P<domain>[^/]+)/file-manager/proxy/(?P<path>.*)$"), _proxy_file_manager, RouteMeta("file_manager.proxy", "site", raw_body=True, max_body=_FM_PROXY_MAX_BODY)),
+    Route("POST", re.compile(r"^/api/sites/(?P<domain>[^/]+)/file-manager/proxy/(?P<path>.*)$"), _proxy_file_manager, RouteMeta("file_manager.proxy", "site", mutates=True, raw_body=True, max_body=_FM_PROXY_MAX_BODY)),
+    Route("PUT", re.compile(r"^/api/sites/(?P<domain>[^/]+)/file-manager/proxy/(?P<path>.*)$"), _proxy_file_manager, RouteMeta("file_manager.proxy", "site", mutates=True, raw_body=True, max_body=_FM_PROXY_MAX_BODY)),
+    Route("PATCH", re.compile(r"^/api/sites/(?P<domain>[^/]+)/file-manager/proxy/(?P<path>.*)$"), _proxy_file_manager, RouteMeta("file_manager.proxy", "site", mutates=True, raw_body=True, max_body=_FM_PROXY_MAX_BODY)),
+    Route("DELETE", re.compile(r"^/api/sites/(?P<domain>[^/]+)/file-manager/proxy/(?P<path>.*)$"), _proxy_file_manager, RouteMeta("file_manager.proxy", "site", mutates=True, raw_body=True, max_body=_FM_PROXY_MAX_BODY)),
+    Route("DELETE", re.compile(r"^/api/sites/(?P<domain>[^/]+)/file-manager$"), _delete_file_manager, RouteMeta("file_manager.disable", "site", True)),
     Route(
         "POST", re.compile(r"^/api/sites/(?P<domain>[^/]+)/databases$"),
         _post_database, RouteMeta("site.database.create", "site", True),
@@ -1754,6 +2159,8 @@ _ROUTES = (
     ),
     Route("POST", re.compile(r"^/api/sites/(?P<domain>[^/]+)/wp$"), _post_wp, RouteMeta("site.wp", "site", True)),
     Route("POST", re.compile(r"^/api/sites/(?P<domain>[^/]+)/config$"), _post_config, RouteMeta("site.config", "site", True)),
+    Route("POST", re.compile(r"^/api/sites/(?P<domain>[^/]+)/ssl/preflight$"), _post_ssl_preflight, RouteMeta("site.ssl.preflight", "site", True)),
+    Route("GET", re.compile(r"^/api/admin/file-managers$"), _get_admin_file_managers, RouteMeta("file_manager.admin_list", "system")),
     # Logout invalidates its caller's credential, so keep it terminal among declarative routes.
     Route("POST", re.compile(r"^/api/auth/logout$"), _post_auth_logout, RouteMeta("auth.logout", "session", True)),
 )
@@ -1784,7 +2191,7 @@ def make_panel_handler(config: PanelConfig) -> type[BaseHTTPRequestHandler]:
             if unread:
                 self.close_connection = True
 
-        def _send_json(self, status: int, payload: dict) -> None:
+        def _send_json(self, status: int, payload: dict, headers: dict[str, str] | None = None) -> None:
             self._close_if_body_unread()
             data = json.dumps(payload).encode("utf-8")
             self.send_response(status)
@@ -1792,10 +2199,32 @@ def make_panel_handler(config: PanelConfig) -> type[BaseHTTPRequestHandler]:
             self.send_header("Content-Length", str(len(data)))
             self.send_header("Cache-Control", "no-store")
             self.send_header("X-Content-Type-Options", "nosniff")
+            for name, value in (headers or {}).items():
+                self.send_header(name, value)
             if self.close_connection:
                 self.send_header("Connection", "close")
             self.end_headers()
             self.wfile.write(data)
+
+        def _send_file_manager_proxy(self, status: int, proxy: _FileManagerProxyResponse) -> None:
+            self._close_if_body_unread()
+            self.send_response(status)
+            for name, value in proxy.headers.items():
+                self.send_header(name, value)
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            if self.close_connection:
+                self.send_header("Connection", "close")
+            self.end_headers()
+            try:
+                while True:
+                    chunk = proxy.response.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+            finally:
+                proxy.response.close()
+                proxy.connection.close()
 
         def _send_download(self, status: int, download: files.Download) -> None:
             self._close_if_body_unread()
@@ -1886,7 +2315,10 @@ def make_panel_handler(config: PanelConfig) -> type[BaseHTTPRequestHandler]:
             except ValueError:
                 self._send_json(404, {"error": "not found"}); return
             if not target.is_file():
-                self._send_json(404, {"error": "not found"}); return
+                if path.startswith(_CLIENT_ROUTE_PREFIXES):
+                    target = STATIC_DIR / "index.html"
+                else:
+                    self._send_json(404, {"error": "not found"}); return
             content_type = _STATIC_TYPES.get(target.suffix)
             if content_type is None:
                 self._send_json(404, {"error": "not found"}); return
@@ -1897,7 +2329,7 @@ def make_panel_handler(config: PanelConfig) -> type[BaseHTTPRequestHandler]:
             self.send_header("Content-Length", str(len(data)))
             self.send_header("X-Content-Type-Options", "nosniff")
             if content_type.startswith("text/html"):
-                self.send_header("Content-Security-Policy", "default-src 'self'; img-src 'self' data:; frame-ancestors 'none'")
+                self.send_header("Content-Security-Policy", "default-src 'self'; img-src 'self' data:; frame-ancestors 'self'; frame-src 'self'")
             if self.close_connection:
                 self.send_header("Connection", "close")
             self.end_headers(); self.wfile.write(data)
@@ -1913,6 +2345,8 @@ def make_panel_handler(config: PanelConfig) -> type[BaseHTTPRequestHandler]:
                     ),
                     None,
                 )
+                if route is not None and route.meta.action.startswith("site.files.") and os.environ.get("WPFY_FM_LEGACY_API", "1") != "1":
+                    raise PanelError(404, "file manager legacy api disabled")
                 principal = None if route is not None and route.meta.scope == "public" else self._authenticate()
                 if principal is None and (route is None or route.meta.scope != "public"):
                     raise PanelError(401, "missing or invalid token")
@@ -1922,6 +2356,10 @@ def make_panel_handler(config: PanelConfig) -> type[BaseHTTPRequestHandler]:
                 domain = match.groupdict().get("domain") if match else None
                 if route.meta.scope != "public":
                     authorize(principal, route.meta, domain)
+                if route.meta.action.startswith("file_manager."):
+                    _file_manager_gate()
+                if route.meta.mutates:
+                    _assert_same_origin(self.headers, self.headers.get("Host", ""))
                 if route.meta.scope == "setup" and panel_auth.login_required():
                     raise PanelError(410, "first-run setup is permanently closed")
                 if route.meta.scope == "setup-session" and (
@@ -1929,12 +2367,12 @@ def make_panel_handler(config: PanelConfig) -> type[BaseHTTPRequestHandler]:
                 ):
                     raise PanelError(410, "setup enrollment is no longer available")
                 if route.meta.raw_body:
-                    body = self._read_raw_body(route.meta.max_body)
+                    body = RawBody(self.rfile, 0) if route.meta.action == "file_manager.proxy" and method == "GET" else self._read_raw_body(route.meta.max_body)
                 elif method in {"POST", "PUT", "DELETE"}:
                     body = self._read_body(route.meta.max_body)
                 else:
                     body = {}
-                if route.meta.action in {"auth.login", "setup.create"}:
+                if route.meta.action in {"auth.login", "setup.create", "setup.totp"}:
                     body["_socket_client"] = resolve_client_address(
                         self.client_address[0],
                         self.headers.get("X-Forwarded-For"),
@@ -1942,7 +2380,15 @@ def make_panel_handler(config: PanelConfig) -> type[BaseHTTPRequestHandler]:
                     )
                 if route.meta.action in {"setup.status", "setup.create"}:
                     body["_edge_bind"] = config.edge_bind
-                status, payload = route.handler(principal, match, parse_qs(parsed.query), body)
+                if route.meta.action == "file_manager.proxy":
+                    result = route.handler(self, principal, match, parse_qs(parsed.query), body)
+                else:
+                    result = route.handler(principal, match, parse_qs(parsed.query), body)
+                response_headers = None
+                if len(result) == 3:
+                    status, payload, response_headers = result
+                else:
+                    status, payload = result
                 preview_response = isinstance(payload, dict) and (
                     payload.get("dry_run") is True or payload.get("acknowledgement_required") is True
                 )
@@ -1958,7 +2404,7 @@ def make_panel_handler(config: PanelConfig) -> type[BaseHTTPRequestHandler]:
                     )
                     events.record_event(route.meta.action, domain=domain, actor=actor)
             except PanelError as exc:
-                self._send_json(exc.status, {"error": str(exc)}); return
+                self._send_json(exc.status, {"error": str(exc)}, exc.headers); return
             except (FileNotFoundError, ValueError) as exc:
                 self._send_json(400, {"error": str(exc)}); return
             except (OSError, subprocess.SubprocessError) as exc:
@@ -1966,13 +2412,15 @@ def make_panel_handler(config: PanelConfig) -> type[BaseHTTPRequestHandler]:
             except Exception:
                 _LOGGER.exception("unhandled panel API error")
                 self._send_json(500, {"error": "internal server error"}); return
-            if isinstance(payload, files.Download):
+            if isinstance(payload, _FileManagerProxyResponse):
+                self._send_file_manager_proxy(status, payload)
+            elif isinstance(payload, files.Download):
                 try:
                     self._send_download(status, payload)
                 finally:
                     payload.stream.close()
             else:
-                self._send_json(status, payload)
+                self._send_json(status, payload, response_headers)
 
         def do_GET(self) -> None:
             if urlparse(self.path).path.startswith("/api/"): self._handle_api("GET")
@@ -1988,6 +2436,10 @@ def make_panel_handler(config: PanelConfig) -> type[BaseHTTPRequestHandler]:
 
         def do_DELETE(self) -> None:
             if urlparse(self.path).path.startswith("/api/"): self._handle_api("DELETE")
+            else: self._send_json(404, {"error": "not found"})
+
+        def do_PATCH(self) -> None:
+            if urlparse(self.path).path.startswith("/api/"): self._handle_api("PATCH")
             else: self._send_json(404, {"error": "not found"})
 
     return PanelHandler
@@ -2008,8 +2460,15 @@ def make_panel_server(config: PanelConfig) -> ThreadingHTTPServer:
         panel_exposure.validate_edge_bind(config.host)
     else:
         validate_loopback_host(config.host)
+    _rediscover_file_managers()
     server = _PanelHTTPServer((config.host, config.port), make_panel_handler(config))
     server.daemon_threads = True
+    threading.Thread(
+        target=_idle_reap_loop,
+        args=(server._reaper_stop,),
+        name="wpfy-fm-reaper",
+        daemon=True,
+    ).start()
     return server
 
 

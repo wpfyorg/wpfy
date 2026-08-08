@@ -10,6 +10,15 @@ from pathlib import Path
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _offline_never_ban(monkeypatch):
+    # The emission guard discovers never-ban edge addresses from Docker on
+    # first failure; keep every test deterministic and offline.
+    import wpfy.panel_auth as panel_auth
+
+    monkeypatch.setattr(panel_auth, "_discover_never_ban_edge_cidrs", lambda: ())
+
+
 @pytest.fixture
 def auth_home(tmp_path, monkeypatch):
     import wpfy.panel_auth as panel_auth

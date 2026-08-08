@@ -2,21 +2,27 @@ from __future__ import annotations
 
 import base64
 from contextlib import contextmanager
+from datetime import datetime, timezone
 import fcntl
 import hashlib
 import hmac
+import ipaddress
 import json
+import math
 import os
 import re
 import secrets
+import shutil
+import stat
 import struct
+import subprocess
 import threading
 import time
 from dataclasses import dataclass, replace
 from pathlib import Path
 from urllib.parse import quote
 
-from . import events, settings
+from . import cloudflare_ranges, events, settings, traefik
 from .site_paths import validate_domain
 
 ROLE_ADMIN = "admin"
@@ -27,6 +33,8 @@ SESSION_IDLE_SECONDS = 30 * 60
 SESSION_ABSOLUTE_SECONDS = 12 * 60 * 60
 MAX_LOGIN_FAILURES = 5
 LOCKOUT_SECONDS = 5 * 60
+MAX_FM_ENABLE = 5
+FM_ENABLE_WINDOW_SECONDS = 5 * 60
 MAX_CLIENT_FAILURES = 10
 CLIENT_COOLDOWN_SECONDS = 60
 TOTP_STEP_SECONDS = 30
@@ -41,6 +49,31 @@ _TOTP_SECRET_BYTES = 20
 _USERNAME = re.compile(r"^[A-Za-z0-9_.@-]{1,64}$")
 _DUMMY_SALT = b"wpfy-panel-auth-dummy-salt"
 _STATE_LOCK = threading.RLock()
+_AUTH_LOG_LOCK = threading.Lock()
+
+# Sentinel for a client address that cannot be determined (trusted edge with
+# no usable forwarded chain) or that must never be written as a bannable
+# identity. Banning 0.0.0.0 is a no-op in iptables, so keeping the record
+# preserves observability without any self-DoS hazard.
+UNKNOWN_CLIENT = "0.0.0.0"
+
+# Never-ban static members: the sentinel itself, loopback (already in the
+# fail2ban safe allowlist), and the default Docker bridge subnet (a container
+# on a shared bridge is never a client worth banning). Not broadened to all
+# private networks, per plan.
+_NEVER_BAN_STATIC_CIDRS = ("0.0.0.0/32", "127.0.0.0/8", "::1/128", "172.17.0.0/16")
+
+# Discovered never-ban members (Traefik edge endpoints + panel backend) are
+# cached with a short monotonic TTL, mirroring `panel.trusted_edge_networks`.
+# A discovery failure is deliberately not cached.
+_NEVER_BAN_EDGE_LOCK = threading.Lock()
+_NEVER_BAN_EDGE_TTL_SECONDS = 30
+_NEVER_BAN_EDGE_CACHE: tuple[tuple[str, ...], float] | None = None
+
+_PANEL_AUTH_LOG_MAX_BYTES = int(
+    os.environ.get("WPFY_PANEL_AUTH_LOG_MAX_BYTES", str(10 * 1024 * 1024))
+)
+_PANEL_AUTH_LOG_KEEP = 3
 
 
 @dataclass(frozen=True, slots=True)
@@ -71,6 +104,7 @@ class ClientFailure:
 _SESSIONS: dict[str, Session] = {}
 _LOGIN_FAILURES: dict[str, LoginFailure] = {}
 _CLIENT_FAILURES: dict[str, ClientFailure] = {}
+_FM_ENABLE: dict[str, list[float]] = {}
 _LAST_TOTP_STEPS: dict[str, int] = {}
 _PENDING_TOTP: dict[str, str] = {}
 _PENDING_TOTP_DISCLOSED: set[str] = set()
@@ -82,6 +116,214 @@ class UserStoreError(ValueError):
 
 def users_path() -> Path:
     return Path(settings.PATHS.config_dir) / "panel-users.json"
+
+
+def panel_auth_log_path() -> Path:
+    """Return the path to the dedicated panel authentication failure log."""
+    return Path(settings.PATHS.log_dir) / "panel-auth.log"
+
+
+def _normalize_client_ip(value: object) -> str:
+    """Normalize a client IP address string; return the sentinel for anything unparseable."""
+    if not isinstance(value, str) or not value:
+        return UNKNOWN_CLIENT
+    truncated = value[:64]
+    try:
+        return str(ipaddress.ip_address(truncated))
+    except (ValueError, TypeError):
+        return UNKNOWN_CLIENT
+
+
+def _address_in_networks(address: str, networks: tuple[str, ...]) -> bool:
+    try:
+        parsed = ipaddress.ip_address(address)
+    except ValueError:
+        return False
+    for raw in networks:
+        try:
+            network = ipaddress.ip_network(raw, strict=False)
+        except ValueError:
+            continue
+        if parsed.version == network.version and parsed in network:
+            return True
+    return False
+
+
+def _discover_never_ban_edge_cidrs() -> tuple[str, ...]:
+    """Traefik edge endpoints (both networks) plus the panel backend address.
+
+    Successful discovery is cached for at most ``_NEVER_BAN_EDGE_TTL_SECONDS``
+    seconds using ``time.monotonic``; a failure (Docker unavailable, container
+    not on the network) is not cached so a transient outage re-attempts on the
+    next record. Same contract as ``panel.trusted_edge_networks``.
+    """
+    global _NEVER_BAN_EDGE_CACHE
+    now = time.monotonic()
+    with _NEVER_BAN_EDGE_LOCK:
+        cached = _NEVER_BAN_EDGE_CACHE
+        if cached is not None and cached[1] > now:
+            return cached[0]
+    discovered: list[str] = []
+    discovered_any = False
+    for network_name in (traefik.TRAEFIK_NETWORK, traefik.PANEL_EDGE_NETWORK):
+        try:
+            discovered.extend(traefik.traefik_network_cidrs(network_name))
+            discovered_any = True
+        except (RuntimeError, OSError, ValueError, subprocess.SubprocessError):
+            continue
+    # The panel backend binds the panel-edge gateway; its own address is
+    # infrastructure, not a client.
+    try:
+        gateway = traefik._network_gateway(traefik.PANEL_EDGE_NETWORK)
+    except (RuntimeError, OSError, ValueError, subprocess.SubprocessError):
+        gateway = None
+    if gateway:
+        try:
+            address = ipaddress.ip_address(gateway)
+        except ValueError:
+            address = None
+        if address is not None:
+            discovered.append(f"{address}/{'32' if address.version == 4 else '128'}")
+            discovered_any = True
+    if not discovered_any:
+        # Total discovery failure: deliberately not cached. A transient
+        # Docker outage must not pin the empty set for the cache TTL; the
+        # next record re-attempts discovery (same contract as
+        # `panel.trusted_edge_networks`).
+        return ()
+    result = tuple(sorted(set(discovered)))
+    with _NEVER_BAN_EDGE_LOCK:
+        _NEVER_BAN_EDGE_CACHE = (result, time.monotonic() + _NEVER_BAN_EDGE_TTL_SECONDS)
+    return result
+
+
+def _client_ip_is_never_ban(value: str) -> bool:
+    """True when the normalized client IP must never be a bannable identity.
+
+    The never-ban set: the 0.0.0.0 sentinel, loopback, the default Docker
+    bridge, Cloudflare edge ranges (published ranges; env override respected),
+    the Traefik edge endpoints, and the panel backend address. Banning any of
+    them would take panel infrastructure offline or ban a non-attacker.
+    """
+    if _address_in_networks(value, _NEVER_BAN_STATIC_CIDRS):
+        return True
+    if cloudflare_ranges.is_cloudflare_ip(value):
+        return True
+    return _address_in_networks(value, _discover_never_ban_edge_cidrs())
+
+
+def _hash_account(identifier: str) -> str:
+    """Return 'sha256:<hex>' of the truncated account identifier."""
+    truncated = (identifier if isinstance(identifier, str) else "")[:64]
+    return "sha256:" + hashlib.sha256(truncated.encode("utf-8")).hexdigest()
+
+
+def _rotate_panel_auth_log(path: Path) -> None:
+    """Rotate panel-auth.log copytruncate-style (t16 W1).
+
+    Keeps up to _PANEL_AUTH_LOG_KEEP rotated files (.1, .2, .3).
+    Best-effort: silently returns on any OS error.
+
+    Copytruncate, not rename: the jail tails panel-auth.log with
+    ``backend = auto``; a rename changes the inode and strands the tail on the
+    renamed file, so fail2ban would miss every fresh record until reload —
+    silently dropping ban coverage. Copying the current content to .1 and
+    truncating the active file in place keeps the inode, so a tailing fail2ban
+    never loses the tail. The rotation runs under _AUTH_LOG_LOCK, so the
+    copy-then-truncate is atomic with respect to concurrent writers.
+    """
+    try:
+        metadata = path.lstat()
+        if stat.S_ISLNK(metadata.st_mode):
+            return  # never rotate or truncate through a symlink
+        if metadata.st_size <= _PANEL_AUTH_LOG_MAX_BYTES:
+            return
+    except OSError:
+        return
+    for i in range(_PANEL_AUTH_LOG_KEEP - 1, 0, -1):
+        src = path.with_name(f"{path.name}.{i}")
+        dst = path.with_name(f"{path.name}.{i + 1}")
+        try:
+            if src.exists():
+                try:
+                    dst.unlink()
+                except FileNotFoundError:
+                    pass
+                src.rename(dst)
+        except OSError:
+            pass
+    rotated = path.with_name(f"{path.name}.1")
+    try:
+        try:
+            rotated.unlink()
+        except FileNotFoundError:
+            pass
+        # Copy current content to .1, then truncate the active file in place
+        # (same inode fail2ban is tailing).
+        shutil.copyfile(path, rotated)
+        fd = os.open(path, os.O_RDWR | os.O_NOFOLLOW)
+        try:
+            os.ftruncate(fd, 0)
+        finally:
+            os.close(fd)
+    except OSError:
+        pass
+
+
+def _append_panel_auth_failure(
+    surface: str,
+    client_ip: object,
+    account_identifier: str,
+    reason_class: str,
+) -> None:
+    """Write one JSON Lines record to the panel auth failure log.
+
+    Emission guard: a resolved client IP that is a never-ban identity (edge
+    endpoint, Docker bridge, Cloudflare edge, panel backend, loopback) is
+    redacted to the 0.0.0.0 sentinel before writing, so no record can ever
+    carry a bannable identity from the never-ban set. The record is kept for
+    observability; banning 0.0.0.0 is a no-op in iptables.
+
+    Hardening: the log file is opened with O_NOFOLLOW (a symlinked log path
+    fails closed instead of writing through the link) and the log directory is
+    tightened to mode 0700. A write failure is never silently swallowed: it is
+    recorded as ``login_shield.health_failed`` and re-raised so the caller can
+    surface the degraded health instead of pretending the attempt was logged.
+    """
+    normalized = _normalize_client_ip(client_ip)
+    if _client_ip_is_never_ban(normalized):
+        normalized = UNKNOWN_CLIENT
+    record = {
+        "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "event": "panel_auth_failure",
+        "surface": surface,
+        "client_ip": normalized,
+        "account_hash": _hash_account(account_identifier),
+        "reason_class": reason_class,
+    }
+    path = panel_auth_log_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(path.parent, 0o700)
+        with _AUTH_LOG_LOCK:
+            _rotate_panel_auth_log(path)
+            line = json.dumps(record, ensure_ascii=True, separators=(",", ":")) + "\n"
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, 0o600)
+            try:
+                os.write(fd, line.encode("utf-8"))
+            finally:
+                os.close(fd)
+    except (OSError, TypeError, ValueError) as exc:
+        try:
+            events.record_event(
+                "login_shield.health_failed",
+                outcome="failed",
+                detail=f"panel auth failure log write failed: {type(exc).__name__}",
+                actor="panel",
+            )
+        except Exception:
+            pass
+        raise
 
 
 @contextmanager
@@ -528,6 +770,21 @@ def client_throttled(client) -> bool:
         return failure is not None and failure.cooldown_until > now
 
 
+def client_retry_after(client) -> int:
+    """Seconds until the client cooldown expires, for a Retry-After header.
+
+    Returns 0 when the client is not currently throttled. Only ever consulted
+    for clients that just returned ``client_throttled() is True``.
+    """
+    now = time.time()
+    with _STATE_LOCK:
+        _prune_client_failures(now)
+        failure = _CLIENT_FAILURES.get(_client_key(client))
+    if failure is None or failure.cooldown_until <= now:
+        return 0
+    return max(1, math.ceil(failure.cooldown_until - now))
+
+
 def _register_client_failure(client: str, now: float) -> None:
     _prune_client_failures(now)
     previous = _CLIENT_FAILURES.get(client)
@@ -547,6 +804,30 @@ def register_client_failure(client) -> None:
         _register_client_failure(_client_key(client), now)
 
 
+def _prune_fm_enable(now: float) -> None:
+    cutoff = now - FM_ENABLE_WINDOW_SECONDS
+    for username, timestamps in tuple(_FM_ENABLE.items()):
+        recent = [timestamp for timestamp in timestamps if timestamp > cutoff]
+        if recent:
+            _FM_ENABLE[username] = recent
+        else:
+            _FM_ENABLE.pop(username, None)
+
+
+def fm_enable_allowed(username: str) -> bool:
+    now = time.time()
+    with _STATE_LOCK:
+        _prune_fm_enable(now)
+        return len(_FM_ENABLE.get(username, ())) < MAX_FM_ENABLE
+
+
+def register_fm_enable(username: str) -> None:
+    now = time.time()
+    with _STATE_LOCK:
+        _prune_fm_enable(now)
+        _FM_ENABLE.setdefault(username, []).append(now)
+
+
 def login(
     username: object, password: object, totp: object = None, *, client=None, setup: bool = False,
 ) -> tuple[str, dict] | None:
@@ -554,6 +835,7 @@ def login(
     client_key = _client_key(client)
     now = time.time()
     if client_throttled(client_key):
+        _append_panel_auth_failure("password", client, username_key, "throttled")
         return None
     with _STATE_LOCK:
         failure = _LOGIN_FAILURES.get(username_key)
@@ -562,6 +844,7 @@ def login(
             _LOGIN_FAILURES.pop(username_key, None)
     if locked:
         _dummy_password_work(password)
+        _append_panel_auth_failure("password", client, username_key, "locked")
         return None
 
     password_ok = verify_password(username_key, password)
@@ -582,6 +865,8 @@ def login(
             _register_client_failure(client_key, now)
             if user is not None:
                 _register_failure(username_key, now)
+            reason = "totp_failed" if password_ok and user is not None else "invalid_credentials"
+            _append_panel_auth_failure("password", client, username_key, reason)
             return None
         _LOGIN_FAILURES.pop(username_key, None)
         _CLIENT_FAILURES.pop(client_key, None)

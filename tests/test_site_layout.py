@@ -300,6 +300,12 @@ def test_compose_content_wpcli_has_volume():
     assert "./app:/var/www/html" in content
 
 
+def test_compose_content_wpcli_mounts_per_site_security_staging_ro():
+    spec = _spec(domain="example.com", flavor="wp", use_mysql=True, use_redis=False)
+    content = compose_content(spec)
+    assert "./security:/security:ro" in content
+
+
 def test_compose_content_has_network_wpfy():
     spec = _spec(domain="example.com", flavor="site", use_mysql=False, use_redis=False)
     content = compose_content(spec)
@@ -2540,3 +2546,65 @@ def test_restore_keeps_archive_credentials_for_uninitialized_db(tmp_wpfy_home, m
     assert result.exit_code == 0
     for key in ("DB_NAME", "DB_USER", "DB_PASSWORD", "DB_ROOT_PASSWORD"):
         assert restored[key] == archived[key]
+
+
+def test_compose_content_app_mounts_security_auth_log_and_bridge(tmp_wpfy_home):
+    import wpfy.site_event_pipeline as pipeline
+
+    content = compose_content(_spec(domain="example.com", flavor="wp", use_mysql=True, use_redis=False))
+    log_mount = f"./security/{pipeline.AUTH_LOG_FILE}:{pipeline.AUTH_LOG_CONTAINER_PATH}"
+    bridge_mount = f"./security/{pipeline.BRIDGE_MU_FILE}:{pipeline.BRIDGE_CONTAINER_PATH}:ro"
+    assert log_mount in content
+    assert bridge_mount in content
+    # The auth log mount stays outside the document root; the bridge is read-only.
+    assert "/var/www/html" not in log_mount
+    assert bridge_mount.endswith(":ro")
+
+
+def test_apply_site_ownership_owns_security_pipeline_files(tmp_wpfy_home, monkeypatch):
+    import wpfy.site_layout
+    import wpfy.site_event_pipeline as pipeline
+
+    importlib.reload(wpfy.site_layout)
+    domain = "ownership-pipeline.example.com"
+    spec = wpfy.site_layout.SiteSpec(domain=domain, flavor="wp", use_mysql=True, use_redis=False)
+    wpfy.site_layout.ensure_site_scaffold(spec)
+
+    chowned: list[tuple] = []
+    monkeypatch.setattr(wpfy.site_layout.os, "geteuid", lambda: 0, raising=False)
+    monkeypatch.setattr(
+        wpfy.site_layout.os,
+        "chown",
+        lambda path, uid, gid, **kwargs: chowned.append((str(path), uid, gid)),
+    )
+    monkeypatch.setattr(wpfy.site_layout.os, "fchown", lambda fd, uid, gid: None)
+    monkeypatch.setattr(wpfy.site_layout.os, "fchmod", lambda fd, mode: None)
+
+    result = wpfy.site_layout._apply_site_ownership(domain, 100042)
+
+    assert result.ran is True
+    owned_paths = {path for path, _, _ in chowned}
+    assert str(pipeline.auth_log_path(domain)) in owned_paths
+    assert str(pipeline.bridge_path(domain)) in owned_paths
+
+
+def test_ensure_site_scaffold_rejects_security_dir_symlink(tmp_wpfy_home, tmp_path):
+    import wpfy.site_layout
+    import wpfy.site_event_pipeline as pipeline
+
+    importlib.reload(wpfy.site_layout)
+    domain = "security-symlink.example.com"
+    spec = wpfy.site_layout.SiteSpec(domain=domain, flavor="wp", use_mysql=True, use_redis=False)
+    wpfy.site_layout.ensure_site_scaffold(spec)
+
+    external = tmp_path / "external-security"
+    external.mkdir()
+    (external / "sentinel").write_bytes(b"sentinel")
+    import shutil
+    shutil.rmtree(pipeline.security_dir(domain))
+    pipeline.security_dir(domain).symlink_to(external, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="unsafe scaffold destination symlink"):
+        wpfy.site_layout.ensure_site_scaffold(spec)
+
+    assert (external / "sentinel").read_bytes() == b"sentinel"

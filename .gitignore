@@ -34,3 +34,14 @@ node_modules
 .superpowers/brainstorm/
 .vitepress/cache/
 .agent-work/
+
+# OhMyOpenCode orchestrator state
+.omo/
+session-ses_*.md
+
+
+# APM dependencies
+apm_modules/
+
+# graphify generated knowledge-graph output (dirty-expected)
+graphify-out/

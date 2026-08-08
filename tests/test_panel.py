@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import importlib
+from datetime import datetime, timedelta, timezone
 from io import BytesIO
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import socket
 import threading
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -35,6 +38,7 @@ def _seed_site(paths, domain: str = "example.com") -> Path:
 @pytest.fixture
 def panel_server(tmp_wpfy_home, monkeypatch):
     monkeypatch.setenv("WPFY_SKIP_RUNTIME", "1")
+    monkeypatch.setenv("WPFY_FM_ENABLED", "1")
 
     import wpfy.site_layout
     import wpfy.operational_inspection
@@ -477,6 +481,35 @@ def test_static_traversal_and_unknown_paths_rejected(panel_server):
         assert status == 404, f"expected 404 for {path}"
 
 
+def test_client_route_paths_serve_shell_without_token(panel_server):
+    base_url, _ = panel_server
+    for path in (
+        "/dashboard",
+        "/sites",
+        "/sites/new",
+        "/sites/new/progress/job-123",
+        "/sites/new/success/job-123",
+        "/site/example.com",
+        "/site/example.com/logs",
+        "/events",
+        "/notifications",
+        "/account/settings",
+        "/account/security",
+        "/admin/users",
+        "/admin/users/new",
+        "/admin/events",
+    ):
+        status, body, headers = _request(base_url, path, token=None)
+        assert status == 200, f"expected shell for {path}"
+        assert headers["Content-Type"].startswith("text/html"), path
+        assert 'id="file-upload-input"' in body, path
+        assert "Content-Security-Policy" in headers, path
+
+    for path in ("/nope", "/nope.html", "/site", "/admin"):
+        status, _, _ = _request(base_url, path, token=None)
+        assert status == 404, f"expected 404 for {path}"
+
+
 def test_unknown_api_endpoint_and_bad_json(panel_server):
     base_url, _ = panel_server
     status, _, _ = _request(base_url, "/api/nope")
@@ -550,3 +583,369 @@ def test_cli_panel_refuses_public_bind():
     result = args.handler(args)
     assert result.exit_code == 2
     assert "loopback" in result.message
+
+
+def test_file_manager_status_disabled(panel_server):
+    base_url, paths = panel_server
+    _seed_site(paths)
+
+    status, body, _ = _request(base_url, "/api/sites/example.com/file-manager")
+    data = json.loads(body)
+    assert status == 200
+    assert data["state"] == "disabled"
+    assert data["provider"] is None
+
+
+def test_file_manager_enable_requires_auth(panel_server):
+    base_url, _ = panel_server
+    status, body, _ = _request(base_url, "/api/sites/example.com/file-manager/enable", method="POST", token=None)
+    assert status == 401
+
+
+def test_file_manager_lease_requires_auth(panel_server):
+    base_url, _ = panel_server
+    status, body, _ = _request(base_url, "/api/sites/example.com/file-manager/lease", method="POST", token=None)
+    assert status == 401
+
+
+def test_file_manager_lease_rejects_non_ready_state(panel_server):
+    base_url, paths = panel_server
+    _seed_site(paths)
+    import wpfy.file_manager as file_manager
+
+    for non_ready in ("disabled", "starting", "failed"):
+        file_manager._write_state("example.com", {"state": non_ready, "domain": "example.com"})
+        status, body, _ = _request(
+            base_url, "/api/sites/example.com/file-manager/lease", method="POST",
+        )
+        assert status == 409, f"expected 409 for state={non_ready}, got {status}: {body}"
+
+
+def test_file_manager_lease_populates_principal_as_holder(panel_server):
+    base_url, paths = panel_server
+    _seed_site(paths)
+    import wpfy.file_manager as file_manager
+
+    file_manager._write_state("example.com", {"state": "ready", "domain": "example.com"})
+
+    status, _, _ = _request(base_url, "/api/sites/example.com/file-manager/lease", method="POST")
+    assert status == 200
+
+    state = file_manager.get_file_manager_state("example.com")
+    assert state.state == "ready"
+    assert state.lease_holders == ["run-token-admin"]
+    assert state.active_leases == 1
+
+
+def test_file_manager_disable_requires_auth(panel_server):
+    base_url, _ = panel_server
+    status, body, _ = _request(base_url, "/api/sites/example.com/file-manager", method="DELETE", token=None)
+    assert status == 401
+
+
+def test_file_manager_unknown_site_rejected(panel_server):
+    base_url, _ = panel_server
+    for path in ("/api/sites/nosuch/file-manager", "/api/sites/nosuch/file-manager/enable", "/api/sites/nosuch/file-manager/lease"):
+        status, _, _ = _request(base_url, path, method="POST" if "enable" in path or "lease" in path else "GET")
+        assert status >= 400, f"expected 4xx for {path}, got {status}"
+
+
+def test_ssl_preflight_endpoint_exists(panel_server):
+    base_url, paths = panel_server
+    _seed_site(paths)
+    status, body, _ = _request(base_url, "/api/sites/example.com/ssl/preflight", method="POST")
+    assert status == 200
+    data = json.loads(body)
+    assert "passed" in data
+    assert "message" in data
+
+
+def test_ssl_preflight_requires_auth(panel_server):
+    base_url, _ = panel_server
+    status, _, _ = _request(base_url, "/api/sites/example.com/ssl/preflight", method="POST", token=None)
+    assert status == 401
+
+
+def test_admin_file_managers_requires_admin(panel_server):
+    base_url, _ = panel_server
+    status, body, _ = _request(base_url, "/api/admin/file-managers")
+    assert status == 200
+    data = json.loads(body)
+    assert isinstance(data, list)
+
+
+def test_file_manager_flag_off_returns_not_found(panel_server, monkeypatch):
+    base_url, paths = panel_server
+    _seed_site(paths)
+    monkeypatch.setenv("WPFY_FM_ENABLED", "0")
+
+    status, body, _ = _request(base_url, "/api/sites/example.com/file-manager")
+
+    assert status == 404
+    assert json.loads(body) == {"error": "file manager disabled"}
+
+
+def test_legacy_files_flag_off_returns_not_found(panel_server, monkeypatch):
+    base_url, paths = panel_server
+    _seed_site(paths)
+    monkeypatch.setenv("WPFY_FM_LEGACY_API", "0")
+
+    status, body, _ = _request(base_url, "/api/sites/example.com/files")
+
+    assert status == 404
+    assert json.loads(body) == {"error": "file manager legacy api disabled"}
+
+
+def test_file_manager_enable_sets_proxy_cookie(panel_server, monkeypatch):
+    base_url, paths = panel_server
+    _seed_site(paths)
+    import wpfy.panel as panel
+
+    monkeypatch.setattr(
+        panel.panel_file_manager,
+        "enable_file_manager",
+        lambda domain, username, provider: {"state": "ready", "url": f"/api/sites/{domain}/file-manager/proxy/"},
+    )
+
+    status, _, headers = _request(
+        base_url, "/api/sites/example.com/file-manager/enable", method="POST",
+    )
+
+    assert status == 200
+    cookie = headers["Set-Cookie"]
+    assert cookie.startswith("wpfy_fm=")
+    assert "Path=/api/sites/example.com/file-manager/proxy/" in cookie
+    assert "HttpOnly" in cookie
+    assert "SameSite=Strict" in cookie
+    assert "Max-Age=60" in cookie
+
+
+def test_file_manager_error_is_sanitized(panel_server, monkeypatch):
+    base_url, paths = panel_server
+    _seed_site(paths)
+    import wpfy.file_manager as file_manager
+    import wpfy.panel as panel
+
+    def fail(domain, username, provider):
+        raise file_manager.FileManagerError("health_failed", "raw detail")
+
+    monkeypatch.setattr(panel.panel_file_manager, "enable_file_manager", fail)
+
+    status, body, _ = _request(
+        base_url, "/api/sites/example.com/file-manager/enable", method="POST",
+    )
+    data = json.loads(body)
+
+    assert status == 500
+    assert data == {"state": "failed", "error": {"code": "health_failed", "message": "file manager failed to start"}}
+    assert "raw detail" not in body
+
+
+def test_metadata_reset_requires_confirmation_and_is_admin_only(panel_server, monkeypatch):
+    base_url, paths = panel_server
+    _seed_site(paths)
+    import wpfy.panel as panel
+    reset = []
+    monkeypatch.setattr(panel.quantum_provider, "reset_metadata", lambda domain: reset.append(domain))
+
+    status, _, _ = _request(
+        base_url, "/api/sites/example.com/file-manager/metadata", method="DELETE",
+        body={"confirm": "reset file manager metadata"},
+    )
+    assert status == 200
+    assert reset == ["example.com"]
+
+    status, _, _ = _request(
+        base_url, "/api/sites/example.com/file-manager/metadata", method="DELETE",
+        body={"confirm": "wrong"},
+    )
+    assert status == 400
+
+    monkeypatch.setattr(
+        panel.panel_auth,
+        "authenticate_session",
+        lambda token: {"username": "manager", "role": panel.panel_auth.ROLE_SITE_MANAGER, "sites": ["example.com"]},
+    )
+    status, _, _ = _request(
+        base_url, "/api/sites/example.com/file-manager/metadata", method="DELETE", token="manager-token",
+        body={"confirm": "reset file manager metadata"},
+    )
+    assert status == 403
+
+
+def test_admin_file_manager_list_skips_corrupt_state(panel_server):
+    base_url, paths = panel_server
+    _seed_site(paths, "good.example.com")
+    bad = _seed_site(paths, "bad.example.com")
+    state = bad / ".wpfy" / "file-manager" / "state.json"
+    state.parent.mkdir(parents=True, exist_ok=True)
+    state.write_text("{invalid", encoding="utf-8")
+    good_state = Path(paths.sites_dir) / "good.example.com" / ".wpfy" / "file-manager" / "state.json"
+    good_state.parent.mkdir(parents=True, exist_ok=True)
+    good_state.write_text(json.dumps({"state": "ready", "provider": "quantum"}), encoding="utf-8")
+
+    status, body, _ = _request(base_url, "/api/admin/file-managers")
+
+    assert status == 200
+    assert [item["domain"] for item in json.loads(body)] == ["good.example.com"]
+
+
+def test_file_manager_proxy_requires_cookie_and_forwards_user(panel_server, monkeypatch):
+    base_url, paths = panel_server
+    _seed_site(paths)
+    import wpfy.panel as panel
+
+    seen = {}
+
+    class EchoHandler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            seen["user"] = self.headers.get("X-Forwarded-User")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.end_headers()
+            self.wfile.write(b"ok")
+
+        def log_message(self, format, *args):
+            pass
+
+    upstream = ThreadingHTTPServer(("127.0.0.1", 0), EchoHandler)
+    thread = threading.Thread(target=upstream.serve_forever, daemon=True)
+    thread.start()
+    monkeypatch.setattr(panel.quantum_provider, "provider_port", lambda domain: upstream.server_address[1])
+    monkeypatch.setattr(
+        panel.panel_file_manager,
+        "enable_file_manager",
+        lambda domain, username, provider: {"state": "ready", "url": f"/api/sites/{domain}/file-manager/proxy/"},
+    )
+    try:
+        status, _, _ = _request(base_url, "/api/sites/example.com/file-manager/proxy/", token=TEST_TOKEN)
+        assert status == 403
+        status, _, headers = _request(base_url, "/api/sites/example.com/file-manager/enable", method="POST")
+        assert status == 200
+        cookie = headers["Set-Cookie"].split(";", 1)[0]
+        request = urllib.request.Request(
+            f"{base_url}/api/sites/example.com/file-manager/proxy/echo", headers={"Cookie": cookie},
+        )
+        request.add_header("Authorization", f"Bearer {TEST_TOKEN}")
+        with urllib.request.urlopen(request, timeout=10) as response:
+            assert response.status == 200
+            assert response.read() == b"ok"
+        assert seen["user"] == "run-token-admin"
+    finally:
+        upstream.shutdown()
+        upstream.server_close()
+        thread.join(timeout=5)
+
+
+def test_idle_reap_stops_expired_file_manager(tmp_wpfy_home, monkeypatch):
+    monkeypatch.setenv("WPFY_SKIP_RUNTIME", "1")
+    import wpfy.events as events
+    import wpfy.file_manager as panel_file_manager
+    import wpfy.panel as panel
+
+    _seed_site(tmp_wpfy_home)
+    panel_file_manager._write_state("example.com", {
+        "state": "ready",
+        "domain": "example.com",
+        "provider": "filebrowser-quantum",
+        "idle_expires_at": (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat(),
+        "lease_holders": [],
+        "health": "healthy",
+    })
+
+    panel._idle_reap_once()
+
+    assert panel_file_manager.get_file_manager_state("example.com").state == "disabled"
+    assert any(event["action"] == "file_manager.auto_stopped" for event in events.list_events())
+
+
+def test_idle_reap_ignores_future_and_already_disabled_states(tmp_wpfy_home, monkeypatch):
+    monkeypatch.setenv("WPFY_SKIP_RUNTIME", "1")
+    import wpfy.file_manager as panel_file_manager
+    import wpfy.panel as panel
+
+    _seed_site(tmp_wpfy_home)
+    panel_file_manager._write_state("example.com", {
+        "state": "ready",
+        "domain": "example.com",
+        "idle_expires_at": (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat(),
+        "lease_holders": [],
+    })
+    panel._idle_reap_once()
+    assert panel_file_manager.get_file_manager_state("example.com").state == "ready"
+
+    panel_file_manager._write_state("example.com", {"state": "disabled", "domain": "example.com"})
+    panel._idle_reap_once()
+    assert panel_file_manager.get_file_manager_state("example.com").state == "disabled"
+
+
+def test_fm_reaper_stops_when_panel_server_closes(tmp_wpfy_home, monkeypatch):
+    """t19 regression pin: make_panel_server's idle reaper thread must stop when
+    the panel server closes. The historical daemon thread looped forever, so a
+    server created in one test kept firing list_sites()/state reads into later
+    tests (full-suite race: test_cli saw an extra registry.list_sites call from
+    the reaper and failed test_site_list_reconciles_before_rendering)."""
+    monkeypatch.setenv("WPFY_SKIP_RUNTIME", "1")
+    monkeypatch.setenv("WPFY_FM_ENABLED", "1")
+    import wpfy.panel as panel
+
+    def count_reapers() -> int:
+        return sum(1 for t in threading.enumerate() if t.name == "wpfy-fm-reaper")
+
+    before = count_reapers()
+    config = panel.PanelConfig(host="127.0.0.1", port=0, token=TEST_TOKEN)
+    server = panel.make_panel_server(config)
+    assert count_reapers() == before + 1, "make_panel_server must start exactly one reaper"
+
+    # No serve_forever thread here: server_close() alone must stop the reaper.
+    server.server_close()
+
+    deadline = time.monotonic() + 5.0
+    while count_reapers() > before and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert count_reapers() == before, "reaper thread must exit after server_close"
+
+
+def test_rediscover_file_manager_marks_running_starting_site_ready(tmp_wpfy_home, monkeypatch):
+    monkeypatch.delenv("WPFY_SKIP_RUNTIME", raising=False)
+    import wpfy.file_manager as panel_file_manager
+    import wpfy.panel as panel
+
+    _seed_site(tmp_wpfy_home)
+    panel_file_manager._write_state("example.com", {"state": "starting", "domain": "example.com"})
+    monkeypatch.setattr(panel.subprocess, "run", lambda *args, **kwargs: type("Result", (), {
+        "returncode": 0,
+        "stdout": "example.com\n",
+    })())
+
+    panel._rediscover_file_managers()
+
+    assert panel_file_manager.get_file_manager_state("example.com").state == "ready"
+
+
+def test_rediscover_file_managers_skips_runtime_requested(tmp_wpfy_home, monkeypatch):
+    monkeypatch.setenv("WPFY_SKIP_RUNTIME", "1")
+    import wpfy.file_manager as panel_file_manager
+    import wpfy.panel as panel
+
+    _seed_site(tmp_wpfy_home)
+    panel_file_manager._write_state("example.com", {"state": "starting", "domain": "example.com"})
+    monkeypatch.setattr(panel.subprocess, "run", lambda *args, **kwargs: pytest.fail("docker must not run"))
+
+    panel._rediscover_file_managers()
+
+    assert panel_file_manager.get_file_manager_state("example.com").state == "starting"
+
+
+def test_logout_revoke_file_manager_for_sole_lease_holder(tmp_wpfy_home, monkeypatch):
+    import wpfy.file_manager as panel_file_manager
+    import wpfy.panel as panel
+
+    _seed_site(tmp_wpfy_home)
+    panel_file_manager._write_state("example.com", {"state": "ready", "domain": "example.com", "lease_holders": ["alice"]})
+    calls = []
+    monkeypatch.setattr(panel_file_manager, "disable_file_manager", lambda domain, provider: calls.append((domain, provider)))
+
+    panel._revoke_fm_for_logout("example.com", "alice")
+
+    assert calls == [("example.com", panel.quantum_provider)]

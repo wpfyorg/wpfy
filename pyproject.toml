@@ -16,7 +16,6 @@ classifiers = [
 
 [project.scripts]
 wpfy = "wpfy.cli:main"
-wpfy-agent = "wpfy.agent_workflow:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
