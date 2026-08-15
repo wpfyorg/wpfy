@@ -9,7 +9,6 @@
 
 <p align="center">
   <a href="https://github.com/wpfyorg/wpfy/releases/tag/v1.0.0-rc4"><img src="https://img.shields.io/github/v/release/wpfyorg/wpfy?include_prereleases&display_name=tag&sort=semver" alt="Current release: v1.0.0-rc4"></a>
-  <a href="https://github.com/wpfyorg/wpfy/actions/workflows/tests.yml"><img src="https://github.com/wpfyorg/wpfy/actions/workflows/tests.yml/badge.svg?branch=main" alt="Tests workflow status"></a>
   <a href="https://github.com/wpfyorg/wpfy/blob/main/pyproject.toml"><img src="https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white" alt="Python 3.10 or later"></a>
   <a href="https://github.com/wpfyorg/wpfy/blob/main/LICENSE"><img src="https://img.shields.io/github/license/wpfyorg/wpfy" alt="AGPL-3.0-only license"></a>
   <a href="https://docs.docker.com/compose/"><img src="https://img.shields.io/badge/Docker-Compose-2496ED?logo=docker&logoColor=white" alt="Uses Docker Compose"></a>
