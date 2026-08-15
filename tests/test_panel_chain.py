@@ -798,7 +798,7 @@ def test_chain_state_remains_bounded(chain_home, monkeypatch, fake_clock):
     assert panel_auth._CLIENT_FAILURES["203.0.113.13"].count <= 10
 
     # Account failures bounded by distinct usernames (one locked account).
-    panel_auth.add_user("u1", "password", role=panel_auth.ROLE_ADMIN)
+    panel_auth.add_user("u1", "password-one", role=panel_auth.ROLE_ADMIN)
     for _ in range(40):
         panel_auth.login("u1", "wrong", client="203.0.113.20")
     assert set(panel_auth._LOGIN_FAILURES) == {"u1"}

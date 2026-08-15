@@ -482,6 +482,40 @@ def test_login_shield_payload_never_exposes_auth_log_or_account_keys(panel_serve
     assert "reason_class" not in rendered
 
 
+def test_security_read_survives_an_unreachable_edge(panel_server, monkeypatch):
+    """The trusted-edge list is discovered from the running Traefik network, so
+    it is unavailable whenever Docker is down. It is informational — the
+    deny-lists, basic-auth state and login-shield status around it are not — and
+    letting its failure escape turned the entire security read into a 500 at the
+    exact moment an operator most needs it: while the runtime is broken.
+
+    Degrade to an empty list plus a stated reason, the way login_shield_status
+    already does.
+    """
+    import wpfy.panel as panel
+
+    base_url, paths = panel_server
+    _seed_site(paths)
+
+    def unreachable():
+        raise RuntimeError(
+            "cannot determine wpfy edge address: failed to connect to the docker API "
+            "at unix:///var/run/docker.sock"
+        )
+
+    monkeypatch.setattr(panel.site_security, "traefik_network_cidrs", unreachable)
+
+    status, payload = _request(base_url, f"/api/sites/{DOMAIN}/security")
+
+    assert status == 200, f"security read failed with the edge unreachable: {payload}"
+    assert payload["trusted_edge_sources"] == []
+    assert "docker" in payload["trusted_edge_error"].lower()
+    # The parts that do not depend on the runtime must still be readable.
+    assert payload["deny_ips"] == []
+    assert payload["basic_auth"]["enabled"] is False
+    assert "login_shield" in payload
+
+
 def test_panel_jail_not_toggleable_through_site_security(panel_server):
     base_url, paths = panel_server
     _seed_site(paths)

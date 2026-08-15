@@ -7,6 +7,7 @@ import re
 import secrets
 import shutil
 import subprocess
+import time
 
 from .events import record_event
 
@@ -235,24 +236,40 @@ def _enable_service() -> tuple[bool, str]:
     return True, "fail2ban service enabled and started"
 
 
+#: How long to wait for fail2ban-server to answer after the unit reports started.
+PING_TIMEOUT_SECONDS = 20
+
+
 def _ping_fail2ban() -> tuple[bool, str]:
-    """Verify fail2ban-client ping returns pong."""
+    """Verify fail2ban-client ping returns pong, waiting for the socket to appear.
+
+    `systemctl start` returns once the unit is active, but fail2ban-server binds
+    /var/run/fail2ban/fail2ban.sock afterwards, so a single immediate ping loses
+    a race it was never told about. On a clean host it lost it every time --
+    "Failed to access socket path" -- and the rollback then tore out a fail2ban
+    that was seconds from ready, package included.
+    """
     if _runtime_skip_requested():
         return True, "skipped by WPFY_SKIP_RUNTIME"
-    try:
-        proc = subprocess.run(
-            ["fail2ban-client", "ping"],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-    except (OSError, subprocess.SubprocessError, subprocess.TimeoutExpired) as exc:
-        return False, f"fail2ban-client ping failed: {exc}"
-    if proc.returncode != 0 or "pong" not in proc.stdout.lower():
+    deadline = time.monotonic() + PING_TIMEOUT_SECONDS
+    detail = "no pong"
+    while True:
+        try:
+            proc = subprocess.run(
+                ["fail2ban-client", "ping"],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+        except (OSError, subprocess.SubprocessError, subprocess.TimeoutExpired) as exc:
+            return False, f"fail2ban-client ping failed: {exc}"
+        if proc.returncode == 0 and "pong" in proc.stdout.lower():
+            return True, "fail2ban-client ping: pong"
         detail = proc.stderr.strip() or proc.stdout.strip() or "no pong"
-        return False, f"fail2ban-client ping failed: {detail}"
-    return True, "fail2ban-client ping: pong"
+        if time.monotonic() >= deadline:
+            return False, f"fail2ban-client ping failed after {PING_TIMEOUT_SECONDS}s: {detail}"
+        time.sleep(0.5)
 
 
 def _iter_failregex_lines(content: str) -> list[tuple[int, str]]:
@@ -915,6 +932,23 @@ def ensure_fail2ban_host() -> HostFail2banResult:
 
     root = _fail2ban_root()
     backups = _backup_wpfy_files(root)
+
+    # The panel jail watches a log the panel only creates on its first auth
+    # failure. Validation runs before that ever happens on a fresh host, and
+    # fail2ban treats a missing logpath as a fatal config error, so the whole
+    # install would roll back on every clean machine.
+    try:
+        from .panel_auth import ensure_panel_auth_log
+
+        ensure_panel_auth_log()
+    except OSError as exc:
+        return HostFail2banResult(
+            exit_code=1,
+            message=f"panel auth log could not be created: {exc}",
+            changed=False,
+            installed=True,
+            health_ok=False,
+        )
 
     # Step 2: WPFY configs land before the service starts.
     config_changed, written_files = _install_wpfy_configs(root)

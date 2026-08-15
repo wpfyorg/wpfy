@@ -6,6 +6,39 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+
+- Rebuild the loopback control panel client on vendored Tabler 1.4.0 (ADR 0032).
+  Site detail collapses from fourteen tabs to five (Overview, Settings, Data,
+  Access, Automation) with the old paths redirecting for one release; the
+  site-creation wizard is rebuilt on the real API; and all ten admin pages ship
+  — events, job detail, users, services, firewall, remote backup, settings,
+  instance, mail, and the basic-auth inventory. Running operations move into a
+  header popover that stays visible across navigation.
+
+- Add host port management over `ufw`: read the rule set, add and remove
+  allow/deny rules with optional source restrictions, and enable or disable the
+  firewall, exposed at `GET /api/firewall` and `/api/firewall/ports|enable|
+  disable`. `enable` allows the detected SSH port before the firewall comes up,
+  and denying or removing the rule carrying SSH requires the port as a typed
+  confirmation. wpfy does not install `ufw` — a host without it reports the fact
+  and the command to run.
+
+- Add `GET /api/metrics/latest`, the newest metrics sample for every scope in
+  one query, and `GET /api/sites/{domain}/services`, so a site-manager can see
+  the containers of the site they are responsible for.
+
+- `wpfy panel expose` asks for the panel domain and, when the host has no ACME
+  contact address, the Let's Encrypt email — the value that decides whether a
+  certificate can issue at all. The typed domain confirmation is unchanged,
+  `--email` covers scripted runs, and a non-interactive run refuses with
+  instructions rather than prompting.
+
+- Add admin-only panel API routes for settings, remote backup and schedule,
+  firewall status/install, SMTP transport configuration/testing, instance facts,
+  and cross-site basic-auth inventory. S3 secret keys and SMTP passwords remain
+  write-only in every API response.
+
 ### Changed
 
 - `wpfy site create --pass`, grouped `wpfy site update --password`, and
@@ -15,6 +48,94 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   now refuses raw values; use `--token-file` or `WPFY_PANEL_TOKEN`.
 
 ### Fixed
+
+- Validate edge-bound panel addresses against the discovered `wpfy-panel-edge`
+  CIDRs, rejecting network, IPv4 broadcast, and off-network addresses without
+  restricting the public-address bind used by domainless self-signed TLS.
+
+Found installing on a clean Ubuntu 24.04 VPS — first-run only, which is why a
+green offline suite never saw them.
+
+- Create the panel auth log before installing the fail2ban jail that watches it.
+  fail2ban treats a missing `logpath` as a fatal config error, so `wpfy stack
+  install` reported `fail2ban: FAIL` on every fresh host and the rollback
+  removed the package it had just installed — leaving a new VPS with no
+  intrusion prevention at all.
+- Wait for fail2ban's socket instead of racing it. `systemctl start` returns
+  when the unit is active; fail2ban-server binds its socket afterwards, so the
+  single immediate `fail2ban-client ping` failed for a service seconds from
+  ready.
+- Green the site health badge for the states the server actually emits.
+  `site_health` returns ready | running | degraded | down | needs-bootstrap; the
+  badge tested for `healthy`, which is never emitted, so a fully working site
+  showed its status in red.
+- Report the edge proxy's parsed state instead of the `docker compose ps` table.
+  The dashboard opened on "1 service degraded: wpfy-traefik" against a healthy
+  container, and the Traefik card printed the table's header row as its subtext.
+- Accept `healthy` as healthy across every client surface. Docker reports
+  `healthy` for a container with a healthcheck and `running` for one without, so
+  treating only `running` as good marked the edge proxy — and every site image
+  with a healthcheck — permanently degraded.
+- Refuse `panel expose --domain` without a real ACME contact address. A fresh
+  install ships `admin@localhost`, which Let's Encrypt rejects at account
+  registration, so exposure reported success and the certificate never issued.
+  Enabling SSL for a site has refused on this since ADR 0016.
+- Keep the panel router recognisable after basic auth is stored. The recognition
+  check re-rendered and compared byte for byte, so storing a credential made
+  wpfy's own router unreadable to wpfy — which is exactly the condition that
+  prevents the credential from being applied.
+
+Found running the panel rebuild against the validation VPS — every one of these
+passed the offline suite, which stubs `subprocess.run` and builds `PanelConfig`
+directly rather than running the command an operator types.
+
+- Require the one-time setup secret on a domainless panel. The gate keyed off
+  `edge_bind`, and a domainless panel is not edge-bound — it binds straight to
+  the public address — so `wpfy panel --public` created the first administrator
+  over the open internet with no secret at all.
+- Let the setup link authenticate the request that carries it. The secret was
+  only read from the request body, so the printed link returned 401 on every
+  call. It now authenticates the setup routes and nothing else, and a public
+  panel prints no run token: that token is a full admin grant, and a public
+  panel writes it into the terminal and the systemd journal.
+- Add `wpfy panel --public`. `expose --no-domain` printed a start command that
+  is refused (a non-loopback host without `--edge-service` never binds) and
+  nothing set `self_signed_tls`, so the mode was unreachable and its TLS unwired.
+- Hash the panel basic-auth credential with APR1. sha512crypt is what nginx
+  verifies for the per-site gate; Traefik's basicAuth understands MD5-APR1,
+  SHA1 and bcrypt only, so it loaded the middleware silently and then rejected
+  the correct password forever.
+- Warn when an active firewall closes the panel's port. The panel is a host
+  process, so ufw applies to it — unlike the Docker-published ports, which
+  bypass ufw's INPUT chain — and it otherwise started, printed the right URL,
+  and timed out from everywhere.
+- List firewall rules while ufw is off. An inactive ufw prints no rule list at
+  all, so rules added before enabling read as absent — and an operator shown
+  "no rules" adds the port again, so enabling installs duplicates.
+- Split the rule comment out of the ufw source column. Glued to the source it
+  was rendered as part of the address, made a rule's IPv6 twin look like a
+  separate rule (two rows, two delete buttons, one underlying rule), and was
+  sent back as `source` on delete, where it is rejected as a malformed address.
+
+- Keep the SFTP password out of `job.result` on site creation. The create job
+  built its payload with `_runtime_payload` rather than `_sftp_payload`, so the
+  CLI's `password (shown once): <secret>` line was stored in a job result that
+  every later `GET /api/jobs` returns in full — outliving the one-time panel
+  designed to show it once.
+
+- Enforce the 12-character password minimum on every write path. It was applied
+  only by the first-run setup form, so an administrator could create a
+  site-manager with a one-character password.
+
+- Accept a blank secret on `PUT /api/backup/remote` and `PUT
+  /api/notifications/smtp` as "keep the stored value". Both demanded a
+  write-only secret on every write, so changing a bucket prefix or a sender
+  address forced the operator to re-type a credential they cannot read back, and
+  a client sending an empty string replaced a working credential with an empty
+  one.
+
+- Report `GET /api/sites/{domain}/security` when the edge is unreachable instead
+  of failing the whole read with a 500.
 
 - Validate PHP image, Let's Encrypt mode, and DNS provider vocabularies before
   site lifecycle preflight or scaffold writes. CLI and panel now share the

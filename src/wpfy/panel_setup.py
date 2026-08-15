@@ -3,8 +3,10 @@ from __future__ import annotations
 from contextlib import contextmanager
 from datetime import datetime, timezone
 import fcntl
+import hashlib
 import json
 import os
+import secrets
 from pathlib import Path
 import re
 import uuid
@@ -12,7 +14,9 @@ import uuid
 from . import events, panel_auth, settings
 
 LICENSE_VERSION = "LICENSE"
-PASSWORD_MIN_LENGTH = 12
+# Re-exported: the floor is enforced inside panel_auth._validate_password so
+# every write path gets it, not just this form.
+PASSWORD_MIN_LENGTH = panel_auth.PASSWORD_MIN_LENGTH
 _EMAIL_SHAPE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 
@@ -45,7 +49,113 @@ def _default_state() -> dict:
         "license_accepted_at": None,
         "license_accepted_by": None,
         "license_version": LICENSE_VERSION,
+        "setup_secret_hash": None,
+        "setup_secret_issued_at": None,
     }
+
+
+# ---------------------------------------------------------------------------
+# Setup secret
+#
+# First-run account creation is refused over an edge-bound panel: the operator
+# is expected to reach loopback through an SSH tunnel. A domainless exposure has
+# no tunnel in the picture, so the secret takes the tunnel's place -- it proves
+# the person creating the first administrator is the person who ran
+# `wpfy panel expose` on the host, because that command is the only thing that
+# prints it.
+#
+# Only a hash is stored, so a readable state file does not hand over the right
+# to create the administrator. It is single-use and expires, because a secret
+# that grants account creation should not sit valid on an internet-facing panel
+# for as long as nobody happens to use it.
+# ---------------------------------------------------------------------------
+
+SETUP_SECRET_TTL_SECONDS = 3600
+
+
+def _hash_secret(secret: str) -> str:
+    return hashlib.sha256(secret.encode("utf-8")).hexdigest()
+
+
+def issue_setup_secret() -> str:
+    """Mint a one-time secret and return it. Only its hash is persisted."""
+    secret = secrets.token_urlsafe(32)
+    with state_lock():
+        current = _default_state()
+        current.update(_read_state())
+        current["setup_secret_hash"] = _hash_secret(secret)
+        current["setup_secret_issued_at"] = _now()
+        _write_state(current)
+    return secret
+
+
+def clear_setup_secret() -> None:
+    with state_lock():
+        current = _default_state()
+        current.update(_read_state())
+        current["setup_secret_hash"] = None
+        current["setup_secret_issued_at"] = None
+        _write_state(current)
+
+
+def _secret_expired(issued_at: object) -> bool:
+    if not isinstance(issued_at, str) or not issued_at:
+        return True
+    try:
+        issued = datetime.fromisoformat(issued_at.replace("Z", "+00:00"))
+    except ValueError:
+        return True
+    return (datetime.now(timezone.utc) - issued).total_seconds() > SETUP_SECRET_TTL_SECONDS
+
+
+def setup_secret_matches(secret: object) -> bool:
+    """Check the secret without burning it.
+
+    The secret has to authenticate the request before it can be spent by it: a
+    domainless panel prints no run token, so the setup link is the only
+    credential the browser has, and `GET /api/setup/status` must answer it. Only
+    `create_account` consumes the secret, so a peek here cannot spend a grant
+    that never produced an account.
+    """
+    if not isinstance(secret, str) or not secret:
+        return False
+    with state_lock():
+        current = _default_state()
+        current.update(_read_state())
+        stored = current.get("setup_secret_hash")
+        if not isinstance(stored, str) or not stored:
+            return False
+        if _secret_expired(current.get("setup_secret_issued_at")):
+            return False
+        return secrets.compare_digest(stored, _hash_secret(secret))
+
+
+def consume_setup_secret(secret: object) -> bool:
+    """Check and burn the secret in one locked step.
+
+    Compared with `secrets.compare_digest` so a wrong guess cannot be narrowed
+    by timing, and cleared inside the same lock the check ran under so two
+    requests racing on the internet cannot both win.
+    """
+    if not isinstance(secret, str) or not secret:
+        return False
+    with state_lock():
+        current = _default_state()
+        current.update(_read_state())
+        stored = current.get("setup_secret_hash")
+        if not isinstance(stored, str) or not stored:
+            return False
+        if _secret_expired(current.get("setup_secret_issued_at")):
+            current["setup_secret_hash"] = None
+            current["setup_secret_issued_at"] = None
+            _write_state(current)
+            return False
+        if not secrets.compare_digest(stored, _hash_secret(secret)):
+            return False
+        current["setup_secret_hash"] = None
+        current["setup_secret_issued_at"] = None
+        _write_state(current)
+        return True
 
 
 def _read_state() -> dict:
@@ -88,14 +198,14 @@ def state() -> dict:
         return current
 
 
-def status(*, edge_bind: bool) -> dict:
+def status(*, remote: bool) -> dict:
     configured = panel_auth.login_required()
     if configured:
         return {"configured": True, "setup_available": False}
     return {
         "configured": False,
         "setup_available": True,
-        "edge_bound": edge_bind,
+        "edge_bound": remote,
         "password_min_length": PASSWORD_MIN_LENGTH,
     }
 
@@ -106,9 +216,20 @@ def _text(value: object, field: str, maximum: int = 80) -> str:
     return value.strip()
 
 
-def create_account(body: dict, *, client: str | None, edge_bind: bool) -> tuple[str, dict]:
-    if edge_bind:
-        raise ValueError("first-run setup is disabled while the panel is edge-bound; use the SSH tunnel")
+def create_account(body: dict, *, client: str | None, remote: bool) -> tuple[str, dict]:
+    # Account creation over the edge used to be refused outright, on the
+    # reasoning that the operator can always reach loopback through an SSH
+    # tunnel. A domainless exposure has no tunnel in the picture, so the refusal
+    # stands unless the request carries the one-time secret that
+    # `wpfy panel expose` printed on the host. The secret is burned on use, so a
+    # request that gets this far cannot be replayed -- and without one the
+    # original refusal is unchanged, including its wording.
+    if remote:
+        if not consume_setup_secret(body.get("setup_secret")):
+            raise ValueError(
+                "first-run setup is disabled on a panel reachable from off this host; "
+                "open the one-time setup link printed by `wpfy panel expose`, or use the SSH tunnel"
+            )
     if panel_auth.client_throttled(client):
         raise panel_auth.ClientThrottleError("too many setup attempts; try again later")
     try:

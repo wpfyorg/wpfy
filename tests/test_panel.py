@@ -9,8 +9,11 @@ import socket
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
+import shutil
+import subprocess
 
 import pytest
 
@@ -84,6 +87,56 @@ def _raw_request(base_url: str, path: str, *, method: str = "GET", raw: bytes | 
             return response.status, response.read(), response.headers
     except urllib.error.HTTPError as exc:
         return exc.code, exc.read(), exc.headers
+
+
+def _await_job(base_url: str, job_id: str, *, timeout: float = 10.0) -> dict:
+    """Poll a job to a terminal state and return its final payload."""
+    deadline = time.monotonic() + timeout
+    last: dict = {}
+    while time.monotonic() < deadline:
+        status, body, _ = _request(base_url, f"/api/jobs/{job_id}")
+        assert status == 200, f"job fetch failed: {status} {body}"
+        last = json.loads(body)
+        if last.get("state") in {"succeeded", "failed"}:
+            return last
+        time.sleep(0.05)
+    raise AssertionError(f"job {job_id} did not finish within {timeout}s: {last}")
+
+
+def _connect_stream(base_url: str, *, token: str | None = TEST_TOKEN, timeout: float = 5) -> socket.socket:
+    """Open a raw socket and send a GET /api/stream request (SSE needs headers, not EventSource)."""
+    parsed = urllib.parse.urlsplit(base_url)
+    sock = socket.create_connection((parsed.hostname, parsed.port), timeout=timeout)
+    lines = [f"GET /api/stream HTTP/1.1", f"Host: {parsed.hostname}:{parsed.port}"]
+    if token is not None:
+        lines.append(f"Authorization: Bearer {token}")
+    lines.append("Connection: close")
+    sock.sendall(("\r\n".join(lines) + "\r\n\r\n").encode("utf-8"))
+    return sock
+
+
+def _read_stream_head(sock: socket.socket, *, timeout: float = 5) -> tuple[str, bytes]:
+    sock.settimeout(timeout)
+    data = b""
+    while b"\r\n\r\n" not in data:
+        chunk = sock.recv(4096)
+        if not chunk:
+            break
+        data += chunk
+    head, _, rest = data.partition(b"\r\n\r\n")
+    return head.decode("utf-8", "replace"), rest
+
+
+def _read_stream_frame(sock: socket.socket, leftover: bytes = b"", *, timeout: float = 5) -> str:
+    """Read bytes until a full SSE frame (or comment line) is assembled."""
+    sock.settimeout(timeout)
+    data = leftover
+    while b"\n\n" not in data:
+        chunk = sock.recv(4096)
+        if not chunk:
+            break
+        data += chunk
+    return data.decode("utf-8", "replace")
 
 
 def test_run_token_principal_supports_identity_and_totp_routes(panel_server):
@@ -254,6 +307,41 @@ def test_phase2_operational_status_codes(panel_server, monkeypatch):
     assert "permission denied" in json.loads(body)["nginx_test_output"]
 
 
+def test_sftp_rotate_returns_the_password_only_as_a_one_time_value(panel_server, monkeypatch):
+    """`ensure_sftp_container()` appends `password (shown once): <secret>` to its
+    message for the CLI, and `rotate_sftp_password()` returns that same result.
+
+    `message` is a general-purpose display field — the panel renders it into the
+    page, next to the one-time panel rather than inside it — so a password left
+    there is a second copy that outlives the surface designed to show it once.
+    The secret leaves this endpoint through `one_time` alone.
+    """
+    import wpfy.panel as panel
+
+    base_url, paths = panel_server
+    _seed_site(paths)
+    secret = "PH-sftp-rotate-secret"
+
+    def fake_rotate(domain, password=None):
+        return panel.sftp.RuntimeResult(
+            0, f"sftp container ready for {domain}\npassword (shown once): {password}"
+        )
+
+    monkeypatch.setattr(panel.sftp, "rotate_sftp_password", fake_rotate)
+    monkeypatch.setattr(panel, "generated_secret", lambda: secret)
+
+    status, body, _ = _request(
+        base_url, "/api/sites/example.com/sftp", method="POST", body={"action": "rotate"},
+    )
+
+    assert status in {200, 202}, body
+    payload = json.loads(body)
+    assert payload["one_time"]["password"] == secret[:16]
+    assert secret[:16] not in payload["message"], (
+        f"the rotate message still carries the password: {payload['message']!r}"
+    )
+
+
 def test_runtime_action_reports_unavailable_when_it_skips(panel_server):
     """A runtime action that skipped started nothing, so it must not answer 2xx.
 
@@ -286,8 +374,11 @@ def test_backups_roundtrip_offline(panel_server):
     assert json.loads(body)["backups"] == []
 
     status, body, _ = _request(base_url, "/api/sites/example.com/backups", method="POST")
-    assert status == 200
-    assert json.loads(body)["ok"] is True
+    assert status == 202
+    job_id = json.loads(body)["job_id"]
+    job = _await_job(base_url, job_id)
+    assert job["state"] == "succeeded"
+    assert job["result"]["ok"] is True
 
     status, body, _ = _request(base_url, "/api/sites/example.com/backups")
     backups = json.loads(body)["backups"]
@@ -300,12 +391,62 @@ def test_backups_roundtrip_offline(panel_server):
     assert status == 404
 
 
-def test_wp_endpoint_validates_args(panel_server, monkeypatch):
+def _job_count(base_url: str) -> int:
+    _, body, _ = _request(base_url, "/api/jobs")
+    return len(json.loads(body)["jobs"])
+
+
+def test_backup_dry_run_creates_no_job(panel_server):
+    base_url, paths = panel_server
+    _seed_site(paths)
+    before = _job_count(base_url)
+
+    status, body, _ = _request(
+        base_url, "/api/sites/example.com/backups", method="POST", body={"dry_run": True},
+    )
+    assert status == 200
+    assert json.loads(body)["changes"] == ["create backup"]
+    assert _job_count(base_url) == before
+
+
+def test_restore_unknown_domain_is_synchronous_404_with_no_job(panel_server):
+    base_url, _ = panel_server
+    before = _job_count(base_url)
+
+    status, body, _ = _request(
+        base_url, "/api/sites/missing.example/restore", method="POST", body={"archive": "x.tar.gz"},
+    )
+    assert status == 404
+    assert _job_count(base_url) == before
+
+
+def test_backup_job_failure_is_redacted(panel_server, monkeypatch):
     base_url, paths = panel_server
     _seed_site(paths)
 
+    import wpfy.panel
+
+    def fake_backup(domain, **kwargs):
+        from wpfy.site_runtime import RuntimeResult
+        return RuntimeResult(1, f"backup failed: MARIADB_PASSWORD={SECRET_MARKER}")
+
+    monkeypatch.setattr(wpfy.panel, "backup_site", fake_backup)
+    status, body, _ = _request(base_url, "/api/sites/example.com/backups", method="POST")
+    assert status == 202
+    job_id = json.loads(body)["job_id"]
+    job = _await_job(base_url, job_id)
+    assert job["state"] == "failed"
+    assert SECRET_MARKER not in json.dumps(job)
+
+
+def test_wp_endpoint_validates_args(panel_server, monkeypatch):
+    base_url, paths = panel_server
+    _seed_site(paths)
+    before = _job_count(base_url)
+
     status, _, _ = _request(base_url, "/api/sites/example.com/wp", method="POST", body={"args": []})
     assert status == 400
+    assert _job_count(base_url) == before
 
     import wpfy.panel
     from wpfy.site_runtime import ProcessResult
@@ -320,10 +461,32 @@ def test_wp_endpoint_validates_args(panel_server, monkeypatch):
     status, body, _ = _request(
         base_url, "/api/sites/example.com/wp", method="POST", body={"args": ["core", "version"]},
     )
-    assert status == 200
-    assert json.loads(body)["stdout"] == "5.9.1\n"
+    assert status == 202
+    job_id = json.loads(body)["job_id"]
+    job = _await_job(base_url, job_id)
+    assert job["state"] == "succeeded"
+    assert job["result"]["stdout"] == "5.9.1\n"
     assert captured["domain"] == "example.com"
     assert captured["args"] == ("core", "version")
+
+
+def test_wp_job_fails_when_runtime_unavailable(panel_server, monkeypatch):
+    base_url, paths = panel_server
+    _seed_site(paths)
+
+    import wpfy.panel
+    from wpfy.site_runtime import ProcessResult
+
+    monkeypatch.setattr(
+        wpfy.panel, "run_wp_cli",
+        lambda *args, **kwargs: ProcessResult(1, stderr="runtime unavailable", skipped=True),
+    )
+    status, body, _ = _request(
+        base_url, "/api/sites/example.com/wp", method="POST", body={"args": ["core", "version"]},
+    )
+    assert status == 202
+    job = _await_job(base_url, json.loads(body)["job_id"])
+    assert job["state"] == "failed"
 
 
 def test_logs_api_delegates_to_runtime(monkeypatch):
@@ -449,25 +612,137 @@ def test_static_ui_served_without_token(panel_server):
     assert status == 200
     assert headers["Content-Type"].startswith("text/html")
     assert "wpfy" in body
-    assert 'data-tab="files"' in body
-    assert 'id="file-upload-input"' in body
+    assert 'id="login-form"' in body        # the way in
+    assert 'id="page"' in body              # the shell's mount point
     assert "Content-Security-Policy" in headers
 
     status, script, headers = _request(base_url, "/panel.js", token=None)
     assert status == 200
     assert headers["Content-Type"].startswith("application/javascript")
     assert "async function apiUpload" in script
-    assert 'result.path.split("/").pop() !== "wp-config.php"' in script
-    assert "detailRequest !== detailRequestId || fileRequest !== fileRequestId" in script
+
+
+def test_dashboard_and_sites_modules_are_csp_safe_served_assets(panel_server):
+    base_url, _ = panel_server
+    expected_endpoints = {
+        "/page-dashboard.js": ("/api/overview", "/api/metrics", "/api/events", "/api/sites"),
+        "/page-sites.js": ("/api/sites",),
+        "/page-site-create.js": ("/api/sites",),
+        "/page-events.js": ("/api/events",),
+        "/page-job.js": ("/api/jobs",),
+        "/page-users.js": ("/api/users",),
+        "/page-services.js": ("/api/system/services", "/api/metrics/latest"),
+        "/page-firewall.js": ("/api/firewall",),
+        "/page-backup.js": ("/api/backup/remote", "/api/backup/schedule"),
+        "/page-settings.js": ("/api/settings",),
+        "/page-instance.js": ("/api/instance",),
+        "/page-mail.js": ("/api/notifications/smtp",),
+        "/page-basic-auth.js": ("/api/security/basic-auth",),
+        "/page-job.js": ("/api/jobs/",),
+        "/page-users.js": ("/api/users", "/api/sites"),
+        "/page-services.js": ("/api/system/services", "/api/metrics/latest"),
+    }
+    for path, endpoints in expected_endpoints.items():
+        status, script, headers = _request(base_url, path, token=None)
+        assert status == 200
+        assert headers["Content-Type"].startswith("application/javascript")
+        assert "innerHTML" not in script
+        assert "insertAdjacentHTML" not in script
+        assert 'style="' not in script
+        for endpoint in endpoints:
+            assert endpoint in script
+
+
+def test_site_detail_modules_are_csp_safe_served_assets(panel_server):
+    base_url, _ = panel_server
+    expected_endpoints = {
+        "/page-site.js": ("/api/sites/",),
+        "/site-tab-overview.js": ("/health", "/diagnostics", "/runtime", "/logs", "/api/events"),
+        "/site-tab-settings.js": ("/config", "/php-settings", "/cache", "/cache/purge", "/nginx-custom", "/security", "/ssl/preflight"),
+        "/site-tab-data.js": ("/databases", "/db-users", "/adminer", "/backups", "/restore"),
+        "/site-tab-access.js": ("/sftp", "/wp", "/site-file-browser.js"),
+        "/site-file-browser.js": ("/files", "wp-config.php", "signal.aborted"),
+        "/site-tab-automation.js": ("/cron",),
+    }
+    for path, endpoints in expected_endpoints.items():
+        status, script, headers = _request(base_url, path, token=None)
+        assert status == 200
+        assert headers["Content-Type"].startswith("application/javascript")
+        assert "innerHTML" not in script
+        assert "insertAdjacentHTML" not in script
+        assert 'style="' not in script
+        for endpoint in endpoints:
+            assert endpoint in script
+
+
+def test_data_tab_module_serves_confirmed_site_data_actions(panel_server):
+    base_url, _ = panel_server
+    status, script, headers = _request(base_url, "/site-tab-data.js", token=None)
+
+    assert status == 200
+    assert headers["Content-Type"].startswith("application/javascript")
+    assert "confirmAction" in script
+    assert "renderOneTime" in script
+    assert "pollJob" in script
+    assert 'body: { confirm: typed }' in script
+    assert "keyword: domain" in script
+    assert "innerHTML" not in script
+    assert "insertAdjacentHTML" not in script
+    assert 'style="' not in script
+
+
+def test_every_shipped_script_actually_parses():
+    """Every other client-side assertion in this file is a substring search, and
+    a substring search passes happily against a file the browser cannot parse.
+    That is not hypothetical: the dashboard module shipped one paren short, every
+    grep-style test stayed green, and the page silently fell back to a placeholder
+    because the dynamic import threw.
+
+    Skipped, not failed, where node is absent: a missing checker is not evidence
+    the scripts are broken. CI's ubuntu runner has node.
+    """
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is not installed; cannot parse-check the client modules")
+
+    import wpfy.panel
+
+    static = Path(wpfy.panel.STATIC_DIR)
+    # `--input-type=module` so `import`/`export` are legal; the panel loads
+    # panel.js and every page-*.js as ES modules.
+    for script in sorted(static.glob("*.js")):
+        result = subprocess.run(
+            [node, "--input-type=module", "--check"],
+            input=script.read_bytes(), capture_output=True,
+        )
+        assert result.returncode == 0, (
+            f"{script.name} is not valid JavaScript:\n{result.stderr.decode('utf-8', 'replace')}"
+        )
+
+
+def test_file_manager_client_guards(panel_server):
+    """Saving `wp-config.php` is explicitly guarded, and stale file requests
+    are discarded before they can render under another site.
+    """
+    base_url, _ = panel_server
+    _, script, _ = _request(base_url, "/site-file-browser.js", token=None)
+    assert "wp-config.php" in script
+    assert "signal.aborted" in script
 
 
 def test_dry_run_previews_use_neutral_plan_badges(panel_server):
+    """A dry-run preview describes what *would* change, so its rows must read
+    as a plan — rendering them with the pass/fail vocabulary tells the operator
+    the change already happened.
+
+    Preview/apply moved out of `panel.js` in the rebuild: it now lives in the
+    site Settings tab, which is where the five old config tabs were consolidated.
+    """
     base_url, _ = panel_server
 
-    status, script, _ = _request(base_url, "/panel.js", token=None)
+    status, script, _ = _request(base_url, "/site-tab-settings.js", token=None)
     assert status == 200
-    assert 'state: operation.status === "planned" ? "plan"' in script
-    assert 'checkItem({ name: "change", state: "plan", message: change })' in script
+    assert "check-plan" in script, "preview rows carry no neutral plan badge"
 
     status, stylesheet, _ = _request(base_url, "/panel.css", token=None)
     assert status == 200
@@ -502,7 +777,7 @@ def test_client_route_paths_serve_shell_without_token(panel_server):
         status, body, headers = _request(base_url, path, token=None)
         assert status == 200, f"expected shell for {path}"
         assert headers["Content-Type"].startswith("text/html"), path
-        assert 'id="file-upload-input"' in body, path
+        assert 'id="page"' in body, path
         assert "Content-Security-Policy" in headers, path
 
     for path in ("/nope", "/nope.html", "/site", "/admin"):
@@ -550,6 +825,106 @@ def test_create_rejects_unknown_flavor(panel_server):
     assert "unknown site flavor" in body
 
 
+def test_create_honors_object_page_cache_and_sftp_fields(panel_server, monkeypatch):
+    base_url, _ = panel_server
+    monkeypatch.setenv("WPFY_SKIP_WORDPRESS_DOWNLOAD", "1")
+    status, body, _ = _request(
+        base_url, "/api/sites", method="POST",
+        body={
+            "domain": "cached.example", "flavor": "wp",
+            "object_cache": "none", "page_cache": "none", "enable_sftp": True,
+        },
+    )
+    assert status == 202
+    job = _await_job(base_url, json.loads(body)["job_id"])
+    assert job["state"] == "succeeded", job
+    assert job["result"]["cache"] == {"page_cache": "none", "object_cache": "none", "ok": True}
+    assert job["result"]["sftp"]["ok"] is True
+    assert job["one_time"]["sftp_password"]
+
+
+def test_create_keeps_the_sftp_password_out_of_the_job_result(panel_server, monkeypatch):
+    """The one-time surface is consumed once; `job.result` is not.
+
+    `ensure_sftp_container()` appends `password (shown once): <secret>` to its
+    message, and the create job stores that message in `job.result`, which every
+    later `GET /api/jobs` read returns in full. A password left there outlives
+    the panel that showed it once and is readable from the Jobs page.
+    """
+    import wpfy.panel as panel
+
+    base_url, _ = panel_server
+    monkeypatch.setenv("WPFY_SKIP_WORDPRESS_DOWNLOAD", "1")
+
+    def fake_ensure(domain, password=None):
+        return panel.sftp.RuntimeResult(
+            0, f"sftp container ready for {domain}\npassword (shown once): {password}"
+        )
+
+    monkeypatch.setattr(panel.sftp, "ensure_sftp_container", fake_ensure)
+
+    status, body, _ = _request(
+        base_url, "/api/sites", method="POST",
+        body={"domain": "sftpleak.example", "flavor": "html", "enable_sftp": True},
+    )
+    assert status == 202
+    job = _await_job(base_url, json.loads(body)["job_id"])
+    assert job["state"] == "succeeded", job
+    secret = job["one_time"]["sftp_password"]
+    assert secret
+    assert secret not in job["result"]["sftp"]["message"], (
+        f"the create job result still carries the sftp password: {job['result']['sftp']['message']!r}"
+    )
+
+
+def test_create_rejects_unknown_cache_values(panel_server):
+    base_url, _ = panel_server
+    before = _job_count(base_url)
+
+    status, body, _ = _request(
+        base_url, "/api/sites", method="POST",
+        body={"domain": "badcache.example", "flavor": "wp", "object_cache": "memcached"},
+    )
+    assert status == 400
+    assert _job_count(base_url) == before
+
+    status, body, _ = _request(
+        base_url, "/api/sites", method="POST",
+        body={"domain": "badcache2.example", "flavor": "wp", "page_cache": "varnish"},
+    )
+    assert status == 400
+    assert _job_count(base_url) == before
+
+
+def test_create_rejects_enable_sftp_wrong_type(panel_server):
+    base_url, _ = panel_server
+    status, body, _ = _request(
+        base_url, "/api/sites", method="POST",
+        body={"domain": "badsftp.example", "flavor": "html", "enable_sftp": "yes"},
+    )
+    assert status == 400
+
+
+@pytest.mark.parametrize("field,value", [
+    ("multisite_type", "subdirectory"),
+    ("enable_backups", True),
+    ("backup_retention", 7),
+    ("notification_channel", "email"),
+])
+def test_create_rejects_cut_fields_as_unknown(panel_server, field, value):
+    """Section 3.2: fields the wizard can no longer honor are rejected, not silently dropped."""
+    base_url, _ = panel_server
+    before = _job_count(base_url)
+
+    status, body, _ = _request(
+        base_url, "/api/sites", method="POST",
+        body={"domain": "cut.example", field: value, "flavor": "html"},
+    )
+    assert status == 400
+    assert "unsupported field" in body
+    assert _job_count(base_url) == before
+
+
 def test_config_dry_run_does_not_apply(panel_server):
     base_url, paths = panel_server
     site = _seed_site(paths)
@@ -563,6 +938,108 @@ def test_config_dry_run_does_not_apply(panel_server):
     assert status == 200
     assert json.loads(body)["changes"] == ["php 8.4→8.3"]
     assert (site / ".env").read_bytes() == before
+
+
+def test_config_apply_runs_as_a_job(panel_server):
+    base_url, paths = panel_server
+    _seed_site(paths)
+
+    status, body, _ = _request(
+        base_url, "/api/sites/example.com/config", method="POST", body={"php_version": "8.3"},
+    )
+    assert status == 202
+    job = _await_job(base_url, json.loads(body)["job_id"])
+    assert job["state"] == "succeeded"
+    assert job["result"]["ok"] is True
+    assert job["result"]["changes"] == ["php 8.4→8.3"]
+
+
+def test_config_apply_unsupported_field_is_synchronous_400_with_no_job(panel_server):
+    base_url, paths = panel_server
+    _seed_site(paths)
+    before = _job_count(base_url)
+
+    status, body, _ = _request(
+        base_url, "/api/sites/example.com/config", method="POST", body={"nope": "x"},
+    )
+    assert status == 400
+    assert _job_count(base_url) == before
+
+
+def test_config_apply_job_failure_is_redacted(panel_server, monkeypatch):
+    base_url, paths = panel_server
+    _seed_site(paths)
+
+    import wpfy.panel
+    import wpfy.site_lifecycle as site_lifecycle
+
+    def fake_update_site(request):
+        raise site_lifecycle.SiteLifecycleError(f"update failed: MARIADB_PASSWORD={SECRET_MARKER}")
+
+    monkeypatch.setattr(wpfy.panel.site_lifecycle, "update_site", fake_update_site)
+    status, body, _ = _request(
+        base_url, "/api/sites/example.com/config", method="POST", body={"php_version": "8.3"},
+    )
+    assert status == 202
+    job = _await_job(base_url, json.loads(body)["job_id"])
+    assert job["state"] == "failed"
+    assert SECRET_MARKER not in json.dumps(job)
+
+
+def test_traefik_restart_runs_as_a_job(panel_server, monkeypatch):
+    base_url, _ = panel_server
+
+    import wpfy.panel
+    from wpfy.site_runtime import RuntimeResult
+
+    status, body, _ = _request(base_url, "/api/system/traefik/restart", method="POST", body={})
+    assert status == 400
+
+    monkeypatch.setattr(wpfy.panel.traefik, "restart_traefik_existing", lambda: RuntimeResult(0, "restarted", ran=True))
+    status, body, _ = _request(
+        base_url, "/api/system/traefik/restart", method="POST", body={"confirm": "wpfy-traefik"},
+    )
+    assert status == 202
+    job = _await_job(base_url, json.loads(body)["job_id"])
+    assert job["state"] == "succeeded"
+    assert job["result"]["ok"] is True
+
+
+def test_traefik_restart_job_fails_and_is_redacted(panel_server, monkeypatch):
+    base_url, _ = panel_server
+
+    import wpfy.panel
+    from wpfy.site_runtime import RuntimeResult
+
+    monkeypatch.setattr(
+        wpfy.panel.traefik, "restart_traefik_existing",
+        lambda: RuntimeResult(1, f"restart failed: MARIADB_PASSWORD={SECRET_MARKER}"),
+    )
+    status, body, _ = _request(
+        base_url, "/api/system/traefik/restart", method="POST", body={"confirm": "wpfy-traefik"},
+    )
+    assert status == 202
+    job = _await_job(base_url, json.loads(body)["job_id"])
+    assert job["state"] == "failed"
+    assert SECRET_MARKER not in json.dumps(job)
+
+
+def test_restore_roundtrip_runs_as_a_job(panel_server):
+    base_url, paths = panel_server
+    _seed_site(paths)
+
+    status, body, _ = _request(base_url, "/api/sites/example.com/backups", method="POST")
+    _await_job(base_url, json.loads(body)["job_id"])
+    status, body, _ = _request(base_url, "/api/sites/example.com/backups")
+    archive_name = json.loads(body)["backups"][0]["name"]
+
+    status, body, _ = _request(
+        base_url, "/api/sites/example.com/restore", method="POST", body={"archive": archive_name},
+    )
+    assert status == 202
+    job = _await_job(base_url, json.loads(body)["job_id"])
+    assert job["state"] == "succeeded"
+    assert job["result"]["ok"] is True
 
 
 def test_cli_panel_parser_defaults():
@@ -949,3 +1426,543 @@ def test_logout_revoke_file_manager_for_sole_lease_holder(tmp_wpfy_home, monkeyp
     panel._revoke_fm_for_logout("example.com", "alice")
 
     assert calls == [("example.com", panel.quantum_provider)]
+
+
+# --- GET /api/stream -----------------------------------------------------
+
+def test_stream_requires_auth(panel_server):
+    base_url, _ = panel_server
+    sock = _connect_stream(base_url, token=None)
+    try:
+        head, _ = _read_stream_head(sock)
+        assert head.startswith("HTTP/1.1 401")
+    finally:
+        sock.close()
+
+
+def test_stream_headers_are_sse_and_no_store(panel_server):
+    base_url, _ = panel_server
+    sock = _connect_stream(base_url)
+    try:
+        head, _ = _read_stream_head(sock)
+        assert head.startswith("HTTP/1.1 200")
+        assert "content-type: text/event-stream" in head.lower()
+        assert "cache-control: no-store" in head.lower()
+        assert "x-content-type-options: nosniff" in head.lower()
+    finally:
+        sock.close()
+
+
+def test_stream_concurrency_cap_returns_503(panel_server):
+    base_url, _ = panel_server
+    held = []
+    try:
+        for _ in range(8):
+            sock = _connect_stream(base_url)
+            head, _ = _read_stream_head(sock)
+            assert head.startswith("HTTP/1.1 200"), head
+            held.append(sock)
+
+        overflow = _connect_stream(base_url)
+        try:
+            head, _ = _read_stream_head(overflow)
+            assert head.startswith("HTTP/1.1 503"), head
+        finally:
+            overflow.close()
+    finally:
+        for sock in held:
+            sock.close()
+
+
+def test_stream_site_manager_only_sees_own_domain(panel_server):
+    base_url, paths = panel_server
+    _seed_site(paths, "assigned.example")
+    _seed_site(paths, "unassigned.example")
+
+    import wpfy.panel_auth as panel_auth
+    panel_auth.add_user("sse-admin", "sse-admin-password-x", role=panel_auth.ROLE_ADMIN)
+    panel_auth.add_user(
+        "sse-manager", "sse-manager-password-x",
+        role=panel_auth.ROLE_SITE_MANAGER, sites=("assigned.example",),
+    )
+    status, body, _ = _request(
+        base_url, "/api/auth/login", token=None, method="POST",
+        body={"username": "sse-admin", "password": "sse-admin-password-x"},
+    )
+    assert status == 200, body
+    admin_token = json.loads(body)["token"]
+
+    status, body, _ = _request(
+        base_url, "/api/auth/login", token=None, method="POST",
+        body={"username": "sse-manager", "password": "sse-manager-password-x"},
+    )
+    assert status == 200, body
+    manager_token = json.loads(body)["token"]
+
+    sock = _connect_stream(base_url, token=manager_token)
+    try:
+        head, leftover = _read_stream_head(sock)
+        assert head.startswith("HTTP/1.1 200")
+
+        cron_body = {"schedule": "* * * * *", "command": "true"}
+        status, _, _ = _request(
+            base_url, "/api/sites/unassigned.example/cron", method="POST", body=cron_body, token=admin_token,
+        )
+        assert status == 201
+        status, _, _ = _request(
+            base_url, "/api/sites/assigned.example/cron", method="POST", body=cron_body, token=admin_token,
+        )
+        assert status == 201
+
+        frame = _read_stream_frame(sock, leftover, timeout=5)
+        assert "unassigned.example" not in frame
+        assert "assigned.example" in frame
+        assert "site.cron.add" in frame
+    finally:
+        sock.close()
+
+
+def test_stream_disconnect_does_not_leak_a_thread(panel_server, monkeypatch):
+    import wpfy.panel as panel
+    monkeypatch.setattr(panel, "_STREAM_KEEPALIVE_SECONDS", 0.2)
+
+    base_url, _ = panel_server
+    sock = _connect_stream(base_url)
+    head, _ = _read_stream_head(sock)
+    assert head.startswith("HTTP/1.1 200")
+    sock.close()
+
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and panel._STREAM_SUBSCRIBERS:
+        time.sleep(0.1)
+    assert not panel._STREAM_SUBSCRIBERS, "closed stream client left a subscriber (and its thread) registered"
+
+
+def test_every_panel_event_reaches_the_stream():
+    """A recorded event that skips `_emit_event` is written to the log but never
+    reaches a live `/api/stream` subscriber — a silent half-mirror that makes the
+    stream untrustworthy as a source of truth. `_emit_event` is the one funnel, so
+    `events.record_event` must appear exactly once in panel.py: inside it.
+    """
+    source = (Path(__file__).resolve().parents[1] / "src" / "wpfy" / "panel.py").read_text()
+    direct = source.count("events.record_event(")
+    assert direct == 1, (
+        f"panel.py calls events.record_event() {direct} times; every event must go "
+        "through _emit_event() so live stream subscribers see it"
+    )
+
+
+_SECTION5_SYSTEM_ROUTES = (
+    ("GET", "/api/settings"), ("PUT", "/api/settings/telemetry"),
+    ("POST", "/api/settings/exposure"), ("DELETE", "/api/settings/exposure"),
+    ("GET", "/api/backup/remote"), ("PUT", "/api/backup/remote"),
+    ("DELETE", "/api/backup/remote"), ("PUT", "/api/backup/schedule"),
+    ("DELETE", "/api/backup/schedule"), ("GET", "/api/firewall"),
+    ("POST", "/api/firewall/install"), ("POST", "/api/firewall/ports"),
+    ("DELETE", "/api/firewall/ports"), ("POST", "/api/firewall/enable"),
+    ("POST", "/api/firewall/disable"), ("GET", "/api/notifications/smtp"),
+    ("PUT", "/api/notifications/smtp"), ("POST", "/api/notifications/smtp/test"),
+    ("DELETE", "/api/notifications/smtp"), ("GET", "/api/instance"),
+    ("GET", "/api/security/basic-auth"),
+)
+
+
+@pytest.mark.parametrize(("method", "path"), _SECTION5_SYSTEM_ROUTES)
+def test_section5_routes_refuse_site_managers(panel_server, monkeypatch, method, path):
+    import wpfy.panel as panel
+
+    monkeypatch.setattr(
+        panel.panel_auth, "authenticate_session",
+        lambda token: {"username": "manager", "role": panel.panel_auth.ROLE_SITE_MANAGER, "sites": ["example.com"]},
+    )
+    status, _, _ = _request(base_url := panel_server[0], path, method=method, token="manager-token", body={})
+    assert status == 403, f"{method} {path} must remain admin-only"
+
+
+def test_section5_admin_routes_and_write_only_secrets(panel_server, monkeypatch):
+    base_url, paths = panel_server
+    _seed_site(paths)
+    import wpfy.panel as panel
+    from wpfy.site_runtime import RuntimeResult
+
+    monkeypatch.setattr(panel.panel_exposure, "expose", lambda *args, **kwargs: RuntimeResult(0, "exposed"))
+    monkeypatch.setattr(panel.panel_exposure, "disable", lambda: RuntimeResult(0, "disabled"))
+    monkeypatch.setattr(panel.backup_schedule, "install_schedule", lambda schedule: RuntimeResult(0, "scheduled"))
+    monkeypatch.setattr(panel.backup_schedule, "disable_schedule", lambda: RuntimeResult(0, "disabled"))
+    monkeypatch.setattr(panel.fail2ban_host, "ensure_fail2ban_host", lambda: panel.fail2ban_host.HostFail2banResult(0, "installed", installed=True, health_ok=True))
+    monkeypatch.setattr(
+        panel.fail2ban_docker, "enforcement_status",
+        lambda: panel.fail2ban_docker.EnforcementStatus(True, False, False, True, True, "f2b-wpfy-panel-auth"),
+    )
+    monkeypatch.setattr(panel.fail2ban_docker, "action_is_stale", lambda: False)
+    monkeypatch.setattr(panel.fail2ban_docker, "ipv6_capable", lambda: False)
+    monkeypatch.setattr(panel.smtp, "send_test_message", lambda config, recipient: f"sent: {recipient}")
+
+    s3_secret = "section5-s3-secret"
+    smtp_secret = "section5-smtp-secret"
+    s3_body = {"endpoint": "https://s3.example.test", "bucket": "backups", "region": "us-east-1", "prefix": "wpfy", "access_key": "access", "secret_key": s3_secret, "allow_insecure": False}
+    smtp_body = {"host": "smtp.example.test", "port": 587, "sender": "wpfy@example.test", "username": "mailer", "password": smtp_secret, "tls": "starttls"}
+    cases = (
+        ("GET", "/api/settings", None),
+        ("PUT", "/api/settings/telemetry", {"enabled": True}),
+        ("POST", "/api/settings/exposure", {"domain": "panel.example.test", "confirm": "panel.example.test"}),
+        ("DELETE", "/api/settings/exposure", {}),
+        ("PUT", "/api/backup/remote", s3_body),
+        ("GET", "/api/backup/remote", None),
+        ("DELETE", "/api/backup/remote", {}),
+        ("PUT", "/api/backup/schedule", {"cadence": "weekly", "time": "02:30", "weekday": "sun", "upload_s3": False}),
+        ("DELETE", "/api/backup/schedule", {}),
+        ("GET", "/api/firewall", None),
+        ("POST", "/api/firewall/install", {}),
+        ("PUT", "/api/notifications/smtp", smtp_body),
+        ("GET", "/api/notifications/smtp", None),
+        ("POST", "/api/notifications/smtp/test", {"recipient": "operator@example.test"}),
+        ("DELETE", "/api/notifications/smtp", {}),
+        ("GET", "/api/instance", None),
+        ("GET", "/api/security/basic-auth", None),
+    )
+    secret_reads = {}
+    inventory = ""
+    for method, path, body in cases:
+        status, raw, _ = _request(base_url, path, method=method, body=body)
+        assert status in {200, 202}, f"{method} {path}: {status} {raw}"
+        if method == "GET" and path in {"/api/backup/remote", "/api/notifications/smtp"}:
+            secret_reads[path] = raw
+        if path == "/api/security/basic-auth":
+            inventory = raw
+    assert s3_secret not in secret_reads["/api/backup/remote"]
+    assert smtp_secret not in secret_reads["/api/notifications/smtp"]
+    assert json.loads(inventory) == {
+        "basic_auth": [{"domain": "example.com", "enabled": False, "username": None}],
+    }
+    # Exposure publishes the panel to the internet, so the operator must type
+    # the destination -- a boolean or a near-miss domain must not get through.
+    for bad_confirm in (False, True, "", "panel.example.tes", "other.example.test"):
+        status, _, _ = _request(
+            base_url,
+            "/api/settings/exposure",
+            method="POST",
+            body={"domain": "panel.example.test", "confirm": bad_confirm},
+        )
+        assert status == 400, f"exposure accepted confirm={bad_confirm!r}"
+
+
+def _firewall_ready(monkeypatch):
+    """Pretend ufw is installed and answering, without one on the test host."""
+    import wpfy.panel as panel
+
+    calls: list[list[str]] = []
+
+    def fake_run(args):
+        calls.append(list(args))
+        if args[:2] == ["status", "verbose"]:
+            return 0, "Status: active\nDefault: deny (incoming), allow (outgoing)\n\n22/tcp ALLOW IN Anywhere\n"
+        return 0, "ok"
+
+    monkeypatch.setattr(panel.firewall_ports, "ufw_available", lambda: True)
+    monkeypatch.setattr(panel.firewall_ports, "_run", fake_run)
+    monkeypatch.delenv("WPFY_SKIP_RUNTIME", raising=False)
+    return calls
+
+
+def test_firewall_read_reports_ports_alongside_intrusion_prevention(panel_server, monkeypatch):
+    base_url, _ = panel_server
+    _firewall_ready(monkeypatch)
+    status, raw, _ = _request(base_url, "/api/firewall")
+    assert status == 200, raw
+    ports = json.loads(raw)["ports"]
+    assert ports["installed"] is True
+    assert ports["active"] is True
+    assert ports["ssh_port"] == 22
+    assert any(rule["port"] == "22" for rule in ports["rules"])
+    assert any(preset["port"] == "443" for preset in ports["presets"])
+
+
+def test_firewall_read_survives_a_host_without_ufw(panel_server, monkeypatch):
+    """Port management missing must not take the fail2ban half of the page down."""
+    import wpfy.panel as panel
+
+    base_url, _ = panel_server
+    monkeypatch.setattr(panel.firewall_ports, "ufw_available", lambda: False)
+    status, raw, _ = _request(base_url, "/api/firewall")
+    assert status == 200, raw
+    payload = json.loads(raw)
+    assert payload["ports"]["installed"] is False
+    assert "enforcement" in payload
+
+
+def test_firewall_allow_rejects_junk_before_it_reaches_ufw(panel_server, monkeypatch):
+    base_url, _ = panel_server
+    calls = _firewall_ready(monkeypatch)
+    for body in (
+        {"port": "0", "protocol": "tcp"},
+        {"port": "22", "protocol": "sctp"},
+        {"port": "80", "protocol": "tcp", "source": "not-an-address"},
+        {"port": "80", "protocol": "tcp", "comment": "`id`"},
+        {"port": "80", "protocol": "tcp", "surprise": True},
+    ):
+        status, raw, _ = _request(base_url, "/api/firewall/ports", method="POST", body=body)
+        assert status == 400, f"{body} was accepted: {raw}"
+    assert all(call[:2] != ["allow", "from"] for call in calls)
+
+
+def test_firewall_deny_of_the_ssh_port_needs_the_typed_confirmation(panel_server, monkeypatch):
+    """Denying SSH from the panel severs the connection carrying the request.
+
+    It stays reachable -- an operator with console access may genuinely want
+    it -- but only by typing the port, never by clicking a button.
+    """
+    base_url, _ = panel_server
+    calls = _firewall_ready(monkeypatch)
+
+    status, raw, _ = _request(base_url, "/api/firewall/ports", method="POST",
+                              body={"port": "22", "protocol": "tcp", "action": "deny"})
+    assert status >= 400, raw
+    assert all(call[0] != "deny" for call in calls), "ufw was invoked despite the guard"
+
+    status, raw, _ = _request(base_url, "/api/firewall/ports", method="POST",
+                              body={"port": "22", "protocol": "tcp", "action": "deny", "confirm": "22"})
+    assert status == 200, raw
+    assert any(call[0] == "deny" for call in calls)
+
+
+def test_firewall_delete_of_the_ssh_rule_needs_the_typed_confirmation(panel_server, monkeypatch):
+    base_url, _ = panel_server
+    calls = _firewall_ready(monkeypatch)
+    status, raw, _ = _request(base_url, "/api/firewall/ports", method="DELETE",
+                              body={"port": "22", "protocol": "tcp", "action": "allow"})
+    assert status >= 400, raw
+    assert all(call[0] != "delete" for call in calls)
+
+
+def test_firewall_enable_reserves_ssh_first(panel_server, monkeypatch):
+    base_url, _ = panel_server
+    calls = _firewall_ready(monkeypatch)
+    status, raw, _ = _request(base_url, "/api/firewall/enable", method="POST", body={})
+    assert status == 200, raw
+    ordered = [call for call in calls if call[0] in {"allow", "--force"}]
+    assert ordered[0][0] == "allow" and "22" in ordered[0]
+    assert ordered[1] == ["--force", "enable"]
+
+
+def test_firewall_disable_needs_confirmation(panel_server, monkeypatch):
+    """Disabling opens every port on the host at once."""
+    base_url, _ = panel_server
+    calls = _firewall_ready(monkeypatch)
+    status, raw, _ = _request(base_url, "/api/firewall/disable", method="POST", body={})
+    assert status == 400, raw
+    assert all(call[0] != "disable" for call in calls)
+
+    status, raw, _ = _request(base_url, "/api/firewall/disable", method="POST", body={"confirm": "disable"})
+    assert status == 200, raw
+    assert any(call[0] == "disable" for call in calls)
+
+
+def test_remote_backup_edit_keeps_the_stored_secret(panel_server):
+    """The secret is write-only, so an edit cannot round-trip it.
+
+    Demanding it on every write means a prefix change re-types an S3 secret, and
+    a client sending "" to satisfy a required field replaces a working credential
+    with an empty one -- which fails first at the next scheduled upload, silently.
+    """
+    base_url, _ = panel_server
+    secret = "keep-this-s3-secret"
+    original = {"endpoint": "https://s3.example.test", "bucket": "backups", "region": "us-east-1",
+                "prefix": "wpfy", "access_key": "access", "secret_key": secret, "allow_insecure": False}
+
+    status, raw, _ = _request(base_url, "/api/backup/remote", method="PUT", body=original)
+    assert status == 200, raw
+
+    edited = {**original, "prefix": "nightly", "secret_key": ""}
+    status, raw, _ = _request(base_url, "/api/backup/remote", method="PUT", body=edited)
+    assert status == 200, raw
+
+    import wpfy.s3_backup as s3_backup
+    stored = s3_backup.load_s3_config()
+    assert stored.prefix == "nightly"
+    assert stored.secret_key == secret, "a blank secret field wiped the stored credential"
+
+    status, raw, _ = _request(base_url, "/api/backup/remote")
+    assert secret not in raw, "the secret must never be readable back"
+
+
+def test_remote_backup_replaces_the_secret_when_one_is_given(panel_server):
+    base_url, _ = panel_server
+    body = {"endpoint": "https://s3.example.test", "bucket": "backups", "region": "us-east-1",
+            "prefix": "wpfy", "access_key": "access", "secret_key": "first-secret", "allow_insecure": False}
+    assert _request(base_url, "/api/backup/remote", method="PUT", body=body)[0] == 200
+    assert _request(base_url, "/api/backup/remote", method="PUT",
+                    body={**body, "secret_key": "second-secret"})[0] == 200
+
+    import wpfy.s3_backup as s3_backup
+    assert s3_backup.load_s3_config().secret_key == "second-secret"
+
+
+def test_remote_backup_first_write_still_needs_a_secret(panel_server):
+    """"Keep the stored one" is meaningless when nothing is stored."""
+    base_url, _ = panel_server
+    body = {"endpoint": "https://s3.example.test", "bucket": "backups", "region": "us-east-1",
+            "prefix": "wpfy", "access_key": "access", "allow_insecure": False}
+    status, raw, _ = _request(base_url, "/api/backup/remote", method="PUT", body=body)
+    assert status == 400
+    assert "secret key" in raw
+
+
+def test_password_minimum_applies_to_every_user_write(panel_server):
+    """Setup enforced twelve characters; user creation enforced non-empty.
+
+    An admin made to pick a strong password could then create a site-manager
+    with a one-character one, on a panel `wpfy panel expose` can publish. The
+    floor now lives in the one validator every write path already calls.
+    """
+    base_url, _ = panel_server
+    status, raw, _ = _request(base_url, "/api/users", method="POST",
+                              body={"username": "weakling", "password": "x", "role": "admin", "sites": []})
+    assert status == 400, raw
+    assert "12 characters" in raw
+
+    import wpfy.panel_auth as panel_auth
+    for call in (
+        lambda: panel_auth.add_user("weakling", "short", role="admin"),
+        lambda: panel_auth.update_user("weakling", password="short"),
+        lambda: panel_auth.set_password("weakling", "short"),
+    ):
+        with pytest.raises(ValueError, match="12 characters"):
+            call()
+
+
+def test_smtp_edit_keeps_the_stored_password(panel_server):
+    """Same shape as the backup destination, and for the same reason.
+
+    The password is write-only, so a client editing the sender cannot round-trip
+    a value it is never allowed to read. A blank field keeps the stored one.
+    """
+    base_url, _ = panel_server
+    secret = "keep-this-smtp-secret"
+    original = {"host": "smtp.example.test", "port": 587, "sender": "wpfy@example.test",
+                "username": "mailer", "password": secret, "tls": "starttls"}
+    assert _request(base_url, "/api/notifications/smtp", method="PUT", body=original)[0] == 200
+
+    edited = {**original, "sender": "alerts@example.test", "password": ""}
+    status, raw, _ = _request(base_url, "/api/notifications/smtp", method="PUT", body=edited)
+    assert status == 200, raw
+
+    import wpfy.smtp as smtp
+    stored = smtp.load_smtp_config()
+    assert stored.sender == "alerts@example.test"
+    assert stored.password == secret, "a blank password field wiped the stored credential"
+
+    status, raw, _ = _request(base_url, "/api/notifications/smtp")
+    assert secret not in raw, "the password must never be readable back"
+
+
+def test_smtp_first_write_still_needs_a_password(panel_server):
+    base_url, _ = panel_server
+    body = {"host": "smtp.example.test", "port": 587, "sender": "wpfy@example.test",
+            "username": "mailer", "tls": "starttls"}
+    status, raw, _ = _request(base_url, "/api/notifications/smtp", method="PUT", body=body)
+    assert status == 400
+    assert "password" in raw
+
+
+def test_site_services_are_readable_per_site(panel_server):
+    """The cross-site services list is admin-only, which left a site-manager
+    unable to see the containers of the site they are responsible for."""
+    base_url, paths = panel_server
+    _seed_site(paths)
+    status, raw, _ = _request(base_url, "/api/sites/example.com/services")
+    assert status == 200, raw
+    payload = json.loads(raw)
+    assert payload["domain"] == "example.com"
+    assert {"web", "app"} <= {row["name"] for row in payload["services"]}
+
+
+def test_site_services_stay_scoped_to_one_site(panel_server, monkeypatch):
+    """A site-manager reaching another site's services must be refused."""
+    import wpfy.panel as panel
+
+    base_url, paths = panel_server
+    _seed_site(paths)
+    monkeypatch.setattr(
+        panel.panel_auth, "authenticate_session",
+        lambda token: {"username": "manager", "role": panel.panel_auth.ROLE_SITE_MANAGER, "sites": ["other.example"]},
+    )
+    status, _, _ = _request(base_url, "/api/sites/example.com/services", token="manager-token")
+    assert status == 403
+
+
+def test_every_module_that_deletes_also_confirms():
+    """A destructive action must not be reachable by a single click.
+
+    The pre-rebuild panel fired six destructive actions with no confirmation at
+    all -- file delete, empty-dir delete, SFTP password rotate, DB-user rotate,
+    service restart, runtime restart -- and used six different idioms for the
+    ones it did confirm, while the two purpose-built helpers had zero call
+    sites. This is the structural floor: a module that issues a DELETE, or
+    posts to a route the server marks destructive, has to have loaded the
+    confirmation helper. It cannot prove the confirm guards the right call, but
+    it does fail the day someone adds a delete button to a page that has no
+    confirm in it at all.
+    """
+    import wpfy.panel
+
+    static = Path(wpfy.panel.__file__).parent / "panel_static"
+    modules = {
+        path.name: path.read_text(encoding="utf-8")
+        for path in sorted(static.glob("*.js"))
+        if not path.name.endswith(".min.js") and path.name != "panel.js"
+    }
+    assert modules, "no client modules found"
+
+    destructive_posts = ("/restore", "/firewall/enable", "/firewall/disable",
+                         "/traefik/restart", "/settings/exposure")
+    offenders = []
+    for name, text in modules.items():
+        deletes = 'method: "DELETE"' in text
+        posts = any(route in text for route in destructive_posts)
+        if (deletes or posts) and "confirmAction" not in text:
+            offenders.append(name)
+
+    assert not offenders, (
+        "these modules perform a destructive request without loading the "
+        f"confirmation helper: {offenders}"
+    )
+
+
+def test_the_riskiest_actions_demand_a_typed_confirmation():
+    """Clicking through a dialog is not the same as typing the thing's name.
+
+    Dropping a database, restoring over a live site, deleting a site, and
+    denying the port that carries SSH are all unrecoverable from the panel, so
+    each one makes the operator type the target rather than accept a default.
+    """
+    import wpfy.panel
+
+    static = Path(wpfy.panel.__file__).parent / "panel_static"
+    for name in ("site-tab-data.js", "site-tab-settings.js", "page-firewall.js", "site-file-browser.js"):
+        text = (static / name).read_text(encoding="utf-8")
+        assert "keyword:" in text, f"{name} confirms destructive work without a typed keyword"
+
+
+def test_the_event_stream_filters_by_tenancy_not_just_permission():
+    """A site-manager may subscribe to the live feed; it must not carry other
+    tenants' events.
+
+    `event.stream` sits in the site-manager allowlist next to `event.list`, so
+    authorization alone lets a manager open the feed. Everything that keeps one
+    tenant out of another's events is `_stream_visible`, and until this test it
+    had no coverage at all — a permission with an untested filter behind it.
+    """
+    from wpfy import panel
+
+    manager = {"role": panel.panel_auth.ROLE_SITE_MANAGER, "sites": ["mine.example"]}
+    admin = {"role": panel.panel_auth.ROLE_ADMIN, "sites": []}
+
+    assert panel._stream_visible({"domain": "mine.example"}, manager) is True
+    assert panel._stream_visible({"domain": "theirs.example"}, manager) is False
+    # Host-level events carry no domain; they are not the manager's business.
+    assert panel._stream_visible({"domain": None}, manager) is False
+    assert panel._stream_visible({}, manager) is False
+    # An administrator sees the whole host, which is the point of the role.
+    assert panel._stream_visible({"domain": "theirs.example"}, admin) is True
+    assert panel._stream_visible({"domain": None}, admin) is True

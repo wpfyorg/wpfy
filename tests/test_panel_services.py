@@ -132,6 +132,14 @@ def test_edge_restart_requires_exact_typed_confirmation(panel_server, body):
 
 
 def test_edge_restart_runs_with_exact_confirmation(panel_server):
+    """The restart is a job now, so the response is the ticket, not the result.
+
+    It used to block for the whole restart and answer 200. Every long operation
+    in the panel returns 202 with a job id; this asserts the work still reaches
+    Docker, by waiting for the job rather than for the request.
+    """
+    import time as _time
+
     base_url, docker_log = panel_server
     docker_log.unlink(missing_ok=True)
     status, payload = _request(
@@ -140,6 +148,93 @@ def test_edge_restart_runs_with_exact_confirmation(panel_server):
         method="POST",
         body={"confirm": "wpfy-traefik"},
     )
-    assert status == 200
-    assert payload["ran"] is True
+    assert status == 202, payload
+    job_id = payload["job_id"]
+
+    deadline = _time.time() + 10
+    while _time.time() < deadline:
+        _, job = _request(base_url, f"/api/jobs/{job_id}")
+        if job["state"] in {"succeeded", "failed"}:
+            break
+        _time.sleep(0.1)
+    assert job["state"] == "succeeded", job
+    assert job["result"]["ran"] is True
     assert _invocations(docker_log)
+
+
+def test_edge_service_status_is_one_state_not_a_docker_table(monkeypatch):
+    """Found on a clean VPS: the dashboard said "1 service degraded: wpfy-traefik"
+    while Docker reported the container healthy.
+
+    `traefik_status()` returns the whole `docker compose ps` table -- header row,
+    image, ports -- which is right for the CLI and wrong as a status field. The
+    client reads it as one container's state, finds no match, and reports the
+    edge proxy as degraded on the dashboard of a healthy install.
+    """
+    from wpfy import panel, traefik
+    from wpfy.site_runtime import RuntimeResult
+
+    real_table = (
+        "NAME           IMAGE             COMMAND                  SERVICE   CREATED   STATUS\n"
+        "wpfy-traefik   traefik:v3.6.17   \"/entrypoint.sh trae…\"   traefik   22 minutes ago   "
+        "Up 22 minutes (healthy)   0.0.0.0:80->80/tcp"
+    )
+    monkeypatch.setattr(traefik, "traefik_status", lambda: RuntimeResult(0, real_table, ran=True))
+    monkeypatch.setattr(traefik, "traefik_health", lambda: "healthy")
+    monkeypatch.setattr(panel, "list_sites", lambda: [])
+
+    edge = next(s for s in panel.api_system_services()["services"] if s["name"] == "wpfy-traefik")
+
+    assert edge["status"] == "healthy"
+    assert "\n" not in edge["status"] and "NAME" not in edge["status"]
+
+
+def test_the_client_treats_healthy_as_healthy():
+    """Docker reports `healthy` for a container with a healthcheck and `running`
+    for one without. A client accepting only `running` marks the edge proxy --
+    and every site image that declares a healthcheck -- permanently degraded.
+    """
+    from wpfy import panel
+
+    source = (Path(panel.__file__).parent / "panel_static" / "panel.js").read_text(encoding="utf-8")
+    assert 'SERVICE_HEALTHY = new Set(["running", "healthy"])' in source
+    assert "export function isServiceHealthy" in source
+
+    static = Path(panel.__file__).parent / "panel_static"
+    for name in ("page-services.js", "site-tab-overview.js", "panel.js"):
+        body = (static / name).read_text(encoding="utf-8")
+        assert 'status !== "running"' not in body, f"{name} still hardcodes the running-only check"
+        assert 'status === "running"' not in body, f"{name} still hardcodes the running-only check"
+
+
+def test_overview_traefik_field_is_a_state_not_a_table(monkeypatch):
+    """The dashboard's Traefik card printed the `docker compose ps` header as its
+    own subtext, and decided "degraded" by searching that table for "error" --
+    a substring that a container name can supply by accident.
+    """
+    from wpfy import operational_inspection, panel, traefik
+
+    monkeypatch.setattr(traefik, "traefik_health", lambda: "healthy")
+    monkeypatch.setattr(
+        operational_inspection, "aggregate_info",
+        lambda: operational_inspection.AggregateInfo((), "NAME IMAGE COMMAND\nwpfy-traefik ...", "29.7.2"))
+
+    payload = panel.api_overview()
+
+    assert payload["traefik"] == "healthy"
+    assert payload["warnings"] == 0
+
+
+def test_site_health_badge_uses_the_vocabulary_the_server_emits():
+    """Found creating a site on the VPS: a fully working site showed "ready" in red.
+
+    `site_health` emits ready | running | degraded | down | needs-bootstrap |
+    <status>-bootstrap. The badge tested for "healthy", which the server never
+    emits, so green was unreachable for every site in every state.
+    """
+    from wpfy import panel
+
+    source = (Path(panel.__file__).parent / "panel_static" / "site-tab-overview.js").read_text(encoding="utf-8")
+    assert 'status === "healthy"' not in source, "still testing for a status the server never emits"
+    assert 'ready: "bg-green-lt text-green"' in source
+    assert 'if (key === "ready") return "green";' in source

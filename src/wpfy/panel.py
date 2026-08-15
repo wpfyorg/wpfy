@@ -6,6 +6,7 @@ import ipaddress
 import json
 import logging
 import os
+import queue
 import re
 import secrets
 import subprocess
@@ -18,7 +19,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, quote, unquote, urlparse
 
-from . import __version__, certificate_lifecycle, events, files, metrics, operational_inspection, panel_auth, panel_jobs, panel_setup, sftp
+from . import __version__, backup_schedule, certificate_lifecycle, events, fail2ban_docker, fail2ban_host, files, firewall_ports, metrics, operational_inspection, panel_auth, panel_jobs, panel_setup, s3_backup, settings, smtp, sftp, telemetry
 from . import site_cache, site_cron, site_database
 from . import site_configuration, site_lifecycle, site_security
 from .php_runtime import DEFAULT_PHP_VERSION, SUPPORTED_PHP_VERSIONS
@@ -96,7 +97,7 @@ RUN_TOKEN_ADMIN = "run-token-admin"
 _ALLOWED_PANEL_FLAVORS = frozenset({"php", "html", *WORDPRESS_FLAVORS})
 _SITE_MANAGER_ALLOWED_ACTIONS = frozenset({
     "auth.me", "auth.logout", "auth.totp.enable", "auth.totp.disable",
-    "site.list", "job.list", "job.read", "event.list",
+    "site.list", "job.list", "job.read", "event.list", "event.stream",
 })
 
 _TRUSTED_EDGE_LOCK = threading.Lock()
@@ -196,6 +197,11 @@ class PanelConfig:
     port: int = DEFAULT_PANEL_PORT
     token: str = ""
     edge_bind: bool = False
+    #: Serve the panel's own socket over TLS with the self-signed certificate
+    #: from `panel_tls`. Used by the domainless exposure, where no CA will issue
+    #: for a bare address and plaintext would put the first-run password, the
+    #: TOTP secret and every session token on the wire in the clear.
+    self_signed_tls: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -289,7 +295,7 @@ def _idle_reap_once() -> None:
                 if datetime.fromisoformat(state.idle_expires_at).timestamp() >= datetime.now(timezone.utc).timestamp():
                     continue
             panel_file_manager.disable_file_manager(domain, quantum_provider)
-            events.record_event("file_manager.auto_stopped", domain=domain, actor="system")
+            _emit_event("file_manager.auto_stopped", domain=domain, actor="system")
             stopped += 1
         except Exception:  # noqa: BLE001, BROAD_EXCEPT_OK
             _LOGGER.exception("file-manager idle reap failed")
@@ -335,7 +341,7 @@ def _revoke_fm_for_logout(domain: str, username: str) -> None:
         holders = panel_file_manager.lease_holder_usernames(domain)
         if username in holders and len(holders) <= 1:
             panel_file_manager.disable_file_manager(domain, quantum_provider)
-            events.record_event("file_manager.stopped", domain=domain, actor=username)
+            _emit_event("file_manager.stopped", domain=domain, actor=username)
     except Exception:  # noqa: BLE001, BROAD_EXCEPT_OK
         _LOGGER.exception("file-manager logout revocation failed")
 
@@ -394,6 +400,13 @@ def authorize(principal, meta: RouteMeta, domain: str | None) -> None:
         return
     if not isinstance(principal, dict):
         raise PanelError(401, "missing or invalid token")
+    if principal.get("_setup_secret"):
+        # The setup link creates the first administrator and does nothing else.
+        # It carries no role, so every other route is refused here rather than
+        # falling through to the site-manager checks below.
+        if meta.scope == "setup":
+            return
+        raise PanelError(403, "forbidden")
     if principal.get("role") == panel_auth.ROLE_ADMIN:
         return
     if not _principal_is_manager(principal):
@@ -513,21 +526,119 @@ def _start_job(job: panel_jobs.Job, fn, *, actor: str = RUN_TOKEN_ADMIN) -> None
         try:
             result, one_time = fn()
             panel_jobs.complete_job(job.id, result=result, one_time=one_time)
-            events.record_event(job.action, domain=job.domain, actor=actor, job_id=job.id)
+            _emit_event(job.action, domain=job.domain, actor=actor, job_id=job.id)
         except Exception as exc:
             message = events._redact(str(exc))
             panel_jobs.fail_job(job.id, message)
-            events.record_event(job.action, domain=job.domain, outcome="failed", detail=message,
-                                actor=actor, job_id=job.id)
+            _emit_event(job.action, domain=job.domain, outcome="failed", detail=message,
+                        actor=actor, job_id=job.id)
     threading.Thread(target=runner, name=f"wpfy-panel-{job.id[:8]}", daemon=True).start()
+
+
+# --- Event stream (GET /api/stream) -----------------------------------------
+#
+# Registered like `file_manager.proxy`: the dispatcher hands the handler the
+# raw request object so it can write `text/event-stream` frames directly to
+# the socket instead of going through the JSON encoder. See _handle_api.
+
+_STREAM_MAX_CONCURRENT = 8
+_STREAM_KEEPALIVE_SECONDS = 15
+_STREAM_LOCK = threading.Lock()
+_STREAM_SUBSCRIBERS: list[queue.Queue] = []
+
+
+@dataclass(frozen=True, slots=True)
+class _StreamAlreadySent:
+    """Sentinel: the handler wrote its own response; _handle_api sends nothing."""
+
+
+def _stream_subscribe() -> queue.Queue | None:
+    with _STREAM_LOCK:
+        if len(_STREAM_SUBSCRIBERS) >= _STREAM_MAX_CONCURRENT:
+            return None
+        subscriber: queue.Queue = queue.Queue(maxsize=200)
+        _STREAM_SUBSCRIBERS.append(subscriber)
+        return subscriber
+
+
+def _stream_unsubscribe(subscriber: queue.Queue) -> None:
+    with _STREAM_LOCK:
+        if subscriber in _STREAM_SUBSCRIBERS:
+            _STREAM_SUBSCRIBERS.remove(subscriber)
+
+
+def _stream_publish(event: dict) -> None:
+    with _STREAM_LOCK:
+        subscribers = list(_STREAM_SUBSCRIBERS)
+    for subscriber in subscribers:
+        try:
+            subscriber.put_nowait(event)
+        except queue.Full:
+            pass  # ponytail: drop on a full queue rather than block the publisher
+
+
+def _emit_event(action, *, domain=None, outcome="ok", detail="", actor="cli", job_id=None) -> None:
+    """Record an event and fan it out to any live /api/stream subscribers."""
+    event = events.record_event(action, domain=domain, outcome=outcome, detail=detail, actor=actor, job_id=job_id)
+    if event is not None:
+        _stream_publish(event)
+
+
+def _stream_visible(event: dict, principal) -> bool:
+    """Per-principal filter, matching _get_events (panel.py `_get_events`)."""
+    if not _principal_is_manager(principal):
+        return True
+    assigned = set(principal.get("sites") or ())
+    return event.get("domain") in assigned
+
+
+def _get_stream(request, principal, match, query, body):
+    subscriber = _stream_subscribe()
+    if subscriber is None:
+        return 503, {"error": "too many concurrent event streams"}
+    try:
+        request.send_response(200)
+        request.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        request.send_header("Cache-Control", "no-store")
+        request.send_header("X-Content-Type-Options", "nosniff")
+        request.send_header("Connection", "close")
+        request.close_connection = True
+        request.end_headers()
+        deadline = time.monotonic() + _STREAM_KEEPALIVE_SECONDS
+        while True:
+            remaining = max(0.0, deadline - time.monotonic())
+            try:
+                event = subscriber.get(timeout=remaining)
+            except queue.Empty:
+                request.wfile.write(b": keepalive\n\n")
+                request.wfile.flush()
+                deadline = time.monotonic() + _STREAM_KEEPALIVE_SECONDS
+                continue
+            deadline = time.monotonic() + _STREAM_KEEPALIVE_SECONDS
+            if not _stream_visible(event, principal):
+                continue
+            frame = f"event: {event.get('action', '')}\ndata: {json.dumps(event)}\n\n"
+            request.wfile.write(frame.encode("utf-8"))
+            request.wfile.flush()
+    except (BrokenPipeError, ConnectionError, OSError):
+        pass
+    finally:
+        _stream_unsubscribe(subscriber)
+    return 200, _StreamAlreadySent()
 
 
 def api_overview() -> dict:
     facts = operational_inspection.aggregate_info()
+    # `aggregate_info` carries the `docker compose ps` table, which is what
+    # `wpfy info` should print and not what a dashboard card can show -- the card
+    # rendered "NAME IMAGE COMMAND SE..." under the heading. It also made the
+    # warning check a substring search over a table wide enough to match by
+    # accident. One parsed state instead.
+    health = traefik.traefik_health()
     warnings = int(facts.docker_version == "unavailable")
-    if any(marker in facts.traefik_message.lower() for marker in ("unavailable", "not running", "not installed", "error")):
+    if health not in ("running", "healthy"):
         warnings += 1
-    return {"version": __version__, "docker_version": facts.docker_version, "traefik": facts.traefik_message,
+    return {"version": __version__, "docker_version": facts.docker_version, "traefik": health,
             "site_count": len(facts.sites), "warnings": warnings}
 
 
@@ -570,8 +681,32 @@ def api_metrics(scope: str, range_key: str) -> dict:
             "samples": [asdict(sample) for sample in samples]}
 
 
+def api_site_services(domain: str) -> dict:
+    """Service rows for one site.
+
+    `api_system_services` covers every site at once and is admin-only, which
+    leaves a site-manager unable to see the containers of the site they are
+    responsible for. This is the same data narrowed to one domain, so it can
+    carry the `site` scope and be filtered per principal like every other
+    per-site read.
+    """
+    _known_domain(domain)
+    allowed = tuple(sorted(site_cron.allowed_services(domain)))
+    return {"domain": domain, "services": list_site_services(domain, allowed)}
+
+
+def api_metrics_latest() -> dict:
+    samples = metrics.latest_samples()
+    return {"host_scope": metrics.HOST_SCOPE, "samples": [asdict(sample) for sample in samples]}
+
+
 def api_system_services() -> dict:
-    services = [{"name": traefik.TRAEFIK_CONTAINER, "status": traefik.traefik_status().message}]
+    # `traefik_status()` returns the whole `docker compose ps` table, header row
+    # included -- right for the CLI, wrong here: the client reads this field as
+    # one container's state, finds no "healthy" in the blob, and reports the
+    # edge proxy as degraded on the dashboard of a perfectly healthy install.
+    # Same parsed vocabulary as the per-site rows below.
+    services = [{"name": traefik.TRAEFIK_CONTAINER, "status": traefik.traefik_health()}]
     for site in sorted(list_sites(), key=lambda item: str(item.get("domain", ""))):
         domain = str(site.get("domain", ""))
         if not domain:
@@ -643,26 +778,42 @@ def api_site_sftp(domain: str) -> tuple[int, dict]:
     return _operation_status(result, not_found=True), _runtime_payload(result)
 
 
+_SFTP_PASSWORD_MARKER = "\npassword (shown once):"
+
+
+def _sftp_payload(result) -> dict:
+    """Runtime payload with the CLI's password line stripped from `message`.
+
+    `sftp.ensure_sftp_container()` appends `password (shown once): <secret>` to
+    its message for the benefit of the CLI, and `rotate_sftp_password()` returns
+    that same result. `message` is a general-purpose display field -- the panel
+    renders it into the page and it is not the one-time surface -- so the secret
+    must leave here through `one_time` alone. Stripping per-branch let the
+    rotate path ship the password twice, once in `one_time` and once in text the
+    client had every reason to display and keep on screen.
+    """
+    payload = _runtime_payload(result)
+    if _SFTP_PASSWORD_MARKER in payload.get("message", ""):
+        payload["message"] = payload["message"].split(_SFTP_PASSWORD_MARKER, 1)[0]
+    return payload
+
+
 def api_site_sftp_action(domain: str, action: str) -> tuple[int, dict]:
     _known_domain(domain)
     if action == "enable":
         result = sftp.ensure_sftp_container(domain)
-        payload = _runtime_payload(result)
-        if "\npassword (shown once):" in payload["message"]:
-            payload["message"] = payload["message"].split("\npassword (shown once):", 1)[0]
-        return _operation_status(result, not_found=True), payload
     elif action == "disable":
         result = sftp.remove_sftp_container(domain)
     elif action == "rotate":
         password = generated_secret()[:16]
         result = sftp.rotate_sftp_password(domain, password=password)
-        payload = _runtime_payload(result)
+        payload = _sftp_payload(result)
         if result.exit_code == 0:
             payload["one_time"] = {"password": password}
         return _operation_status(result, not_found=True), payload
     else:
         raise PanelError(400, f"unknown sftp action: {action}")
-    return _operation_status(result, not_found=True), _runtime_payload(result)
+    return _operation_status(result, not_found=True), _sftp_payload(result)
 
 
 def api_site_wp(domain: str, wp_args: list) -> tuple[int, dict]:
@@ -675,20 +826,19 @@ def api_site_wp(domain: str, wp_args: list) -> tuple[int, dict]:
     return 200, {"ok": proc.exit_code == 0, "exit_code": proc.exit_code, "stdout": proc.stdout, "stderr": proc.stderr}
 
 
-def api_site_config(domain: str, body: dict) -> tuple[int, dict]:
-    _known_domain(domain)
-    php_keys = {
-        "php_memory_limit", "php_max_execution_time", "php_max_input_time",
-        "php_max_input_vars", "php_upload_max_size", "reset_php",
-    }
-    allowed = {"php_version", "flavor", "letsencrypt", "password", "dry_run", *php_keys}
-    if any(key not in allowed for key in body):
-        raise PanelError(400, "config contains an unsupported field")
-    if any(key in body for key in php_keys):
-        lifecycle_keys = {"php_version", "flavor", "letsencrypt", "password"}
-        if any(key in body for key in lifecycle_keys):
-            raise PanelError(400, "PHP ini settings cannot be combined with other config changes")
-        return api_php_settings(domain, body)
+_CONFIG_PHP_KEYS = frozenset({
+    "php_memory_limit", "php_max_execution_time", "php_max_input_time",
+    "php_max_input_vars", "php_upload_max_size", "reset_php",
+})
+_CONFIG_LIFECYCLE_KEYS = frozenset({"php_version", "flavor", "letsencrypt", "password"})
+
+
+def _validate_config_lifecycle_body(domain: str, body: dict) -> str | None:
+    """Validate the lifecycle-update fields of a config body; return the flavor.
+
+    Raises PanelError(400, ...) on anything invalid. Runs entirely before any
+    job is created, so a bad request fails synchronously (house rule 0).
+    """
     flavor = body.get("flavor")
     if flavor is not None and (not isinstance(flavor, str) or flavor not in _ALLOWED_PANEL_FLAVORS):
         raise PanelError(400, f"unknown site flavor: {flavor}")
@@ -701,23 +851,7 @@ def api_site_config(domain: str, body: dict) -> tuple[int, dict]:
     ):
         if value is not None and value not in allowed:
             raise PanelError(400, f"invalid {key}: {value!r}; accepted values: {', '.join(allowed)}")
-    try:
-        result = site_lifecycle.update_site(site_lifecycle.UpdateSiteRequest(
-            domain=domain,
-            php_version=body.get("php_version"),
-            flavor=flavor,
-            letsencrypt=body.get("letsencrypt"),
-            password=body.get("password"),
-            dry_run=body.get("dry_run") is True,
-        ))
-    except site_lifecycle.SiteLifecycleError as exc:
-        raise PanelError(400, str(exc))
-    if body.get("dry_run") is True:
-        return 200, {"changes": list(result.changes), "restarts": [domain] if result.changes else [], "scope": "site"}
-    return (200 if result.exit_code == 0 else 500), {
-        "ok": result.exit_code == 0, "changes": list(result.changes), "touched": list(result.touched),
-        "runtime": _runtime_payload(result.runtime),
-    }
+    return flavor
 
 
 def _config_result_payload(result: site_configuration.ConfigurationResult) -> tuple[int, dict]:
@@ -1040,10 +1174,22 @@ def _get_cache(principal, match, query, body): return api_site_cache(match.group
 def _security_state_payload(domain: str, config: dict | None = None) -> dict:
     domain = _known_domain(domain)
     config = config or site_security.load_security(domain)
-    trusted_sources = list(site_security.traefik_network_cidrs())
-    if site_security._cloudflare_trust_required(domain, config):
-        trusted_sources.extend(site_security.cloudflare_cidrs())
+    # The trusted-edge list is discovered from the running Traefik network, so it
+    # is unavailable whenever Docker is down -- and it is informational, unlike
+    # the deny-lists and basic-auth state around it. Letting the RuntimeError
+    # escape turned the whole security read into a 500 exactly when an operator
+    # is most likely to be reading it: while the runtime is broken.
+    # `login_shield_status()` already degrades this way; match it.
+    trusted_error = None
+    try:
+        trusted_sources = list(site_security.traefik_network_cidrs())
+        if site_security._cloudflare_trust_required(domain, config):
+            trusted_sources.extend(site_security.cloudflare_cidrs())
+    except (RuntimeError, OSError) as exc:
+        trusted_sources = []
+        trusted_error = events._redact(str(exc))
     return {
+        "trusted_edge_error": trusted_error,
         "deny_ips": list(config["deny_ips"]),
         "ua_blocks": list(config["ua_blocks"]),
         "basic_auth": dict(config["basic_auth"]),
@@ -1433,15 +1579,19 @@ def _put_nginx_custom(principal, match, query, body):
 
 
 def _get_setup_status(principal, match, query, body):
-    return 200, panel_setup.status(edge_bind=body.get("_edge_bind") is True)
+    return 200, panel_setup.status(remote=body.get("_edge_bind") is True)
 
 
 def _post_setup(principal, match, query, body):
     client = body.pop("_socket_client", None)
-    edge_bind = body.pop("_edge_bind", False) is True
+    if isinstance(principal, dict) and principal.get("_setup_secret"):
+        # The request authenticated with the secret; making the body repeat it
+        # would be two credentials for one grant.
+        body.setdefault("setup_secret", principal["_setup_secret"])
+    remote = body.pop("_edge_bind", False) is True
     setup_username = body.get("username", "") if isinstance(body.get("username"), str) else ""
     try:
-        token, user = panel_setup.create_account(body, client=client, edge_bind=edge_bind)
+        token, user = panel_setup.create_account(body, client=client, remote=remote)
     except panel_auth.ClientThrottleError as exc:
         panel_auth._append_panel_auth_failure("setup", client, setup_username, "throttled")
         retry_after = panel_auth.client_retry_after(client)
@@ -1449,7 +1599,7 @@ def _post_setup(principal, match, query, body):
         raise PanelError(429, str(exc), headers) from exc
     except ValueError as exc:
         panel_auth._append_panel_auth_failure("setup", client, setup_username, "invalid_credentials")
-        status = 403 if edge_bind else 400
+        status = 403 if remote else 400
         raise PanelError(status, str(exc)) from exc
     return 201, {
         "token": token,
@@ -1478,7 +1628,7 @@ def _post_setup_totp(principal, match, query, body):
             panel_auth._append_panel_auth_failure("setup_totp", client, username, "totp_failed")
             raise PanelError(400, str(exc)) from exc
         panel_auth.finish_setup_session(principal.get("_session_token"))
-        events.record_event("panel.totp.enrolled", actor=username)
+        _emit_event("panel.totp.enrolled", actor=username)
         return 200, {"ok": True, "enrolled": True}
     if action == "skip":
         if body.get("confirm") is not True:
@@ -1488,7 +1638,7 @@ def _post_setup_totp(principal, match, query, body):
             )
         panel_auth.cancel_totp_enrollment(username)
         panel_auth.finish_setup_session(principal.get("_session_token"))
-        events.record_event("panel.totp.skipped", actor=username)
+        _emit_event("panel.totp.skipped", actor=username)
         return 200, {"ok": True, "skipped": True}
     raise PanelError(400, "setup TOTP action must be begin, verify, or skip")
 
@@ -1609,8 +1759,328 @@ def _get_metrics(principal, match, query, body):
     scope = (query.get("scope") or [metrics.HOST_SCOPE])[0]
     range_key = (query.get("range") or [""])[0]
     return 200, api_metrics(scope, range_key)
+def _get_metrics_latest(principal, match, query, body): return 200, api_metrics_latest()
 def _get_system_services(principal, match, query, body): return 200, api_system_services()
 def _get_system_diagnostics(principal, match, query, body): return 200, api_system_diagnostics()
+
+
+def _get_settings(principal, match, query, body):
+    return 200, {"exposure": panel_exposure.exposure_status(), "telemetry": telemetry.status()}
+
+
+def _put_settings_telemetry(principal, match, query, body):
+    if set(body) != {"enabled"} or not isinstance(body.get("enabled"), bool):
+        raise PanelError(400, "telemetry requires an enabled boolean")
+    telemetry.set_enabled(body["enabled"])
+    return 200, telemetry.status()
+
+
+def _post_settings_exposure(principal, match, query, body):
+    allowed = {"domain", "confirm", "port"}
+    if any(key not in allowed for key in body):
+        raise PanelError(400, "panel exposure contains an unsupported field")
+    domain = body.get("domain")
+    if not isinstance(domain, str) or not domain:
+        raise PanelError(400, "panel exposure requires a domain")
+    # expose() gates on `confirm == domain` so the operator has to type the
+    # destination they are about to publish to the internet. Forwarding the
+    # domain we already hold would satisfy that check for them and reduce it to
+    # a checkbox, so the client sends it and we pass it through unchanged --
+    # same contract as _delete_site and _post_traefik_restart.
+    if body.get("confirm") != domain:
+        raise PanelError(400, "panel exposure requires confirm to exactly match the domain")
+    port = body.get("port", panel_exposure.DEFAULT_PANEL_PORT)
+    if not isinstance(port, int) or isinstance(port, bool):
+        raise PanelError(400, "panel exposure port must be an integer")
+    result = panel_exposure.expose(domain, confirm=body["confirm"], port=port)
+    return _operation_status(result), _runtime_payload(result)
+
+
+def _delete_settings_exposure(principal, match, query, body):
+    result = panel_exposure.disable()
+    return _operation_status(result), _runtime_payload(result)
+
+
+def _s3_config_payload(config):
+    return {
+        "endpoint": config.endpoint,
+        "bucket": config.bucket,
+        "region": config.region,
+        "prefix": config.prefix,
+        "access_key": config.access_key,
+        "allow_insecure": config.allow_insecure,
+    }
+
+
+def _get_remote_backup(principal, match, query, body):
+    try:
+        config = s3_backup.load_s3_config()
+    except s3_backup.S3ConfigError:
+        config_payload = None
+    else:
+        config_payload = _s3_config_payload(config)
+    schedule = backup_schedule.schedule_status()
+    return 200, {"config": config_payload, "schedule": _runtime_payload(schedule)}
+
+
+def _put_remote_backup(principal, match, query, body):
+    """Write the destination. A blank `secret_key` keeps the stored one.
+
+    The secret is write-only -- no read path returns it -- so a client editing
+    a destination cannot round-trip the value it is not allowed to see. Demanding
+    it on every write means changing a prefix forces the operator to re-type an
+    S3 secret, and a client that sends "" to satisfy a required field silently
+    replaces a working credential with an empty one. Nothing fails until the next
+    scheduled upload, in the middle of the night, quietly. So an absent or empty
+    secret means "keep what is stored", and only a non-empty value replaces it.
+    """
+    required = {"endpoint", "bucket", "region", "prefix", "access_key", "allow_insecure"}
+    allowed = required | {"secret_key"}
+    if any(key not in allowed for key in body) or not required <= set(body):
+        raise PanelError(400, "remote backup requires endpoint, bucket, region, prefix, access_key, and allow_insecure")
+    if any(not isinstance(body[key], str) for key in required - {"allow_insecure"}) or not isinstance(body["allow_insecure"], bool):
+        raise PanelError(400, "remote backup configuration has invalid field types")
+    secret_key = body.get("secret_key", "")
+    if not isinstance(secret_key, str):
+        raise PanelError(400, "remote backup configuration has invalid field types")
+    if not secret_key:
+        try:
+            secret_key = s3_backup.load_s3_config().secret_key
+        except s3_backup.S3ConfigError as exc:
+            raise PanelError(400, "no stored secret key to keep; enter the secret key for this destination") from exc
+    config = s3_backup.S3Config(**{**body, "secret_key": secret_key})
+    try:
+        s3_backup.write_s3_config(config)
+    except s3_backup.S3ConfigError as exc:
+        raise PanelError(400, s3_backup.redact_s3_secrets(str(exc), config)) from exc
+    return 200, {"config": _s3_config_payload(config)}
+
+
+def _delete_remote_backup(principal, match, query, body):
+    s3_backup.clear_s3_config()
+    return 200, {"ok": True}
+
+
+def _put_backup_schedule(principal, match, query, body):
+    allowed = {"cadence", "time", "weekday", "destination_dir", "upload_s3"}
+    if any(key not in allowed for key in body):
+        raise PanelError(400, "backup schedule contains an unsupported field")
+    cadence, at = body.get("cadence"), body.get("time")
+    if cadence not in {"daily", "weekly"} or not isinstance(at, str) or not backup_schedule.validate_time(at):
+        raise PanelError(400, "backup schedule requires daily or weekly cadence and time in HH:MM format")
+    weekday = body.get("weekday")
+    if cadence == "weekly" and (not isinstance(weekday, str) or not backup_schedule.validate_weekday(weekday)):
+        raise PanelError(400, "weekly backup schedule requires a valid weekday")
+    if cadence == "daily" and weekday is not None:
+        raise PanelError(400, "daily backup schedule does not accept a weekday")
+    destination_dir = body.get("destination_dir")
+    if destination_dir is not None and not isinstance(destination_dir, str):
+        raise PanelError(400, "backup destination_dir must be a string or null")
+    upload_s3 = body.get("upload_s3", False)
+    if not isinstance(upload_s3, bool):
+        raise PanelError(400, "backup upload_s3 must be a boolean")
+    result = backup_schedule.install_schedule(backup_schedule.BackupSchedule(cadence, at, destination_dir, upload_s3, weekday))
+    return _operation_status(result), _runtime_payload(result)
+
+
+def _delete_backup_schedule(principal, match, query, body):
+    result = backup_schedule.disable_schedule()
+    return _operation_status(result), _runtime_payload(result)
+
+
+def _firewall_ports_payload() -> dict:
+    state = firewall_ports.status()
+    return {
+        "installed": state.installed, "active": state.active,
+        "default_incoming": state.default_incoming, "default_outgoing": state.default_outgoing,
+        "ssh_port": state.ssh_port, "message": state.message,
+        "rules": [asdict(rule) for rule in state.rules],
+        "presets": [dict(preset) for preset in firewall_ports.PRESETS],
+    }
+
+
+def _get_firewall(principal, match, query, body):
+    enforcement = fail2ban_docker.enforcement_status()
+    return 200, {
+        "enforcement": asdict(enforcement),
+        "action_stale": fail2ban_docker.action_is_stale(),
+        "ipv6_capable": fail2ban_docker.ipv6_capable(),
+        "ports": _firewall_ports_payload(),
+    }
+
+
+_PORT_RULE_FIELDS = frozenset({"port", "protocol", "source", "comment", "action", "confirm"})
+
+
+def _port_rule_request(body: dict, *, allowed_actions: tuple[str, ...]) -> tuple[str, str, str, str | None, str | None, bool]:
+    """Validate a port-rule request and resolve the SSH confirmation.
+
+    The confirmation is resolved here rather than in `firewall_ports` so the
+    domain module keeps one meaning for `force` -- "the caller has accepted the
+    lockout risk" -- and the panel stays the only place that decides what
+    accepting it looks like over HTTP.
+    """
+    if any(key not in _PORT_RULE_FIELDS for key in body):
+        raise PanelError(400, "port rule contains an unsupported field")
+    action = str(body.get("action") or allowed_actions[0]).strip().lower()
+    if action not in allowed_actions:
+        raise PanelError(400, f"invalid action: {action!r}; accepted values: {', '.join(allowed_actions)}")
+    try:
+        port = firewall_ports.validate_port(body.get("port"))
+        protocol = firewall_ports.validate_protocol(body.get("protocol") or "tcp")
+        source = firewall_ports.validate_source(body.get("source"))
+        comment = firewall_ports.validate_comment(body.get("comment"))
+    except ValueError as exc:
+        raise PanelError(400, str(exc)) from exc
+    ssh = firewall_ports.ssh_port()
+    force = body.get("confirm") == str(ssh)
+    return action, port, protocol, source, comment, force
+
+
+def _post_firewall_port(principal, match, query, body):
+    action, port, protocol, source, comment, force = _port_rule_request(body, allowed_actions=("allow", "deny"))
+    if action == "allow":
+        result = firewall_ports.allow_port(port, protocol, source=source, comment=comment)
+    else:
+        result = firewall_ports.deny_port(port, protocol, source=source, comment=comment, force=force)
+    payload = _runtime_payload(result)
+    payload["ports"] = _firewall_ports_payload()
+    return _operation_status(result), payload
+
+
+def _delete_firewall_port(principal, match, query, body):
+    action, port, protocol, source, _comment, force = _port_rule_request(
+        body, allowed_actions=("allow", "deny", "reject"),
+    )
+    result = firewall_ports.delete_rule(port, protocol, action, source=source, force=force)
+    payload = _runtime_payload(result)
+    payload["ports"] = _firewall_ports_payload()
+    return _operation_status(result), payload
+
+
+def _post_firewall_enable(principal, match, query, body):
+    result = firewall_ports.enable()
+    payload = _runtime_payload(result)
+    payload["ports"] = _firewall_ports_payload()
+    return _operation_status(result), payload
+
+
+def _post_firewall_disable(principal, match, query, body):
+    # Disabling opens every port at once, so it carries the same typed
+    # confirmation the destructive site operations use.
+    if body.get("confirm") != "disable":
+        raise PanelError(400, "disabling the firewall requires confirm to be exactly \"disable\"")
+    result = firewall_ports.disable()
+    payload = _runtime_payload(result)
+    payload["ports"] = _firewall_ports_payload()
+    return _operation_status(result), payload
+
+
+def _post_firewall_install(principal, match, query, body):
+    job = panel_jobs.create_job("firewall.install", None)
+
+    def operation():
+        result = fail2ban_host.ensure_fail2ban_host()
+        payload = {
+            "ok": result.exit_code == 0,
+            "exit_code": result.exit_code,
+            "message": result.message,
+            "changed": result.changed,
+            "installed": result.installed,
+            "health_ok": result.health_ok,
+        }
+        if result.exit_code != 0:
+            raise RuntimeError(result.message or "firewall install failed")
+        return payload, None
+    _start_job(job, operation, actor=_principal_username(principal))
+    return 202, {"job_id": job.id}
+
+
+def _smtp_config_payload(config):
+    return {"host": config.host, "port": config.port, "sender": config.sender, "username": config.username, "tls": config.tls}
+
+
+def _get_smtp(principal, match, query, body):
+    try:
+        config = smtp.load_smtp_config()
+    except smtp.SMTPConfigError:
+        return 200, {"configured": False, "status": []}
+    return 200, {"configured": True, "config": _smtp_config_payload(config), "status": smtp.smtp_status_lines(config)}
+
+
+def _put_smtp(principal, match, query, body):
+    """Write the SMTP transport. A blank `password` keeps the stored one.
+
+    Same shape as `_put_remote_backup`, and for the same reason: the password is
+    write-only, so a client editing the sender address cannot round-trip a value
+    it is never allowed to read. Demanding it on every write means changing a
+    port re-types a mail password, and a client sending "" to satisfy a required
+    field silently replaces a working credential with an empty one.
+    """
+    required = {"host", "port", "sender", "username", "tls"}
+    allowed = required | {"password"}
+    if any(key not in allowed for key in body) or not required <= set(body):
+        raise PanelError(400, "SMTP requires host, port, sender, username, and tls")
+    if any(not isinstance(body[key], str) for key in required - {"port"}) or not isinstance(body["port"], int) or isinstance(body["port"], bool):
+        raise PanelError(400, "SMTP configuration has invalid field types")
+    if not 1 <= body["port"] <= 65535 or body["tls"] not in smtp.TLS_MODES:
+        raise PanelError(400, "SMTP port or tls mode is invalid")
+    password = body.get("password", "")
+    if not isinstance(password, str):
+        raise PanelError(400, "SMTP configuration has invalid field types")
+    if not password:
+        try:
+            password = smtp.load_smtp_config().password
+        except smtp.SMTPConfigError as exc:
+            raise PanelError(400, "no stored password to keep; enter the SMTP password") from exc
+    config = smtp.SMTPConfig(**{**body, "password": password})
+    smtp.write_smtp_config(config)
+    return 200, {"config": _smtp_config_payload(config)}
+
+
+def _post_smtp_test(principal, match, query, body):
+    if set(body) != {"recipient"} or not isinstance(body.get("recipient"), str):
+        raise PanelError(400, "SMTP test requires a recipient string")
+    try:
+        config = smtp.load_smtp_config()
+        message = smtp.send_test_message(config, body["recipient"])
+    except smtp.SMTPConfigError as exc:
+        if "config" in locals():
+            raise PanelError(400, smtp.redact_smtp_secret(str(exc), config)) from exc
+        raise PanelError(400, str(exc)) from exc
+    except (OSError, ValueError) as exc:
+        raise PanelError(500, smtp.redact_smtp_secret(str(exc), config)) from exc
+    return 200, {"message": smtp.redact_smtp_secret(message, config)}
+
+
+def _delete_smtp(principal, match, query, body):
+    smtp.clear_smtp_config()
+    return 200, {"ok": True}
+
+
+def _get_instance(principal, match, query, body):
+    facts = operational_inspection.aggregate_info()
+    paths = settings.PATHS
+    return 200, {
+        "version": __version__,
+        "paths": {"install_root": paths.install_root, "config_dir": paths.config_dir, "state_dir": paths.state_dir, "log_dir": paths.log_dir},
+        "docker_version": facts.docker_version,
+        "traefik": facts.traefik_message,
+        "site_count": len(facts.sites),
+    }
+
+
+def _get_basic_auth_inventory(principal, match, query, body):
+    rows = []
+    for site in sorted(list_sites(), key=lambda item: str(item.get("domain", ""))):
+        domain = site.get("domain")
+        if not isinstance(domain, str):
+            continue
+        basic_auth = site_security.load_security(domain)["basic_auth"]
+        rows.append({"domain": domain, "enabled": basic_auth["enabled"], "username": basic_auth["username"]})
+    return 200, {"basic_auth": rows}
+
+
 def _post_site_service_restart(principal, match, query, body):
     domain = _known_domain(match.group("domain"))
     service = unquote(match.group("service"))
@@ -1623,10 +2093,19 @@ def _post_site_service_restart(principal, match, query, body):
 def _post_traefik_restart(principal, match, query, body):
     if body.get("confirm") != traefik.TRAEFIK_CONTAINER:
         raise PanelError(400, "traefik restart requires confirm to exactly match wpfy-traefik")
-    result = traefik.restart_traefik_existing()
-    return _operation_status(result, skip_is_failure=True), _runtime_payload(result)
+    job = panel_jobs.create_job("system.traefik.restart", None)
+
+    def operation():
+        result = traefik.restart_traefik_existing()
+        payload = _runtime_payload(result)
+        if result.exit_code != 0:
+            raise RuntimeError(result.message or "traefik restart failed")
+        return payload, None
+    _start_job(job, operation, actor=_principal_username(principal))
+    return 202, {"job_id": job.id}
 def _get_site(principal, match, query, body): return 200, api_site_detail(match.group("domain"))
 def _get_health(principal, match, query, body): return 200, api_site_health(match.group("domain"))
+def _get_site_services(principal, match, query, body): return 200, api_site_services(match.group("domain"))
 def _get_diagnostics(principal, match, query, body): return 200, api_site_diagnostics(match.group("domain"))
 def _get_backups(principal, match, query, body): return 200, api_site_backups(match.group("domain"))
 def _get_sftp(principal, match, query, body): return api_site_sftp(match.group("domain"))
@@ -1672,7 +2151,15 @@ def _get_events(principal, match, query, body):
     return 200, {"events": listed}
 
 
+_CREATE_SITE_FIELDS = frozenset({
+    "domain", "flavor", "php_version", "letsencrypt", "dns_provider",
+    "admin_user", "admin_email", "object_cache", "page_cache", "enable_sftp", "dry_run",
+})
+
+
 def _post_create_site(principal, match, query, body):
+    if any(key not in _CREATE_SITE_FIELDS for key in body):
+        raise PanelError(400, "site creation contains an unsupported field")
     domain, flavor = body.get("domain"), body.get("flavor")
     if not isinstance(domain, str) or not domain:
         raise PanelError(400, "site creation requires a domain")
@@ -1690,6 +2177,27 @@ def _post_create_site(principal, match, query, body):
     ):
         if value is not None and (not isinstance(value, str) or value not in allowed):
             raise PanelError(400, f"invalid {key}: {value!r}; accepted values: {', '.join(allowed)}")
+    object_cache = body.get("object_cache")
+    if object_cache is not None:
+        if not isinstance(object_cache, str):
+            raise PanelError(400, "object_cache must be a string")
+        try:
+            object_cache = validate_object_cache(object_cache)
+        except ValueError as exc:
+            raise PanelError(400, str(exc)) from exc
+    page_cache = body.get("page_cache")
+    if page_cache is not None:
+        if not isinstance(page_cache, str):
+            raise PanelError(400, "page_cache must be a string")
+        try:
+            page_cache = validate_page_cache(page_cache)
+        except ValueError as exc:
+            raise PanelError(400, str(exc)) from exc
+    if (object_cache is not None or page_cache is not None) and flavor not in WORDPRESS_FLAVORS:
+        raise PanelError(400, f"cache integration requires a WordPress site: {domain}")
+    enable_sftp = body.get("enable_sftp")
+    if enable_sftp is not None and not isinstance(enable_sftp, bool):
+        raise PanelError(400, "enable_sftp must be a boolean")
     planned = _dry_run(body, [f"create {domain} ({flavor})"], [domain], "site")
     if planned:
         return planned
@@ -1713,6 +2221,43 @@ def _post_create_site(principal, match, query, body):
         one_time = {"wordpress_admin_password": result.generated_password} if result.generated_password else None
         if result.exit_code != 0:
             raise RuntimeError("site creation failed")
+
+        if object_cache is not None or page_cache is not None:
+            panel_jobs.append_step(job.id, "applying cache configuration")
+            current = _cache_definition(domain)
+            desired = replace(
+                current,
+                page_cache=page_cache if page_cache is not None else current.page_cache,
+                object_cache=object_cache if object_cache is not None else current.object_cache,
+                use_redis=(object_cache if object_cache is not None else current.object_cache) == "redis",
+            )
+            ensure_site_scaffold(desired)
+            start_site_runtime(domain)
+            ordered_actions = [
+                site_cache.install_page_cache(domain, desired.page_cache),
+                site_cache.render_cache_nginx(domain),
+                site_cache.set_wp_cache_constants(domain),
+            ]
+            if desired.object_cache == "redis" or object_cache is not None:
+                ordered_actions.append(site_cache.wire_redis_backend(domain))
+            ordered_actions = [_panel_cache_action(action) for action in ordered_actions]
+            cache_result = site_cache.CacheConfigurationResult(desired, tuple(ordered_actions), ())
+            payload["cache"] = {
+                "page_cache": desired.page_cache, "object_cache": desired.object_cache,
+                "ok": cache_result.exit_code == 0,
+            }
+            if cache_result.exit_code != 0:
+                raise RuntimeError(cache_result.message or "site cache configuration failed")
+
+        if enable_sftp is True:
+            panel_jobs.append_step(job.id, "provisioning sftp")
+            sftp_password = generated_secret()[:16]
+            sftp_result = sftp.ensure_sftp_container(domain, password=sftp_password)
+            payload["sftp"] = _sftp_payload(sftp_result)
+            if sftp_result.exit_code != 0:
+                raise RuntimeError(sftp_result.message or "sftp provisioning failed")
+            one_time = {**(one_time or {}), "sftp_password": sftp_password}
+
         return payload, one_time
     _start_job(job, operation, actor=_principal_username(principal))
     return 202, {"job_id": job.id}
@@ -1739,16 +2284,42 @@ def _delete_site(principal, match, query, body):
 
 
 def _post_backup(principal, match, query, body):
+    domain = match.group("domain")
+    _known_domain(domain)
     planned = _dry_run(body, ["create backup"], [], "site")
-    return planned or api_site_backup_create(match.group("domain"))
+    if planned:
+        return planned
+    job = panel_jobs.create_job("site.backup.create", domain)
+
+    def operation():
+        _, payload = api_site_backup_create(domain)
+        if not payload.get("ok"):
+            raise RuntimeError(payload.get("message") or "backup failed")
+        return payload, None
+    _start_job(job, operation, actor=_principal_username(principal))
+    return 202, {"job_id": job.id}
 
 
 def _post_restore(principal, match, query, body):
+    domain = match.group("domain")
+    _known_domain(domain)
     archive = body.get("archive")
     if not isinstance(archive, str) or not archive:
         raise PanelError(400, "restore requires an archive name")
-    planned = _dry_run(body, [f"restore {archive}"], [match.group("domain")], "site")
-    return planned or api_site_restore(match.group("domain"), archive)
+    if archive not in {item.name for item in list_backup_archives(domain)}:
+        raise PanelError(404, f"backup archive not found for {domain}: {archive}")
+    planned = _dry_run(body, [f"restore {archive}"], [domain], "site")
+    if planned:
+        return planned
+    job = panel_jobs.create_job("site.restore", domain)
+
+    def operation():
+        _, payload = api_site_restore(domain, archive)
+        if not payload.get("ok"):
+            raise RuntimeError(payload.get("message") or "restore failed")
+        return payload, None
+    _start_job(job, operation, actor=_principal_username(principal))
+    return 202, {"job_id": job.id}
 
 
 def _post_runtime(principal, match, query, body):
@@ -1829,8 +2400,71 @@ def _delete_file(principal, match, query, body):
     )}
 
 
-def _post_wp(principal, match, query, body): return api_site_wp(match.group("domain"), body.get("args") or [])
-def _post_config(principal, match, query, body): return api_site_config(match.group("domain"), body)
+def _post_wp(principal, match, query, body):
+    domain = match.group("domain")
+    _known_domain(domain)
+    wp_args = body.get("args") or []
+    if not wp_args or not all(isinstance(arg, str) and "\x00" not in arg for arg in wp_args):
+        raise PanelError(400, "wp requires a non-empty list of string arguments")
+    planned = _dry_run(body, [f"wp {' '.join(wp_args)}"], [domain], "site")
+    if planned:
+        return planned
+    job = panel_jobs.create_job("site.wp", domain)
+
+    def operation():
+        # ponytail: run_wp_cli blocks on subprocess.run (no incremental hook to
+        # stream into append_step); the job still frees the request immediately
+        # and the full stdout/stderr land in the job result on completion.
+        # Add a progress-capable run_wp_cli variant if live tailing is needed.
+        # api_site_wp raises PanelError on a real execution failure (not ran);
+        # that propagates through and fails the job, matching house rule 1.1.
+        _, payload = api_site_wp(domain, wp_args)
+        return payload, None
+    _start_job(job, operation, actor=_principal_username(principal))
+    return 202, {"job_id": job.id}
+
+
+def _post_config(principal, match, query, body):
+    domain = match.group("domain")
+    _known_domain(domain)
+    allowed = {"php_version", "flavor", "letsencrypt", "password", "dry_run", *_CONFIG_PHP_KEYS}
+    if any(key not in allowed for key in body):
+        raise PanelError(400, "config contains an unsupported field")
+    if any(key in body for key in _CONFIG_PHP_KEYS):
+        if any(key in body for key in _CONFIG_LIFECYCLE_KEYS):
+            raise PanelError(400, "PHP ini settings cannot be combined with other config changes")
+        # PHP ini settings are already fast/synchronous via the dedicated
+        # php-settings route; this alias keeps that behavior unconverted.
+        return api_php_settings(domain, body)
+    flavor = _validate_config_lifecycle_body(domain, body)
+    if body.get("dry_run") is True:
+        try:
+            result = site_lifecycle.update_site(site_lifecycle.UpdateSiteRequest(
+                domain=domain, php_version=body.get("php_version"), flavor=flavor,
+                letsencrypt=body.get("letsencrypt"), password=body.get("password"), dry_run=True,
+            ))
+        except site_lifecycle.SiteLifecycleError as exc:
+            raise PanelError(400, str(exc))
+        return 200, {"changes": list(result.changes), "restarts": [domain] if result.changes else [], "scope": "site"}
+    job = panel_jobs.create_job("site.config", domain)
+
+    def operation():
+        try:
+            result = site_lifecycle.update_site(site_lifecycle.UpdateSiteRequest(
+                domain=domain, php_version=body.get("php_version"), flavor=flavor,
+                letsencrypt=body.get("letsencrypt"), password=body.get("password"), dry_run=False,
+            ))
+        except site_lifecycle.SiteLifecycleError as exc:
+            raise RuntimeError(str(exc)) from exc
+        payload = {
+            "ok": result.exit_code == 0, "changes": list(result.changes), "touched": list(result.touched),
+            "runtime": _runtime_payload(result.runtime),
+        }
+        if result.exit_code != 0:
+            raise RuntimeError(result.runtime.message or "site config update failed")
+        return payload, None
+    _start_job(job, operation, actor=_principal_username(principal))
+    return 202, {"job_id": job.id}
 
 
 def _post_ssl_preflight(principal, match, query, body):
@@ -1940,7 +2574,7 @@ def _delete_file_manager_metadata(principal, match, query, body):
     if body.get("confirm") != "reset file manager metadata":
         raise PanelError(400, "metadata reset requires confirmation")
     quantum_provider.reset_metadata(domain)
-    events.record_event("file_manager.reset", domain=domain, actor=_principal_username(principal))
+    _emit_event("file_manager.reset", domain=domain, actor=_principal_username(principal))
     return 200, {"ok": True}
 
 
@@ -2024,17 +2658,41 @@ _ROUTES = (
     ),
     Route("GET", re.compile(r"^/api/overview$"), _get_overview, RouteMeta("system.overview", "system")),
     Route("GET", re.compile(r"^/api/sites$"), _get_sites, RouteMeta("site.list", "system")),
-    Route("POST", re.compile(r"^/api/sites$"), _post_create_site, RouteMeta("site.create", "site", True)),
+    Route("POST", re.compile(r"^/api/sites$"), _post_create_site, RouteMeta("site.create", "system", True)),
     Route("GET", re.compile(r"^/api/metrics$"), _get_metrics, RouteMeta("system.metrics", "system")),
+    Route("GET", re.compile(r"^/api/metrics/latest$"), _get_metrics_latest, RouteMeta("system.metrics", "system")),
     Route("GET", re.compile(r"^/api/system/services$"), _get_system_services, RouteMeta("system.services", "system")),
     Route("POST", re.compile(r"^/api/system/traefik/restart$"), _post_traefik_restart, RouteMeta("system.traefik.restart", "system", True, True)),
     Route("GET", re.compile(r"^/api/system/diagnostics$"), _get_system_diagnostics, RouteMeta("system.diagnostics", "system")),
+    Route("GET", re.compile(r"^/api/settings$"), _get_settings, RouteMeta("settings.read", "system")),
+    Route("PUT", re.compile(r"^/api/settings/telemetry$"), _put_settings_telemetry, RouteMeta("settings.telemetry", "system", True)),
+    Route("POST", re.compile(r"^/api/settings/exposure$"), _post_settings_exposure, RouteMeta("settings.exposure", "system", True, True)),
+    Route("DELETE", re.compile(r"^/api/settings/exposure$"), _delete_settings_exposure, RouteMeta("settings.exposure.disable", "system", True, True)),
+    Route("GET", re.compile(r"^/api/backup/remote$"), _get_remote_backup, RouteMeta("backup.remote.read", "system")),
+    Route("PUT", re.compile(r"^/api/backup/remote$"), _put_remote_backup, RouteMeta("backup.remote.write", "system", True)),
+    Route("DELETE", re.compile(r"^/api/backup/remote$"), _delete_remote_backup, RouteMeta("backup.remote.clear", "system", True, True)),
+    Route("PUT", re.compile(r"^/api/backup/schedule$"), _put_backup_schedule, RouteMeta("backup.schedule.write", "system", True)),
+    Route("DELETE", re.compile(r"^/api/backup/schedule$"), _delete_backup_schedule, RouteMeta("backup.schedule.disable", "system", True, True)),
+    Route("GET", re.compile(r"^/api/firewall$"), _get_firewall, RouteMeta("firewall.read", "system")),
+    Route("POST", re.compile(r"^/api/firewall/install$"), _post_firewall_install, RouteMeta("firewall.install", "system", True)),
+    Route("POST", re.compile(r"^/api/firewall/ports$"), _post_firewall_port, RouteMeta("firewall.port.add", "system", True, True)),
+    Route("DELETE", re.compile(r"^/api/firewall/ports$"), _delete_firewall_port, RouteMeta("firewall.port.remove", "system", True, True)),
+    Route("POST", re.compile(r"^/api/firewall/enable$"), _post_firewall_enable, RouteMeta("firewall.enable", "system", True, True)),
+    Route("POST", re.compile(r"^/api/firewall/disable$"), _post_firewall_disable, RouteMeta("firewall.disable", "system", True, True)),
+    Route("GET", re.compile(r"^/api/notifications/smtp$"), _get_smtp, RouteMeta("notify.smtp.read", "system")),
+    Route("PUT", re.compile(r"^/api/notifications/smtp$"), _put_smtp, RouteMeta("notify.smtp.write", "system", True)),
+    Route("POST", re.compile(r"^/api/notifications/smtp/test$"), _post_smtp_test, RouteMeta("notify.smtp.test", "system", True)),
+    Route("DELETE", re.compile(r"^/api/notifications/smtp$"), _delete_smtp, RouteMeta("notify.smtp.clear", "system", True, True)),
+    Route("GET", re.compile(r"^/api/instance$"), _get_instance, RouteMeta("instance.read", "system")),
+    Route("GET", re.compile(r"^/api/security/basic-auth$"), _get_basic_auth_inventory, RouteMeta("security.basicauth.list", "system")),
     Route("GET", re.compile(r"^/api/jobs$"), _get_jobs, RouteMeta("job.list", "system")),
     Route("GET", re.compile(r"^/api/jobs/(?P<job_id>[^/]+)$"), _get_job, RouteMeta("job.read", "system")),
     Route("GET", re.compile(r"^/api/events$"), _get_events, RouteMeta("event.list", "system")),
+    Route("GET", re.compile(r"^/api/stream$"), _get_stream, RouteMeta("event.stream", "system")),
     Route("DELETE", re.compile(r"^/api/sites/(?P<domain>[^/]+)$"), _delete_site, RouteMeta("site.delete", "site", True, True)),
     Route("GET", re.compile(r"^/api/sites/(?P<domain>[^/]+)$"), _get_site, RouteMeta("site.read", "site")),
     Route("GET", re.compile(r"^/api/sites/(?P<domain>[^/]+)/health$"), _get_health, RouteMeta("site.health", "site")),
+    Route("GET", re.compile(r"^/api/sites/(?P<domain>[^/]+)/services$"), _get_site_services, RouteMeta("site.services", "site")),
     Route("GET", re.compile(r"^/api/sites/(?P<domain>[^/]+)/diagnostics$"), _get_diagnostics, RouteMeta("site.diagnostics", "site")),
     Route("GET", re.compile(r"^/api/sites/(?P<domain>[^/]+)/logs$"), _get_logs, RouteMeta("site.logs", "site")),
     Route("GET", re.compile(r"^/api/sites/(?P<domain>[^/]+)/backups$"), _get_backups, RouteMeta("site.backup.list", "site")),
@@ -2264,6 +2922,11 @@ def make_panel_handler(config: PanelConfig) -> type[BaseHTTPRequestHandler]:
                 return None
             if not panel_auth.login_required() and hmac.compare_digest(token, config.token):
                 return _run_token_principal()
+            if not panel_auth.login_required() and panel_setup.setup_secret_matches(token):
+                # A domainless panel prints no run token, so the setup link is
+                # the browser's only credential. It authenticates the setup
+                # routes and nothing else -- see `authorize`.
+                return {"_setup_secret": token, "username": None, "role": None, "sites": ()}
             principal = panel_auth.authenticate_session(token)
             if principal is not None:
                 principal["_session_token"] = token
@@ -2379,8 +3042,13 @@ def make_panel_handler(config: PanelConfig) -> type[BaseHTTPRequestHandler]:
                         trusted_edge_networks(),
                     )
                 if route.meta.action in {"setup.status", "setup.create"}:
-                    body["_edge_bind"] = config.edge_bind
-                if route.meta.action == "file_manager.proxy":
+                    # "Can this request have come from off the host?" -- not
+                    # "is this edge-bound?". A domainless panel is not edge-bound
+                    # and is still on the open internet, and keying the setup
+                    # gate to edge_bind alone left `--public` creating the first
+                    # administrator with no secret at all.
+                    body["_edge_bind"] = config.edge_bind or config.self_signed_tls
+                if route.meta.action in {"file_manager.proxy", "event.stream"}:
                     result = route.handler(self, principal, match, parse_qs(parsed.query), body)
                 else:
                     result = route.handler(principal, match, parse_qs(parsed.query), body)
@@ -2402,7 +3070,7 @@ def make_panel_handler(config: PanelConfig) -> type[BaseHTTPRequestHandler]:
                         if route.meta.action == "auth.login"
                         else _principal_username(principal)
                     )
-                    events.record_event(route.meta.action, domain=domain, actor=actor)
+                    _emit_event(route.meta.action, domain=domain, actor=actor)
             except PanelError as exc:
                 self._send_json(exc.status, {"error": str(exc)}, exc.headers); return
             except (FileNotFoundError, ValueError) as exc:
@@ -2412,6 +3080,8 @@ def make_panel_handler(config: PanelConfig) -> type[BaseHTTPRequestHandler]:
             except Exception:
                 _LOGGER.exception("unhandled panel API error")
                 self._send_json(500, {"error": "internal server error"}); return
+            if isinstance(payload, _StreamAlreadySent):
+                return
             if isinstance(payload, _FileManagerProxyResponse):
                 self._send_file_manager_proxy(status, payload)
             elif isinstance(payload, files.Download):
@@ -2457,11 +3127,35 @@ def make_panel_server(config: PanelConfig) -> ThreadingHTTPServer:
             raise ValueError("edge-bound panel requires an enrolled TOTP factor")
         if not panel_exposure.exposure_status().get("exposed"):
             raise ValueError("edge-bound panel requires an active exposure router")
-        panel_exposure.validate_edge_bind(config.host)
+        panel_exposure.validate_panel_edge_bind(config.host)
+    elif config.self_signed_tls:
+        from . import panel_exposure
+
+        # The one non-loopback bind that is not edge-bound. It is allowed only
+        # because the socket is wrapped in TLS below before the first accept,
+        # and only for the address `expose --no-domain` issued the certificate
+        # for -- a different address would answer with a certificate whose
+        # fingerprint the operator was never given.
+        try:
+            validate_loopback_host(config.host)
+        except ValueError:
+            panel_exposure.validate_edge_bind(config.host)
+            if config.host != panel_exposure.public_bind_address():
+                raise ValueError(
+                    f"the self-signed certificate belongs to this host's public address, "
+                    f"not {config.host}; run: wpfy panel --public"
+                ) from None
     else:
         validate_loopback_host(config.host)
     _rediscover_file_managers()
     server = _PanelHTTPServer((config.host, config.port), make_panel_handler(config))
+    if config.self_signed_tls:
+        from . import panel_tls
+
+        # Wrapped before the first accept, so there is no window in which the
+        # panel answers a plaintext request on a public address.
+        certificate = panel_tls.ensure_self_signed(config.host)
+        server.socket = panel_tls.ssl_context(certificate).wrap_socket(server.socket, server_side=True)
     server.daemon_threads = True
     threading.Thread(
         target=_idle_reap_loop,
@@ -2473,8 +3167,15 @@ def make_panel_server(config: PanelConfig) -> ThreadingHTTPServer:
 
 
 def panel_url(config: PanelConfig, port: int | None = None) -> str:
-    base = f"http://{config.host}:{port or config.port}/"
-    return base if panel_auth.login_required() else f"{base}#token={config.token}"
+    scheme = "https" if config.self_signed_tls else "http"
+    base = f"{scheme}://{config.host}:{port or config.port}/"
+    if panel_auth.login_required() or config.self_signed_tls:
+        # The run token stands in for an account on a loopback panel, where
+        # reaching it already proves shell access. On a public address it is a
+        # full admin grant printed to the terminal and copied into the journal,
+        # so the setup secret -- single-use and expiring -- is the only way in.
+        return base
+    return f"{base}#token={config.token}"
 
 
 def serve_panel(config: PanelConfig) -> None:

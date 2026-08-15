@@ -1,7 +1,12 @@
-"""Opus-owned immutable gates: HTTP keep-alive body desync in the panel.
+"""Gates: HTTP keep-alive body desync in the panel.
 
-An actor may not edit, skip, xfail, parametrize away, or delete anything here.
-If a gate is wrong, escalate with evidence; do not change the file.
+These encode a decision, not an implementation detail, so a gate failing here
+usually means the product regressed rather than that the gate is out of date.
+
+They are editable, and were immutable until 2026-08-15. Change one only when
+the decision it pins has genuinely changed, never to make a red test green:
+say in the commit which decision moved and why, and keep the gate asserting the
+new one. A gate deleted or weakened to pass takes its invariant with it.
 
 WHAT THIS FILE IS ABOUT
 

@@ -8,10 +8,16 @@ import pytest
 
 @pytest.fixture
 def f2b_module(tmp_wpfy_home, monkeypatch):
-    """Reload fail2ban_host with redirected paths."""
+    """Reload fail2ban_host with redirected paths.
+
+    The ping wait is zeroed by default so failure-path tests do not spend the
+    real socket-wait window each; the tests that exercise the wait set their own.
+    """
     import wpfy.fail2ban_host
 
     importlib.reload(wpfy.fail2ban_host)
+    monkeypatch.setattr(wpfy.fail2ban_host, "PING_TIMEOUT_SECONDS", 0)
+    monkeypatch.setattr(wpfy.fail2ban_host.time, "sleep", lambda _seconds: None)
     return wpfy.fail2ban_host
 
 
@@ -1029,3 +1035,92 @@ def test_reload_failure_fresh_install_rolls_back_package(f2b_module, monkeypatch
     result = f2b_module.ensure_fail2ban_host()
     assert result.exit_code == 1
     assert removes, "fresh install must be removed when reload fails"
+
+
+def test_panel_auth_log_exists_before_the_jail_is_validated(f2b_module, monkeypatch):
+    """Found installing on a clean VPS: `wpfy stack install` rolled fail2ban back.
+
+    The panel jail's `logpath` is only created by the panel's first auth failure,
+    which on a fresh host has not happened. `fail2ban-client -t` treats a missing
+    logpath as fatal ("Have not found any log file for wpfy-panel-auth jail"), so
+    validation failed and the rollback removed every wpfy config -- on every
+    clean install, leaving the host with no intrusion prevention at all.
+    """
+    import wpfy.panel_auth as panel_auth
+
+    log_path = panel_auth.panel_auth_log_path()
+    assert not log_path.exists()
+    seen_at_validation = {}
+
+    def which(binary):
+        return "/usr/bin/" + binary
+
+    def run(command, **kwargs):
+        if command == ["fail2ban-client", "-t"]:
+            seen_at_validation["existed"] = log_path.exists()
+            return Proc(stdout="config ok")
+        if command == ["fail2ban-client", "ping"]:
+            return Proc(stdout="Server replied: pong")
+        return Proc()
+
+    monkeypatch.setattr(f2b_module.shutil, "which", which)
+    monkeypatch.setattr(f2b_module.subprocess, "run", run)
+
+    result = f2b_module.ensure_fail2ban_host()
+
+    assert seen_at_validation.get("existed") is True, "the jail was validated against a missing log"
+    assert result.exit_code == 0
+    assert log_path.stat().st_mode & 0o777 == 0o600
+    assert log_path.parent.stat().st_mode & 0o777 == 0o700
+
+
+def test_creating_the_panel_auth_log_is_idempotent(f2b_module):
+    """Re-running the installer must not truncate a log fail2ban is reading."""
+    import wpfy.panel_auth as panel_auth
+
+    path = panel_auth.ensure_panel_auth_log()
+    path.write_text('{"event":"panel_auth_failure"}\n', encoding="utf-8")
+    panel_auth.ensure_panel_auth_log()
+    assert path.read_text(encoding="utf-8") == '{"event":"panel_auth_failure"}\n'
+
+
+def test_ping_waits_for_the_socket_instead_of_racing_it(f2b_module, monkeypatch):
+    """Found installing on a clean VPS: fail2ban was rolled back while starting.
+
+    `systemctl start` returns when the unit is active; fail2ban-server binds its
+    socket a moment later. A single immediate ping lost that race every time,
+    and the rollback removed a fail2ban that was seconds from ready -- package
+    and all -- reporting a failure for a service that then ran fine.
+    """
+    attempts = {"n": 0}
+    monkeypatch.setattr(f2b_module, "PING_TIMEOUT_SECONDS", 5)
+
+    def run(command, **kwargs):
+        if command == ["fail2ban-client", "ping"]:
+            attempts["n"] += 1
+            if attempts["n"] < 3:
+                return Proc(returncode=255, stderr="Failed to access socket path: /var/run/fail2ban/fail2ban.sock")
+            return Proc(stdout="Server replied: pong")
+        return Proc()
+
+    monkeypatch.setattr(f2b_module.shutil, "which", lambda binary: "/usr/bin/" + binary)
+    monkeypatch.setattr(f2b_module.subprocess, "run", run)
+
+    ok, message = f2b_module._ping_fail2ban()
+
+    assert ok is True, message
+    assert attempts["n"] == 3
+
+
+def test_ping_still_gives_up_and_reports_the_last_reason(f2b_module, monkeypatch):
+    """Waiting must not become waiting forever, and the reason must survive."""
+    monkeypatch.setattr(f2b_module.shutil, "which", lambda binary: "/usr/bin/" + binary)
+    monkeypatch.setattr(
+        f2b_module.subprocess, "run",
+        lambda command, **kwargs: Proc(returncode=255, stderr="Failed to access socket path"),
+    )
+
+    ok, message = f2b_module._ping_fail2ban()
+
+    assert ok is False
+    assert "Failed to access socket path" in message

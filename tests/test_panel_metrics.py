@@ -102,3 +102,39 @@ def test_metrics_endpoint_isolates_site_rows_and_leaks_no_secret(panel_server):
     assert status == 200
     assert {sample["scope"] for sample in payload["samples"]} == {"one.example"}
     assert SECRET not in json.dumps(payload)
+
+
+def test_latest_samples_returns_one_row_per_scope(panel_server):
+    """The services view needs a current reading for every scope in one query."""
+    import time as _time
+
+    _, metrics = panel_server
+    now = int(_time.time())
+    metrics._insert_samples([
+        metrics.Sample(now - 120, metrics.HOST_SCOPE, 10.0, 1, 2, 3, 4, 0.5),
+        metrics.Sample(now - 60, metrics.HOST_SCOPE, 20.0, 1, 2, 3, 4, 0.5),
+        metrics.Sample(now - 60, "example.com", 30.0, 5, 6, 7, 8, 0.5),
+    ])
+    latest = {sample.scope: sample for sample in metrics.latest_samples()}
+    assert {metrics.HOST_SCOPE, "example.com"} <= set(latest)
+    assert len([s for s in metrics.latest_samples() if s.scope == metrics.HOST_SCOPE]) == 1
+    assert latest[metrics.HOST_SCOPE].cpu_percent == 20.0, "an older host sample won over the newer one"
+
+
+def test_latest_samples_drops_stale_scopes(panel_server):
+    """A site whose containers stopped keeps its last sample forever.
+
+    Rendering yesterday's reading as the current one is worse than rendering
+    nothing: the operator reads a stopped site as a healthy one.
+    """
+    import time as _time
+
+    _, metrics = panel_server
+    now = int(_time.time())
+    metrics._insert_samples([
+        metrics.Sample(now - 10, metrics.HOST_SCOPE, 1.0, 1, 2, 3, 4, 0.1),
+        metrics.Sample(now - 86400, "stopped.example", 99.0, 1, 2, 3, 4, 0.1),
+    ])
+    scopes = {sample.scope for sample in metrics.latest_samples()}
+    assert "stopped.example" not in scopes
+    assert metrics.HOST_SCOPE in scopes

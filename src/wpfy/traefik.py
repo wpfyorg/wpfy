@@ -761,6 +761,21 @@ def traefik_status() -> RuntimeResult:
     return RuntimeResult(0, message, ran=True)
 
 
+def traefik_health() -> str:
+    """One word for the edge proxy's state, in the same vocabulary as site rows.
+
+    `traefik_status()` is the human-readable `docker compose ps` table and stays
+    that way for the CLI; callers that compare against a status need this.
+    """
+    from .site_runtime import _container_healths, docker_available, runtime_skip_requested
+
+    if runtime_skip_requested() or not docker_available():
+        return "unavailable"
+    if not traefik_compose_path().exists():
+        return "not installed"
+    return (_container_healths([TRAEFIK_CONTAINER]) or ["unknown"])[0]
+
+
 def traefik_running() -> bool:
     docker = shutil.which("docker")
     if not docker:

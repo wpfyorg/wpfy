@@ -74,7 +74,7 @@ def record_event(
     detail="",
     actor="cli",
     job_id=None,
-) -> None:
+) -> dict:
     event = _json_safe(_redact({
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "action": str(action),
@@ -95,7 +95,8 @@ def record_event(
         finally:
             os.close(fd)
     except (OSError, TypeError, ValueError):
-        return
+        return event
+    return event
 
 
 def list_events(limit=200, domain=None, action=None) -> list[dict]:

@@ -116,6 +116,7 @@ def test_setup_password_license_edge_and_client_throttle(setup_home, monkeypatch
         status, payload = _request(host, port, "/api/setup", method="POST", token=config.token, body=_account())
         assert status == 403
         assert "SSH tunnel" in payload["error"]
+        assert "setup link" in payload["error"]
     finally:
         server.shutdown()
         server.server_close()
@@ -210,7 +211,7 @@ def test_concurrent_first_run_requests_create_one_admin(setup_home):
 
     def create(body):
         try:
-            results.append(panel_setup.create_account(body, client="198.51.100.14", edge_bind=False))
+            results.append(panel_setup.create_account(body, client="198.51.100.14", remote=False))
         except ValueError as exc:
             results.append(exc)
 

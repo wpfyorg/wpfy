@@ -2109,14 +2109,32 @@ def add_panel_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentPar
         help="read the access token from a file, keeping it out of the process table",
     )
     parser.add_argument("--edge-service", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--public",
+        action="store_true",
+        help="serve on this host's public address over the self-signed certificate "
+             "prepared by `wpfy panel expose --no-domain`",
+    )
     commands = parser.add_subparsers(dest="panel_command")
 
     expose = _add_parser(commands, "expose", help="Publish or disable the panel through Traefik.")
-    exposure_action = expose.add_mutually_exclusive_group(required=True)
+    # Not required: bare `wpfy panel expose` asks for the domain and the ACME
+    # contact address instead of printing a usage error.
+    exposure_action = expose.add_mutually_exclusive_group(required=False)
     exposure_action.add_argument("--domain")
+    exposure_action.add_argument(
+        "--no-domain",
+        action="store_true",
+        help="publish on this host's public address over self-signed TLS instead of a domain",
+    )
     exposure_action.add_argument("--disable", action="store_true")
     exposure_action.add_argument("--status", action="store_true")
     expose.add_argument("--confirm", help="typed confirmation; must exactly match --domain")
+    expose.add_argument(
+        "--email",
+        help="ACME contact address Let's Encrypt registers the certificate against; "
+             "asked for interactively when the host has none",
+    )
     expose.add_argument("--port", type=int, default=panel.DEFAULT_PANEL_PORT)
     expose.set_defaults(handler=handle_panel_exposure)
 
@@ -2260,9 +2278,36 @@ def handle_panel_exposure(args: argparse.Namespace) -> CommandResult:
                 if status["router_present"] and not status["service_installed"]:
                     lines.append("next: wpfy panel service install is required before the public panel is ready")
                 return CommandResult("\n".join(lines))
-            if args.disable:
+            if args.no_domain:
+                # Publishing to a bare address is asked for explicitly, never by
+                # forgetting --domain: it means a self-signed certificate and a
+                # browser warning, which is a different bargain from an ACME one.
+                confirmation = args.confirm
+                if confirmation is None:
+                    if not sys.stdin.isatty():
+                        return CommandResult(
+                            'typed confirmation required; pass --confirm expose',
+                            exit_code=2,
+                        )
+                    confirmation = input("Type expose to publish the panel on this host's public address: ")
+                result = panel_exposure.expose_without_domain(
+                    confirm=confirmation,
+                    port=args.port if args.port != panel.DEFAULT_PANEL_PORT else panel_exposure.DOMAINLESS_PANEL_PORT,
+                )
+            elif args.disable:
                 result = panel_exposure.disable()
             else:
+                domain = args.domain
+                if domain is None:
+                    if not sys.stdin.isatty():
+                        return CommandResult(
+                            "pass --domain with the panel domain, or --no-domain to publish on "
+                            "this host's public address",
+                            exit_code=2,
+                        )
+                    domain = input("Panel domain (blank to cancel): ").strip()
+                    if not domain:
+                        return CommandResult("cancelled; the panel was not exposed")
                 confirmation = args.confirm
                 if confirmation is None:
                     if not sys.stdin.isatty():
@@ -2270,8 +2315,23 @@ def handle_panel_exposure(args: argparse.Namespace) -> CommandResult:
                             "typed confirmation required; pass --confirm with the exact panel domain",
                             exit_code=2,
                         )
-                    confirmation = input(f"Type {args.domain} to expose the panel: ")
-                result = panel_exposure.expose(args.domain, confirm=confirmation, port=args.port)
+                    confirmation = input(f"Type {domain} to expose the panel: ")
+                # Ask for the contact address before exposing rather than after
+                # the certificate silently fails to issue: a fresh install ships
+                # a placeholder Let's Encrypt refuses at account registration.
+                # Setting it here is enough -- `expose` re-renders the static
+                # config and recreates Traefik, so the new address is applied.
+                email = args.email
+                if email is None and stack.traefik.acme_email_problem() and sys.stdin.isatty():
+                    email = input(
+                        "Email for Let's Encrypt (used to issue the certificate, blank to skip): "
+                    ).strip()
+                if email:
+                    try:
+                        stack.traefik.set_acme_email(email)
+                    except ValueError as exc:
+                        return CommandResult(str(exc), exit_code=2)
+                result = panel_exposure.expose(domain, confirm=confirmation, port=args.port)
         elif args.panel_command == "service":
             if args.panel_service_command == "install":
                 result = panel_exposure.install_service(panel_exposure.edge_bind_address(), args.port)
@@ -2321,7 +2381,23 @@ def handle_panel(args: argparse.Namespace) -> CommandResult:
         return CommandResult(f"panel token could not be read: {exc}", exit_code=2)
     if token_warning:
         print(token_warning, file=sys.stderr)
-    config = panel.PanelConfig(host=args.host, port=args.port, token=token, edge_bind=args.edge_service)
+    host, port = args.host, args.port
+    if args.public:
+        # `expose --no-domain` decided the address and issued the certificate for
+        # it. Re-deriving it here rather than asking the operator to retype it
+        # keeps the two from drifting: a host that does not match the
+        # certificate's SAN makes the fingerprint they were told to check
+        # meaningless.
+        try:
+            host = panel_exposure.public_bind_address()
+        except RuntimeError as exc:
+            return CommandResult(str(exc), exit_code=2)
+        if port == panel.DEFAULT_PANEL_PORT:
+            port = panel_exposure.DOMAINLESS_PANEL_PORT
+    config = panel.PanelConfig(
+        host=host, port=port, token=token,
+        edge_bind=args.edge_service, self_signed_tls=args.public,
+    )
     try:
         server = panel.make_panel_server(config)
     except ValueError as exc:
@@ -2338,16 +2414,23 @@ def handle_panel(args: argparse.Namespace) -> CommandResult:
             "sign in with a configured panel user; press Ctrl+C to stop",
         ]
     else:
-        access = (
-            "sign in with a configured panel user; press Ctrl+C to stop"
-            if panel_auth.login_required()
-            else "the URL carries a one-time access token; press Ctrl+C to stop"
-        )
+        if panel_auth.login_required():
+            access = "sign in with a configured panel user; press Ctrl+C to stop"
+        elif args.public:
+            access = ("no account exists yet: open the one-time setup link from "
+                      "`wpfy panel expose --no-domain`; press Ctrl+C to stop")
+        else:
+            access = "the URL carries a one-time access token; press Ctrl+C to stop"
         summary = [
-            f"listening: http://{args.host}:{actual_port}/",
+            f"listening: {'https' if args.public else 'http'}://{host}:{actual_port}/",
             f"open: {panel.panel_url(config, actual_port)}",
             access,
         ]
+        if args.public:
+            from . import panel_tls
+
+            summary.insert(2, f"certificate fingerprint (SHA-256): "
+                              f"{panel_tls.fingerprint_of(panel_tls.certificate_path())}")
     print(_render_summary("wpfy panel", summary), flush=True)
     try:
         server.serve_forever()

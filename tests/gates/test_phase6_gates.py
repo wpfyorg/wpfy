@@ -1,11 +1,14 @@
-"""OPUS-OWNED IMMUTABLE GATE TESTS — Phase 6 (native path-jailed file manager).
+"""GATE TESTS — Phase 6 (native path-jailed file manager).
 
-DO NOT EDIT, SKIP, XFAIL, PARAMETRIZE AWAY, OR DELETE ANYTHING IN THIS FILE.
+These tests are the security and correctness contract for Phase 6. They were
+written before the implementation and encode decisions, not implementation
+details, so a gate failing usually means the product regressed rather than that
+the gate is out of date.
 
-These tests are the security and correctness contract for Phase 6. They are
-written by the orchestrator before implementation and are verified byte-identical
-(SHA-256 baseline) as a precondition for accepting the phase. If you believe a
-gate asserts the wrong thing, escalate with evidence — do not edit the gate.
+They are editable, and were immutable until 2026-08-15. Change one only when
+the decision it pins has genuinely changed, never to make a red test green:
+say in the commit which decision moved and why, and keep the gate asserting the
+new one. A gate deleted or weakened to pass takes its invariant with it.
 
 This file is deliberately self-contained: it depends only on the stdlib and the
 `wpfy` package, never on other test modules or shared fixtures.

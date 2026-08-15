@@ -17,6 +17,10 @@ RATE_LIMIT_AVERAGE = 10
 RATE_LIMIT_BURST = 20
 DEFAULT_PANEL_PORT = 8642
 _ROUTER_NAME = "wpfy-panel"
+#: Distinguishes "use the stored credential" from an explicit None ("no credential").
+_UNSET = "\0unset"
+#: The `user:hash` line inside a rendered basicAuth block.
+_BASIC_AUTH_USER_RE = re.compile(r'^\s+- "([^"]+)"\s*$', re.MULTILINE)
 _SERVICE_NAME = "wpfy-panel.service"
 _CONTAINER_DYNAMIC_DIR = "/etc/traefik/dynamic"
 _DOMAIN_RULE_RE = re.compile(r"Host\(`([^`]+)`\)")
@@ -52,11 +56,35 @@ def _validated_target_url(target_url: str) -> str:
     return target_url
 
 
-def render_router_config(domain, target_url) -> str:
+def render_router_config(domain, target_url, credential: str | None = _UNSET) -> str:
     if not isinstance(domain, str):
         raise TypeError("panel domain must be a string")
     validate_domain(domain)
     target_url = _validated_target_url(target_url)
+    # Basic auth, when configured, guards the public router only. Loopback and
+    # the SSH tunnel stay unguarded on purpose: a forgotten credential must
+    # always be recoverable, and this is the only place it helps anyway --
+    # a scanner hitting the public domain is stopped before the login form
+    # loads.
+    #
+    # `credential` is explicit for `_router_details`, which must re-render a
+    # file written before the credential existed. Defaulting to the stored one
+    # made the recognition check disagree with any router written under a
+    # different credential state -- including the moment a credential is first
+    # stored, which is exactly when the router needs rewriting.
+    if credential is _UNSET:
+        credential = read_panel_basic_auth()
+    middlewares = [f"        - {_ROUTER_NAME}-rate-limit"]
+    if credential:
+        middlewares.append(f"        - {_ROUTER_NAME}-basic-auth")
+    basic_auth_block = []
+    if credential:
+        basic_auth_block = [
+            f"    {_ROUTER_NAME}-basic-auth:",
+            "      basicAuth:",
+            "        users:",
+            f'          - "{credential}"',
+        ]
     return "\n".join([
         "http:",
         "  routers:",
@@ -65,7 +93,7 @@ def render_router_config(domain, target_url) -> str:
         "      entryPoints:",
         "        - websecure",
         "      middlewares:",
-        f"        - {_ROUTER_NAME}-rate-limit",
+        *middlewares,
         f"      service: {_ROUTER_NAME}",
         "      tls:",
         "        certResolver: le-http",
@@ -74,6 +102,7 @@ def render_router_config(domain, target_url) -> str:
         "      rateLimit:",
         f"        average: {RATE_LIMIT_AVERAGE}",
         f"        burst: {RATE_LIMIT_BURST}",
+        *basic_auth_block,
         "  services:",
         f"    {_ROUTER_NAME}:",
         "      loadBalancer:",
@@ -97,19 +126,48 @@ def validate_edge_bind(host) -> str:
     return str(address)
 
 
+def validate_panel_edge_bind(host) -> str:
+    """The stricter rule for an edge-bound panel: inside the panel's own bridge.
+
+    Separate from `validate_edge_bind` because the domainless mode binds the
+    host's *public* address, which is deliberately outside this network. One
+    function cannot enforce both, so each caller names the rule it means.
+    """
+    address = ipaddress.ip_address(validate_edge_bind(host))
+    unknown = ValueError(f"panel edge network {PANEL_EDGE_NETWORK} could not be inspected")
+    try:
+        # `traefik_network_cidrs` returns CIDR *strings*, not network objects.
+        raw = traefik.traefik_network_cidrs(PANEL_EDGE_NETWORK)
+        networks = [ipaddress.ip_network(cidr, strict=False) for cidr in raw]
+    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+        raise unknown from exc
+    if not networks:
+        raise unknown
+    network = next(
+        (candidate for candidate in networks if address.version == candidate.version and address in candidate),
+        None,
+    )
+    if network is None:
+        raise ValueError(f"panel edge bind {address} is outside {PANEL_EDGE_NETWORK}")
+    if address == network.network_address:
+        raise ValueError(f"panel edge bind {address} is the network address of {network}")
+    if address.version == 4 and address == network.broadcast_address:
+        raise ValueError(f"panel edge bind {address} is the broadcast address of {network}")
+    return str(address)
+
+
 def edge_bind_address() -> str:
     gateway = traefik._network_gateway(PANEL_EDGE_NETWORK)
     if gateway is not None:
-        try:
-            return validate_edge_bind(gateway)
-        except ValueError:
-            pass
+        return validate_panel_edge_bind(gateway)
     raise RuntimeError(f"cannot determine a gateway address for {PANEL_EDGE_NETWORK}")
 
 
 def _target_url(host: str, port: int) -> str:
     if not isinstance(port, int) or isinstance(port, bool) or not 1 <= port <= 65535:
         raise ValueError("panel port must be between 1 and 65535")
+    # Deliberately the loose check: this renders a config string and must work
+    # with no Docker to ask, including in `render_router_config`.
     address = ipaddress.ip_address(validate_edge_bind(host))
     rendered_host = f"[{address}]" if address.version == 6 else str(address)
     return f"http://{rendered_host}:{port}"
@@ -159,6 +217,14 @@ def expose(domain, *, confirm, port=DEFAULT_PANEL_PORT) -> RuntimeResult:
         preflight = certificate_lifecycle.preflight_ssl(domain)
         if not preflight.passed:
             return RuntimeResult(2, preflight.message)
+        # The site path has refused without a real contact address since ADR
+        # 0016; this path did not, so `expose --domain` reported success and
+        # then Traefik failed at ACME account registration -- "contact email has
+        # invalid domain" -- leaving a panel that answers only with Traefik's
+        # self-signed default and no clue why.
+        email_problem = traefik.acme_email_problem()
+        if email_problem:
+            return RuntimeResult(2, email_problem)
 
         if not traefik.runtime_skip_requested() and traefik.docker_available():
             pull_result = traefik._pull_traefik_image()
@@ -210,9 +276,18 @@ def _router_details() -> dict | None:
         validate_domain(domain)
         _validated_target_url(target_url)
         parsed = urlsplit(target_url)
+        # Reading a file off disk must not require inspecting a Docker network:
+        # status is most wanted precisely when the daemon is unreachable.
         host = validate_edge_bind(parsed.hostname)
         port = parsed.port
-        if render_router_config(domain, target_url) != text:
+        # Re-render with the credential the file itself carries, not the one
+        # stored now. Storing a credential changes what `render_router_config`
+        # produces, so comparing against today's version made a router wpfy had
+        # just written unrecognisable the moment basic auth was configured --
+        # and `set_panel_basic_auth` only rewrites a router it recognises, so
+        # the credential could never be applied at all.
+        found = _BASIC_AUTH_USER_RE.search(text)
+        if render_router_config(domain, target_url, found.group(1) if found else None) != text:
             return None
     except (RuntimeError, TypeError, ValueError):
         return None
@@ -236,7 +311,7 @@ def exposure_status() -> dict:
 
 
 def panel_service_content(host, port) -> str:
-    host = validate_edge_bind(host)
+    host = validate_panel_edge_bind(host)
     _target_url(host, port)
     command = systemd.command_line([
         "/usr/local/bin/wpfy", "panel", "--host", host, "--port", str(port), "--edge-service",
@@ -296,3 +371,225 @@ def disable() -> RuntimeResult:
     if errors:
         return RuntimeResult(1, "; ".join(errors))
     return RuntimeResult(0, "panel exposure disabled", ran=True)
+
+
+# ---------------------------------------------------------------------------
+# Domainless exposure
+#
+# `expose(domain)` puts the panel behind Traefik with an ACME certificate. Not
+# every operator has a domain, so this binds the panel directly on a public
+# address instead. No CA issues certificates for a bare IP, so the connection is
+# carried by a self-signed certificate whose fingerprint is printed next to the
+# URL -- a browser warning an operator can verify, rather than one they are
+# trained to click through.
+#
+# Plaintext was considered and rejected: first-run account creation sends a
+# password and a TOTP secret, and every request afterwards carries a bearer
+# token. On the open internet all three are readable by anyone on the path.
+# ---------------------------------------------------------------------------
+
+DOMAINLESS_PANEL_PORT = 3939
+
+
+def public_bind_address() -> str:
+    """The address a domainless panel should listen on.
+
+    Deliberately not `0.0.0.0`: the operator is told exactly which address the
+    panel answers on, and the certificate is issued for that address, so the
+    fingerprint they verify belongs to a name the browser actually saw.
+    """
+    ipv4, ipv6 = certificate_lifecycle.detect_public_ips()
+    for candidate in (*ipv4, *ipv6):
+        try:
+            return validate_edge_bind(candidate)
+        except ValueError:
+            continue
+    raise RuntimeError(
+        "cannot determine a public address for this host; expose the panel with a domain instead"
+    )
+
+
+def domainless_status() -> dict:
+    from . import panel_tls
+
+    certificate = panel_tls.certificate_path()
+    if not certificate.exists():
+        return {"configured": False, "port": DOMAINLESS_PANEL_PORT}
+    try:
+        fingerprint = panel_tls.fingerprint_of(certificate)
+    except (OSError, ValueError):
+        fingerprint = None
+    return {
+        "configured": True,
+        "port": DOMAINLESS_PANEL_PORT,
+        "certificate": str(certificate),
+        "fingerprint": fingerprint,
+    }
+
+
+def expose_without_domain(*, confirm: object, port: int = DOMAINLESS_PANEL_PORT) -> RuntimeResult:
+    """Prepare a public, self-signed, domainless panel.
+
+    Returns the URL to open and the certificate fingerprint to check against the
+    browser warning. When no panel account exists yet, a one-time setup secret is
+    minted and embedded in the URL: over a tunnel-less public address it stands
+    in for the SSH tunnel that first-run setup would otherwise require.
+    """
+    from . import panel_setup, panel_tls
+
+    if confirm != "expose":
+        return RuntimeResult(2, 'confirmation must be exactly "expose"')
+    if not isinstance(port, int) or isinstance(port, bool) or not 1 <= port <= 65535:
+        return RuntimeResult(2, "panel port must be between 1 and 65535")
+
+    try:
+        host = public_bind_address()
+    except RuntimeError as exc:
+        return RuntimeResult(2, str(exc))
+
+    try:
+        certificate = panel_tls.ensure_self_signed(host)
+    except (OSError, RuntimeError, ValueError) as exc:
+        return RuntimeResult(2, str(exc))
+
+    url = f"https://{host}:{port}/"
+    lines = [
+        f"panel: {url}",
+        f"certificate fingerprint (SHA-256): {certificate.fingerprint}",
+    ]
+
+    if not panel_auth.login_required():
+        secret = panel_setup.issue_setup_secret()
+        lines.insert(0, f"panel: {url}#setup={secret}")
+        lines[1] = f"panel (no account yet, open the link above): {url}"
+        lines.append(
+            f"the setup link is single-use and expires in "
+            f"{panel_setup.SETUP_SECRET_TTL_SECONDS // 60} minutes"
+        )
+
+    lines.append(
+        "the browser will warn that this certificate is untrusted -- that is expected for a "
+        "bare address; check the fingerprint above before continuing"
+    )
+    # The panel is a host process, so ufw applies to it -- unlike the Docker
+    # published ports, which bypass ufw's INPUT chain entirely. An operator with
+    # the firewall on otherwise gets a panel that starts, reports the right URL,
+    # and times out from everywhere.
+    from . import firewall_ports
+
+    if firewall_ports.port_allowed(port) is False:
+        lines.append(
+            f"the firewall is active and does not allow {port}/tcp; the panel will be "
+            f"unreachable until you run: ufw allow {port}/tcp"
+        )
+
+    start = "wpfy panel --public" + (f" --port {port}" if port != DOMAINLESS_PANEL_PORT else "")
+    lines.append(f"start the panel with: {start}")
+    return RuntimeResult(0, "\n".join(lines), ran=True)
+
+
+# ---------------------------------------------------------------------------
+# Panel basic auth
+#
+# A second gate in front of the panel's own login form, applied to the public
+# Traefik router only. Loopback and the SSH tunnel stay unguarded deliberately:
+# a forgotten credential has to be recoverable, and the tunnel is the recovery
+# path. It is also the only place the gate does anything -- a scanner reaching
+# the public domain is refused before the login form is served.
+# ---------------------------------------------------------------------------
+
+_BASIC_AUTH_FILE = "panel-basic-auth"
+_SAFE_BASIC_AUTH_USERNAME = re.compile(r"^[A-Za-z0-9._@-]{1,64}$")
+
+
+def panel_basic_auth_path() -> Path:
+    from . import settings
+
+    return Path(settings.PATHS.config_dir) / _BASIC_AUTH_FILE
+
+
+def read_panel_basic_auth() -> str | None:
+    """The stored `user:hash` line, or None. Never the password."""
+    try:
+        line = panel_basic_auth_path().read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeDecodeError):
+        return None
+    return line or None
+
+
+def panel_basic_auth_status() -> dict:
+    line = read_panel_basic_auth()
+    return {
+        "enabled": line is not None,
+        "username": line.split(":", 1)[0] if line else None,
+    }
+
+
+def set_panel_basic_auth(username: str, password: str) -> RuntimeResult:
+    """Store a credential for the public router. The password is not kept."""
+    # APR1, not the sha512crypt `_htpasswd_hash` the per-site gate uses. That
+    # one is verified by nginx, which hashes through crypt(3) and takes `$6$`.
+    # This one is verified by Traefik, whose basicAuth understands MD5-APR1,
+    # SHA1 and bcrypt only -- a `$6$` line loads without complaint and then
+    # rejects the correct password forever.
+    from .site_security import _htpasswd_apr1
+
+    if not isinstance(username, str) or not _SAFE_BASIC_AUTH_USERNAME.fullmatch(username):
+        return RuntimeResult(2, "basic-auth username may use 1-64 letters, digits, '_', '.', '@', or '-'")
+    if not isinstance(password, str) or len(password) < 12:
+        return RuntimeResult(2, "basic-auth password must be at least 12 characters")
+
+    hashed = _htpasswd_apr1(password)
+    path = panel_basic_auth_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # Written in place with a restrictive mode: the hash is not a password, but
+    # it is offline-crackable and there is no reason for it to be readable.
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as stream:
+        stream.write(f"{username}:{hashed}\n")
+    os.chmod(path, 0o600)
+
+    status = exposure_status()
+    if status.get("exposed") and status.get("domain"):
+        refreshed = _rewrite_router(status["domain"], status.get("target_host"), status.get("target_port"))
+        if refreshed.exit_code != 0:
+            return refreshed
+        return RuntimeResult(0, f"panel basic auth enabled for {username}; the public router now requires it", ran=True)
+    return RuntimeResult(0, f"panel basic auth stored for {username}; it applies when the panel is published", ran=True)
+
+
+def clear_panel_basic_auth() -> RuntimeResult:
+    path = panel_basic_auth_path()
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return RuntimeResult(0, "panel basic auth was not configured", ran=False)
+    except OSError as exc:
+        return RuntimeResult(1, str(exc))
+
+    status = exposure_status()
+    if status.get("exposed") and status.get("domain"):
+        refreshed = _rewrite_router(status["domain"], status.get("target_host"), status.get("target_port"))
+        if refreshed.exit_code != 0:
+            return refreshed
+    return RuntimeResult(0, "panel basic auth removed", ran=True)
+
+
+def _rewrite_router(domain: str, host: object, port: object) -> RuntimeResult:
+    """Re-render the router so a credential change takes effect immediately.
+
+    Without this the file on disk still carries the previous middleware list and
+    the change only lands the next time someone re-exposes the panel -- which
+    reads, to the operator, as the credential not working.
+    """
+    try:
+        target = _target_url(str(host), int(port)) if host and port else None
+    except (TypeError, ValueError):
+        target = None
+    if target is None:
+        return RuntimeResult(2, "the panel router is unrecognised; re-run wpfy panel expose to rewrite it")
+    try:
+        panel_router_path().write_text(render_router_config(domain, target), encoding="utf-8")
+    except OSError as exc:
+        return RuntimeResult(1, str(exc))
+    return RuntimeResult(0, "router updated", ran=True)

@@ -145,6 +145,33 @@ def read_samples(scope: str, range_key: str) -> tuple[Sample, ...]:
     return tuple(Sample(*row) for row in rows)
 
 
+def latest_samples(max_age_seconds: int = 900) -> tuple[Sample, ...]:
+    """The newest sample for every scope, in one query.
+
+    The services view needs a current reading for the host and for each site at
+    once. Asking `read_samples` per scope is one round trip per site, so a host
+    with twenty sites pays twenty queries to render one page.
+
+    Samples older than `max_age_seconds` are dropped rather than returned stale:
+    a site whose containers stopped keeps its last sample forever, and a reading
+    from yesterday presented as current is worse than no reading at all.
+    """
+    path = metrics_db_path()
+    if not path.exists():
+        return ()
+    cutoff = int(time.time()) - max(0, int(max_age_seconds))
+    with closing(_connect()) as connection, connection:
+        rows = connection.execute(
+            "SELECT s.timestamp, s.scope, s.cpu_percent, s.memory_used, s.memory_total, "
+            "s.disk_used, s.disk_total, s.load1 FROM samples AS s "
+            "JOIN (SELECT scope, MAX(timestamp) AS ts FROM samples GROUP BY scope) AS newest "
+            "ON s.scope = newest.scope AND s.timestamp = newest.ts "
+            "WHERE s.timestamp >= ? ORDER BY s.scope ASC",
+            (cutoff,),
+        ).fetchall()
+    return tuple(Sample(*row) for row in rows)
+
+
 def prune(retention_days: int = RETENTION_DAYS, *, now: int | None = None) -> int:
     if retention_days < 0:
         raise ValueError("retention_days must not be negative")

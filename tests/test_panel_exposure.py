@@ -33,9 +33,23 @@ def exposure_home(tmp_path, monkeypatch):
         object.__setattr__(paths, field, value)
     monkeypatch.setenv("WPFY_SYSTEMD_DIR", str(tmp_path / "systemd"))
     monkeypatch.setenv("WPFY_SKIP_RUNTIME", "1")
+    # `expose` refuses without a usable ACME contact, the same way enabling SSL
+    # for a site does. These tests are about the router and the service, so the
+    # host is given a contact rather than each test asserting the refusal.
+    monkeypatch.setenv("WPFY_ACME_EMAIL", "ops@example.test")
     monkeypatch.setenv("WPFY_TEST_DNS_IPS", PUBLIC_IP)
     monkeypatch.setenv("WPFY_TEST_PUBLIC_IPS", PUBLIC_IP)
     monkeypatch.setenv("WPFY_TEST_TRAEFIK_NETWORK_CIDRS", EDGE_CIDR)
+    # The CIDR override alone left the fixture self-contradictory: the subnet was
+    # injected while the gateway still came from the real Docker daemon, so on a
+    # machine with Docker the two disagreed and on a machine without one there
+    # was no gateway at all. Pinning both makes these tests say the same thing
+    # everywhere, and stops them needing a `wpfy-panel-edge` network to run.
+    import wpfy.traefik as traefik
+
+    monkeypatch.setattr(
+        traefik, "_network_gateway",
+        lambda network: EDGE_HOST if network == "wpfy-panel-edge" else None)
     for directory in (paths.config_dir, paths.state_dir, paths.log_dir, paths.traefik_dir):
         Path(directory).mkdir(parents=True, exist_ok=True)
     panel_auth.reset_state()
@@ -82,12 +96,42 @@ def test_render_router_config_rejects_unexpected_targets(exposure_home, target):
 
 
 def test_validate_edge_bind_accepts_only_usable_network_addresses(exposure_home):
+    """An edge-bound panel outside its bridge cannot be reached by Traefik."""
     import wpfy.panel_exposure as exposure
 
-    assert exposure.validate_edge_bind(EDGE_HOST) == EDGE_HOST
+    assert exposure.validate_panel_edge_bind(EDGE_HOST) == EDGE_HOST
     for host in ("172.31.240.0", "172.31.240.255", "172.31.241.1", "0.0.0.0"):
         with pytest.raises(ValueError):
-            exposure.validate_edge_bind(host)
+            exposure.validate_panel_edge_bind(host)
+
+
+def test_validate_panel_edge_bind_accepts_usable_ipv6_addresses(exposure_home, monkeypatch):
+    """IPv6 panel-edge addresses have no broadcast address to reject."""
+    import wpfy.panel_exposure as exposure
+
+    monkeypatch.setenv("WPFY_TEST_TRAEFIK_NETWORK_CIDRS", "172.31.240.0/24,fd00:240::/64")
+
+    assert exposure.validate_panel_edge_bind("fd00:240::1") == "fd00:240::1"
+    with pytest.raises(ValueError, match="network address"):
+        exposure.validate_panel_edge_bind("fd00:240::")
+
+
+def test_validate_panel_edge_bind_refuses_an_unknown_network(exposure_home, monkeypatch):
+    """An uninspected bridge must not turn an arbitrary host address into an edge bind."""
+    import wpfy.panel_exposure as exposure
+
+    monkeypatch.delenv("WPFY_TEST_TRAEFIK_NETWORK_CIDRS")
+    monkeypatch.setattr(exposure.traefik, "traefik_network_cidrs", lambda _network: ())
+
+    with pytest.raises(ValueError, match="could not be inspected"):
+        exposure.validate_panel_edge_bind(EDGE_HOST)
+
+
+def test_validate_edge_bind_keeps_domainless_public_addresses(exposure_home):
+    """Domainless TLS binds the host public address, not the Docker bridge."""
+    import wpfy.panel_exposure as exposure
+
+    assert exposure.validate_edge_bind(PUBLIC_IP) == PUBLIC_IP
 
 
 def test_expose_writes_private_directory_and_truthful_status(exposure_home):

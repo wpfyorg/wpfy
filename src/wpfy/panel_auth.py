@@ -28,6 +28,7 @@ from .site_paths import validate_domain
 ROLE_ADMIN = "admin"
 ROLE_SITE_MANAGER = "site-manager"
 ROLES = frozenset({ROLE_ADMIN, ROLE_SITE_MANAGER})
+PASSWORD_MIN_LENGTH = 12
 
 SESSION_IDLE_SECONDS = 30 * 60
 SESSION_ABSOLUTE_SECONDS = 12 * 60 * 60
@@ -121,6 +122,23 @@ def users_path() -> Path:
 def panel_auth_log_path() -> Path:
     """Return the path to the dedicated panel authentication failure log."""
     return Path(settings.PATHS.log_dir) / "panel-auth.log"
+
+
+def ensure_panel_auth_log() -> Path:
+    """Create the auth log if it does not exist yet, with the writer's modes.
+
+    fail2ban refuses to load a jail whose `logpath` is missing -- `fail2ban-client
+    -t` fails with "Have not found any log file", which on a fresh host rolls the
+    whole wpfy fail2ban install back before the panel has ever recorded a failure.
+    The jail has to be installed against a file that already exists.
+    """
+    path = panel_auth_log_path()
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(path.parent, 0o700)
+    # O_NOFOLLOW for the same reason the writer uses it: a symlinked log path
+    # fails closed rather than creating a file through the link.
+    os.close(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, 0o600))
+    return path
 
 
 def _normalize_client_ip(value: object) -> str:
@@ -346,8 +364,20 @@ def _validate_username(username: str) -> str:
 
 
 def _validate_password(password: str) -> str:
+    """The length floor lives here, not at the caller.
+
+    It used to be enforced only by the first-run setup form, so the admin who
+    was made to pick twelve characters could then create a site-manager with a
+    one-character password -- on a panel that `wpfy panel expose` can publish to
+    the internet. Every write path (`add_user`, `update_user`, `set_password`,
+    setup) already funnels through this function, so the guard belongs here and
+    nowhere else. Stored passwords are unaffected: validation runs on write, so
+    existing accounts keep working until someone changes them.
+    """
     if not isinstance(password, str) or not password:
         raise ValueError("password must be a non-empty string")
+    if len(password) < PASSWORD_MIN_LENGTH:
+        raise ValueError(f"password must be at least {PASSWORD_MIN_LENGTH} characters")
     return password
 
 

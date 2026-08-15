@@ -47,6 +47,7 @@ Built for developers and WordPress server administrators who operate their own U
 | Backups and recovery | Verified local archives, explicit restore, local retention/pruning, S3-compatible remote operations, edge backups, and a systemd backup schedule. |
 | WordPress operations | WP-CLI, controlled PHP/config changes, cache clearing, cron runners, and SMTP configuration with explicit test sends. |
 | Access and diagnostics | Per-site SFTP lifecycle, logs, security audits, health checks, diagnostics, and a browser panel that is loopback-only by default. |
+| Host firewall | ufw port rules with presets and an SSH-lockout guard, plus fail2ban intrusion prevention whose bans reach container traffic. |
 
 ## Quick start
 
@@ -94,13 +95,25 @@ For a new site whose DNS is already correct, combine creation and TLS with `wpfy
 
 ### Open the browser panel
 
-The ad-hoc `wpfy panel` service stays loopback-only and requires a fresh token. The panel access token can be supplied with `--token-file` or the `WPFY_PANEL_TOKEN` environment variable; `--token` still works but exposes the value in the process table and now warns. On the VPS, run `wpfy panel`; from your workstation, tunnel the port and open the token-bearing URL printed by the command:
+The panel is loopback-only by default. On the VPS run `wpfy panel`; from your workstation, tunnel the port and open the URL it prints:
 
 ```bash
 ssh -L 8642:127.0.0.1:8642 user@your-server
 ```
 
-The screenshot above is the real current panel against a sanitized local demo state. It shows an overview; the panel also exposes site details, health, diagnostics, logs, backups/restores, runtime actions, SFTP, WP-CLI, and PHP changes. Phase 1 adds site creation and deletion from the panel, with background jobs and live step progress. Newly created or rotated credentials are displayed in a one-time panel; deletion requires typing the exact domain and is refused if the pre-delete backup fails. The Config tab can show a dry-run change preview before applying a mutation, and the Events view plus each site’s Activity tab expose recorded operations. Recent events are also available from the CLI with `wpfy log events` (optionally filtered by `--domain` and limited with `--limit`). The panel has named user accounts with administrator and site-manager roles; site-managers are scoped to their assigned sites and refused everything else. TOTP two-factor enrollment is verified before it is persisted, and a first-run browser setup wizard creates the first administrator; both setup routes close permanently once a user exists. The panel remains loopback-only by default, with SSH tunnelling recommended; `wpfy panel expose` opts into Traefik publishing only after named-user authentication, at least one enrolled TOTP factor, DNS/IP preflight, and typed exact-domain confirmation.
+The access token can be supplied with `--token-file` or `WPFY_PANEL_TOKEN`; `--token` still works but exposes the value in the process table and warns.
+
+**Accounts.** A first-run browser wizard creates the first administrator, then both setup routes close permanently. Accounts are named users with administrator and site-manager roles; a site-manager is scoped to its assigned sites and refused everything else, including the live event stream for sites it does not manage. TOTP enrolment is verified against a real code before it is persisted.
+
+**Sites.** A three-step wizard creates a site, with a dry-run plan before anything is written and a background job reporting live steps. Site detail is five tabs — Overview, Settings, Data, Access, Automation — covering health and diagnostics, PHP/cache/vhost/security settings behind one preview-and-apply bar, databases and backups, SFTP, files and WP-CLI, and cron. Newly created or rotated credentials appear once in a one-time panel; deletion needs the exact domain typed and is refused if the pre-delete backup fails.
+
+**Server.** Admin pages cover events, users, running services, remote backup destinations and schedule, the host firewall (ufw ports plus fail2ban intrusion prevention), mail transport, basic-auth inventory, settings, and instance facts. Long operations are jobs: a header popover tracks them across navigation, with a detail page per job. Recent events are also available from the CLI with `wpfy log events`.
+
+**Publishing it.** `wpfy panel expose` asks for the domain and, when the host has no ACME contact yet, the Let's Encrypt address that decides whether a certificate can issue at all. It refuses without named-user authentication, at least one enrolled TOTP factor, a passing DNS/IP preflight, and the domain typed back exactly. Basic auth can be placed in front of the published router.
+
+For a host with no domain, `wpfy panel expose --no-domain` publishes on the machine's public address over a self-signed certificate and prints its SHA-256 fingerprint to check against the browser warning, plus a single-use setup link. Start it with `wpfy panel --public`. That mode is a stopgap: the certificate chains to nothing, and it does not sit behind the edge proxy's rate limit.
+
+The panel loads no script, style, font, or image from a third-party origin — its CSP is `default-src 'self'`, and everything it serves ships with it.
 
 ### Develop from source
 
@@ -224,7 +237,7 @@ wpfy’s model is designed to reduce accidental cross-site coupling, not to make
 - **Unix identity:** wpfy allocates a unique site UID and applies it to site files.
 - **Nginx hardening:** the web service uses `nginxinc/nginx-unprivileged` and generated Nginx configuration denies common sensitive paths.
 - **Secret and backup handling:** site `.env` files are restricted, and local backup archives are written with mode `0600`.
-- **Panel exposure:** ad-hoc `wpfy panel` stays loopback-only; the opt-in exposed service binds only to the dedicated `wpfy-panel-edge` gateway address, while wildcard, public, and off-network binds are refused. SSH tunnelling remains the recommended access path.
+- **Panel exposure:** ad-hoc `wpfy panel` stays loopback-only, and SSH tunnelling remains the recommended access path. The opt-in exposed service binds only the dedicated `wpfy-panel-edge` gateway address; wildcard, public, and off-network binds are refused there, so the panel is reached through Traefik with its TLS termination and rate limit. `--no-domain` is the one deliberate exception: it binds the host's public address directly over a self-signed certificate, which means no CA-issued chain and no edge rate limit, and it is a stopgap for hosts that have no domain yet.
 
 Important limits:
 
