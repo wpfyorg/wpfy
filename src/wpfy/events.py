@@ -26,6 +26,10 @@ _SECRET_ASSIGNMENT = re.compile(
 _AUTHORIZATION_ASSIGNMENT = re.compile(
     r"(?i)(?<![A-Z0-9])(AUTHORIZATION)(?![A-Z0-9])(\s*[=:]\s*)(?:\"[^\"]*\"|'[^']*'|[^,;\r\n]+)"
 )
+_QUOTED_KEY_ASSIGNMENT = re.compile(
+    r"(?i)(?<![A-Z0-9])(['\"])(PASSWORD|SECRET|TOKEN|KEY|PWD|PASS|CREDENTIAL|AUTHORIZATION|AUTH)\1"
+    r"(\s*[=:]\s*)(?:\"[^\"]*\"|'[^']*'|[^\s,;}]+)"
+)
 
 
 def event_log_path() -> Path:
@@ -40,6 +44,7 @@ def _redact(value: Any, key: str = "") -> Any:
     if isinstance(value, (list, tuple)):
         return [_redact(item) for item in value]
     if isinstance(value, str):
+        value = _QUOTED_KEY_ASSIGNMENT.sub(r"\1\2\1\3***REDACTED***", value)
         value = _AUTHORIZATION_ASSIGNMENT.sub(r"\1\2***REDACTED***", value)
         return _SECRET_ASSIGNMENT.sub(r"\1\2***REDACTED***", value)
     return value
@@ -53,7 +58,9 @@ def _json_safe(value: Any) -> Any:
     try:
         json.dumps(value)
     except (TypeError, ValueError):
-        return str(value)
+        # Stringification is itself an information boundary: exception
+        # messages and other custom objects can contain credential material.
+        return _redact(str(value))
     return value
 
 

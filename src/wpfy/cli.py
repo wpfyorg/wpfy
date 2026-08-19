@@ -2255,7 +2255,7 @@ def handle_panel_auth(args: argparse.Namespace) -> CommandResult:
                 panel_auth.complete_totp_enrollment(args.username, code)
                 return CommandResult(f"panel TOTP enabled: {args.username}")
             if args.panel_totp_command == "disable":
-                panel_auth.disable_totp(args.username)
+                panel_auth.recover_disable_totp(args.username)
                 return CommandResult(f"panel TOTP disabled: {args.username}")
             return CommandResult("panel TOTP command required", exit_code=2)
     except (OSError, ValueError) as exc:

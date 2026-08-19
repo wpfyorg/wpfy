@@ -136,8 +136,10 @@ def validate_panel_edge_bind(host) -> str:
     address = ipaddress.ip_address(validate_edge_bind(host))
     unknown = ValueError(f"panel edge network {PANEL_EDGE_NETWORK} could not be inspected")
     try:
-        # `traefik_network_cidrs` returns CIDR *strings*, not network objects.
-        raw = traefik.traefik_network_cidrs(PANEL_EDGE_NETWORK)
+        # The rule is about the *network* range the gateway sits in, not the
+        # /32 addresses Traefik holds on it -- `traefik_network_subnets` answers
+        # that; `traefik_network_cidrs` names Traefik itself.
+        raw = traefik.traefik_network_subnets(PANEL_EDGE_NETWORK)
         networks = [ipaddress.ip_network(cidr, strict=False) for cidr in raw]
     except (OSError, RuntimeError, TypeError, ValueError) as exc:
         raise unknown from exc

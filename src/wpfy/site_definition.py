@@ -53,12 +53,25 @@ PHP_SETTING_FIELDS: Final = {
 }
 
 
-def compose_hardening_lines(pids_limit: int, mem_limit: str, cpus: str) -> list[str]:
-    return [
+def compose_hardening_lines(
+    pids_limit: int,
+    mem_limit: str,
+    cpus: str,
+    *,
+    cap_add: tuple[str, ...] = (),
+) -> list[str]:
+    lines = [
         "    security_opt:",
         "      - no-new-privileges:true",
         "    cap_drop:",
-        "      - NET_RAW",
+        "      - ALL",
+    ]
+    if cap_add:
+        lines.extend([
+            "    cap_add:",
+            *(f"      - {capability}" for capability in cap_add),
+        ])
+    lines.extend([
         f"    pids_limit: {pids_limit}",
         f"    mem_limit: {mem_limit}",
         f"    cpus: {cpus}",
@@ -67,7 +80,8 @@ def compose_hardening_lines(pids_limit: int, mem_limit: str, cpus: str) -> list[
         "      options:",
         "        max-size: 10m",
         '        max-file: "3"',
-    ]
+    ])
+    return lines
 
 
 def validate_page_cache(value: str) -> str:
@@ -265,7 +279,17 @@ def sftp_service_lines(definition: SiteDefinition) -> list[str]:
         "    image: atmoz/sftp:alpine",
         f"    container_name: {project}-sftp",
         "    restart: unless-stopped",
-        *compose_hardening_lines(128, "128m", "0.25"),
+        # atmoz/sftp creates the configured account and changes ownership before
+        # sshd starts; CHOWN is required by that entrypoint. sshd's privilege
+        # separation requires SETUID and SETGID for user-session switching.
+        # Port 22 also needs NET_BIND_SERVICE on hosts whose privileged-port
+        # floor is 1024.
+        *compose_hardening_lines(
+            128,
+            "128m",
+            "0.25",
+            cap_add=("CHOWN", "NET_BIND_SERVICE", "SETUID", "SETGID"),
+        ),
         "    ports:",
         f'      - "127.0.0.1:{definition.sftp_port or "2222"}:22"',
         f"    command: sftpuser:${{SFTP_PASSWORD}}:{uid}:{uid}:app",

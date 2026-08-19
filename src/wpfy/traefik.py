@@ -242,27 +242,35 @@ def ensure_panel_edge_network() -> RuntimeResult:
     return _ensure_bridge_network(PANEL_EDGE_NETWORK)
 
 
+def _test_cidr_override() -> tuple[str, ...] | None:
+    """Parse the offline CIDR override hook, or None when it is unset."""
+    override = os.environ.get("WPFY_TEST_TRAEFIK_NETWORK_CIDRS")
+    if not override:
+        return None
+    raw_cidrs = [item.strip() for item in override.split(",") if item.strip()]
+    cidrs: list[str] = []
+    for raw in raw_cidrs:
+        try:
+            network = ipaddress.ip_network(raw, strict=False)
+        except ValueError as exc:
+            raise RuntimeError(f"cannot determine wpfy edge address: invalid test source {raw!r}") from exc
+        if network.prefixlen == 0:
+            raise RuntimeError("cannot determine wpfy edge address: wildcard test source refused")
+        cidrs.append(network.with_prefixlen)
+    if not cidrs:
+        raise RuntimeError("cannot determine wpfy edge address: no test source")
+    return tuple(sorted(set(cidrs)))
+
+
 def traefik_network_cidrs(network_name: str = TRAEFIK_NETWORK) -> tuple[str, ...]:
     """Return trusted edge sources; name Traefik itself, never its subnet.
 
     ``WPFY_TEST_TRAEFIK_NETWORK_CIDRS`` remains a test-only compatibility hook
     for offline callers that cannot provide a Docker container.
     """
-    override = os.environ.get("WPFY_TEST_TRAEFIK_NETWORK_CIDRS")
+    override = _test_cidr_override()
     if override:
-        raw_cidrs = [item.strip() for item in override.split(",") if item.strip()]
-        cidrs: list[str] = []
-        for raw in raw_cidrs:
-            try:
-                network = ipaddress.ip_network(raw, strict=False)
-            except ValueError as exc:
-                raise RuntimeError(f"cannot determine wpfy edge address: invalid test source {raw!r}") from exc
-            if network.prefixlen == 0:
-                raise RuntimeError("cannot determine wpfy edge address: wildcard test source refused")
-            cidrs.append(network.with_prefixlen)
-        if not cidrs:
-            raise RuntimeError("cannot determine wpfy edge address: no test source")
-        return tuple(sorted(set(cidrs)))
+        return override
     return traefik_edge_addresses(network_name)
 
 
@@ -298,6 +306,47 @@ def traefik_edge_addresses(network_name: str = TRAEFIK_NETWORK) -> tuple[str, ..
     if not addresses:
         raise RuntimeError("cannot determine wpfy edge address: container has no address on edge network")
     return tuple(sorted(set(addresses)))
+
+
+def traefik_network_subnets(network_name: str = PANEL_EDGE_NETWORK) -> tuple[str, ...]:
+    """Return the IPAM subnets Docker assigned to a bridge network.
+
+    The panel edge rule validates the gateway the panel binds against the
+    *network* range. ``traefik_network_cidrs`` names Traefik itself (host /32
+    addresses) and is the wrong source for that check, so this asks Docker for
+    the network's own subnets. Same offline override hook as the CIDR helper.
+    """
+    override = _test_cidr_override()
+    if override:
+        return override
+    if not docker_available():
+        raise RuntimeError("cannot determine wpfy edge network subnets: Docker is unavailable")
+    proc = subprocess.run(
+        [
+            "docker", "network", "inspect", "--format",
+            "{{json .IPAM.Config}}", network_name,
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode != 0:
+        detail = proc.stderr.strip() or proc.stdout.strip() or "network inspect failed"
+        raise RuntimeError(f"cannot determine wpfy edge network subnets: {detail}")
+    try:
+        configs = json.loads(proc.stdout.strip())
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("cannot determine wpfy edge network subnets: invalid Docker inspect output") from exc
+    if not isinstance(configs, list):
+        raise RuntimeError("cannot determine wpfy edge network subnets: Docker reported no IPAM config")
+    cidrs = [
+        item["Subnet"]
+        for item in configs
+        if isinstance(item, dict) and isinstance(item.get("Subnet"), str) and item["Subnet"]
+    ]
+    if not cidrs:
+        raise RuntimeError("cannot determine wpfy edge network subnets: Docker reported no subnet")
+    return tuple(sorted(set(cidrs)))
 
 
 def _network_gateway(network_name: str = TRAEFIK_NETWORK) -> str | None:
@@ -430,7 +479,8 @@ def traefik_compose_content() -> str:
         f"    image: {TRAEFIK_IMAGE}",
         f"    container_name: {TRAEFIK_CONTAINER}",
         "    restart: unless-stopped",
-        *compose_hardening_lines(256, "256m", "0.50"),
+        # Traefik binds host-facing ports 80/443 inside its container.
+        *compose_hardening_lines(256, "256m", "0.50", cap_add=("NET_BIND_SERVICE",)),
         "    ports:",
         '      - "80:80"',
         '      - "443:443"',

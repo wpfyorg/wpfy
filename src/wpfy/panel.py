@@ -14,7 +14,7 @@ import threading
 import time
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
-from http.cookies import SimpleCookie
+from http.cookies import CookieError, SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, quote, unquote, urlparse
@@ -366,31 +366,77 @@ def _principal_is_manager(principal) -> bool:
     return isinstance(principal, dict) and principal.get("role") == panel_auth.ROLE_SITE_MANAGER
 
 
-def _assert_same_origin(headers, host_header: str) -> None:
+def _origin_tuple(value: str, *, scheme: str, referer: bool = False) -> tuple[str, str, int] | None:
     try:
-        request_host = urlparse(f"//{host_header}").hostname
-    except ValueError:
-        request_host = None
+        parsed = urlparse(value)
+        hostname = parsed.hostname
+        port = parsed.port
+    except (AttributeError, ValueError):
+        return None
+    if parsed.scheme.lower() not in {"http", "https"} or hostname is None:
+        return None
+    if parsed.username is not None or parsed.password is not None:
+        return None
+    if not referer and (parsed.path not in ("", "/") or parsed.query or parsed.fragment):
+        return None
+    normalized_scheme = parsed.scheme.lower()
+    if normalized_scheme != scheme:
+        return None
+    if port is None:
+        port = 443 if normalized_scheme == "https" else 80
+    return normalized_scheme, hostname.lower().rstrip("."), port
+
+
+def _assert_same_origin(headers, host_header: str, *, scheme: str = "http") -> None:
+    """Reject state changes without a verifiable browser same-origin header."""
+    scheme = scheme.lower()
+    try:
+        request = urlparse(f"//{host_header.strip()}")
+        if (
+            request.hostname is None
+            or request.username is not None
+            or request.password is not None
+            or request.path
+            or request.query
+            or request.fragment
+        ):
+            raise PanelError(403, "cross-origin request denied")
+        request_host = request.hostname
+        request_port = request.port
+    except PanelError:
+        raise
+    except (AttributeError, ValueError):
+        request_host = request_port = None
+    if request_host is None:
+        raise PanelError(403, "cross-origin request denied")
+    if request_port is None:
+        request_port = 443 if scheme == "https" else 80
+    expected = (scheme, request_host.lower().rstrip("."), request_port)
+
     origin = headers.get("Origin")
     referer = headers.get("Referer")
-    if origin is not None:
-        try:
-            parsed = urlparse(origin)
-        except ValueError:
-            raise PanelError(403, "cross-origin request denied") from None
-        if parsed.scheme not in {"http", "https"} or parsed.hostname is None or request_host is None:
-            raise PanelError(403, "cross-origin request denied")
-        if parsed.hostname.lower() != request_host.lower():
-            raise PanelError(403, "cross-origin request denied")
-    elif referer is not None:
-        try:
-            parsed = urlparse(referer)
-        except ValueError:
-            raise PanelError(403, "cross-origin request denied") from None
-        if parsed.hostname is None or request_host is None:
-            raise PanelError(403, "cross-origin request denied")
-        if parsed.hostname.lower() != request_host.lower():
-            raise PanelError(403, "cross-origin request denied")
+    candidate = origin if origin is not None else referer
+    if candidate is None:
+        raise PanelError(403, "cross-origin request denied")
+    actual = _origin_tuple(candidate, scheme=scheme, referer=origin is None)
+    if actual != expected:
+        raise PanelError(403, "cross-origin request denied")
+
+
+def _is_loopback_address(address: object) -> bool:
+    try:
+        return ipaddress.ip_address(str(address)).is_loopback
+    except ValueError:
+        return False
+
+
+def _internal_error_payload(exc: object) -> dict[str, str]:
+    error_id = secrets.token_hex(8)
+    diagnostic = events._redact(str(exc))
+    if not diagnostic:
+        diagnostic = exc.__class__.__name__
+    _LOGGER.error("panel API error id=%s: %s", error_id, diagnostic)
+    return {"error": "internal server error", "error_id": error_id}
 
 
 def authorize(principal, meta: RouteMeta, domain: str | None) -> None:
@@ -457,6 +503,20 @@ def _file_manager_cookie(domain: str, username: str) -> str:
         _FM_PROXY_TICKETS.update({key: value for key, value in _FM_PROXY_TICKETS.items() if value[2] > now})
         _FM_PROXY_TICKETS[token] = (domain, username, now + 60)
     return f"wpfy_fm={token}; Path=/api/sites/{domain}/file-manager/proxy/; HttpOnly; SameSite=Strict; Max-Age=60"
+
+
+def _secure_file_manager_cookie(value: str) -> str:
+    """Add Secure based on cookie name, never on token text or formatting."""
+    cookie = SimpleCookie()
+    try:
+        cookie.load(value)
+    except (CookieError, ValueError):
+        return value
+    morsel = cookie.get("wpfy_fm")
+    if morsel is None:
+        return value
+    morsel["secure"] = True
+    return morsel.OutputString()
 
 
 def _validate_file_manager_cookie(headers, domain: str, username: str) -> None:
@@ -598,6 +658,7 @@ def _get_stream(request, principal, match, query, body):
         return 503, {"error": "too many concurrent event streams"}
     try:
         request.send_response(200)
+        request._send_security_headers()
         request.send_header("Content-Type", "text/event-stream; charset=utf-8")
         request.send_header("Cache-Control", "no-store")
         request.send_header("X-Content-Type-Options", "nosniff")
@@ -1622,12 +1683,13 @@ def _post_setup_totp(principal, match, query, body):
         return 200, {"secret": secret, "uri": uri}
     if action == "verify":
         try:
-            panel_auth.complete_totp_enrollment(username, body.get("code"))
+            fingerprint = panel_auth.complete_totp_enrollment(username, body.get("code"))
         except ValueError as exc:
             client = body.get("_socket_client")
             panel_auth._append_panel_auth_failure("setup_totp", client, username, "totp_failed")
             raise PanelError(400, str(exc)) from exc
-        panel_auth.finish_setup_session(principal.get("_session_token"))
+        if not panel_auth.finish_setup_session(principal.get("_session_token"), fingerprint):
+            raise PanelError(401, "setup session invalidated; authenticate again")
         _emit_event("panel.totp.enrolled", actor=username)
         return 200, {"ok": True, "enrolled": True}
     if action == "skip":
@@ -1637,7 +1699,8 @@ def _post_setup_totp(principal, match, query, body):
                 "confirm skipping TOTP: without a second factor this panel cannot be published to the internet",
             )
         panel_auth.cancel_totp_enrollment(username)
-        panel_auth.finish_setup_session(principal.get("_session_token"))
+        if not panel_auth.finish_setup_session(principal.get("_session_token")):
+            raise PanelError(401, "setup session invalidated; authenticate again")
         _emit_event("panel.totp.skipped", actor=username)
         return 200, {"ok": True, "skipped": True}
     raise PanelError(400, "setup TOTP action must be begin, verify, or skip")
@@ -1696,7 +1759,16 @@ def _post_auth_totp(principal, match, query, body):
 
 
 def _delete_auth_totp(principal, match, query, body):
-    panel_auth.disable_totp(principal["username"])
+    username = principal["username"]
+    try:
+        if username == RUN_TOKEN_ADMIN:
+            # Run token is trusted host-admin credential, not self-service
+            # account credential. Keep recovery separate from user reauth.
+            panel_auth.recover_disable_totp(username)
+        else:
+            panel_auth.disable_totp(username, body.get("password"), body.get("current_totp"))
+    except ValueError as exc:
+        raise PanelError(400, str(exc)) from exc
     return 200, {"ok": True}
 
 
@@ -1740,9 +1812,29 @@ def _delete_user(principal, match, query, body):
     return 200, {"ok": True}
 
 
+def _reauthenticate_admin(principal, body) -> None:
+    """Require fresh actor credentials before remote administrator recovery."""
+    username = principal.get("username") if isinstance(principal, dict) else None
+    if (
+        not isinstance(principal, dict)
+        or principal.get("role") != panel_auth.ROLE_ADMIN
+        or not isinstance(username, str)
+        or username == RUN_TOKEN_ADMIN
+    ):
+        raise PanelError(403, "named administrator reauthentication required")
+    result = panel_auth.login(username, body.get("password"), body.get("current_totp"))
+    if result is None:
+        raise PanelError(403, "administrator reauthentication failed")
+    panel_auth.logout(result[0])
+
+
 def _delete_user_totp(principal, match, query, body):
+    username = unquote(match.group("username"))
+    if username == _principal_username(principal):
+        raise PanelError(403, "self TOTP reset is not available; use self-disable with reauthentication")
+    _reauthenticate_admin(principal, body)
     try:
-        panel_auth.disable_totp(unquote(match.group("username")))
+        panel_auth.recover_disable_totp(username)
     except ValueError as exc:
         raise PanelError(400, str(exc)) from exc
     return 200, {"ok": True}
@@ -2826,8 +2918,12 @@ _ROUTES = (
 
 def make_panel_handler(config: PanelConfig) -> type[BaseHTTPRequestHandler]:
     class PanelHandler(BaseHTTPRequestHandler):
-        server_version = f"wpfy-panel/{__version__}"
+        server_version = "wpfy-panel"
+        sys_version = ""
         protocol_version = "HTTP/1.1"
+
+        def version_string(self) -> str:
+            return self.server_version
 
         def log_message(self, format: str, *args) -> None:
             pass
@@ -2849,15 +2945,24 @@ def make_panel_handler(config: PanelConfig) -> type[BaseHTTPRequestHandler]:
             if unread:
                 self.close_connection = True
 
+        def _send_security_headers(self) -> None:
+            self.send_header("Referrer-Policy", "no-referrer")
+            self.send_header("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+            if config.edge_bind or config.self_signed_tls:
+                self.send_header("Strict-Transport-Security", "max-age=31536000")
+
         def _send_json(self, status: int, payload: dict, headers: dict[str, str] | None = None) -> None:
             self._close_if_body_unread()
             data = json.dumps(payload).encode("utf-8")
             self.send_response(status)
+            self._send_security_headers()
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(data)))
             self.send_header("Cache-Control", "no-store")
             self.send_header("X-Content-Type-Options", "nosniff")
             for name, value in (headers or {}).items():
+                if (config.edge_bind or config.self_signed_tls) and name.lower() == "set-cookie":
+                    value = _secure_file_manager_cookie(value)
                 self.send_header(name, value)
             if self.close_connection:
                 self.send_header("Connection", "close")
@@ -2867,6 +2972,7 @@ def make_panel_handler(config: PanelConfig) -> type[BaseHTTPRequestHandler]:
         def _send_file_manager_proxy(self, status: int, proxy: _FileManagerProxyResponse) -> None:
             self._close_if_body_unread()
             self.send_response(status)
+            self._send_security_headers()
             for name, value in proxy.headers.items():
                 self.send_header(name, value)
             self.send_header("Cache-Control", "no-store")
@@ -2889,6 +2995,7 @@ def make_panel_handler(config: PanelConfig) -> type[BaseHTTPRequestHandler]:
             safe_name = re.sub(r"[^\w.\- ]", "_", download.name, flags=re.ASCII) or "download"
             encoded_name = quote(download.name, safe="")
             self.send_response(status)
+            self._send_security_headers()
             self.send_header("Content-Type", "application/octet-stream")
             self.send_header(
                 "Content-Disposition",
@@ -2920,7 +3027,11 @@ def make_panel_handler(config: PanelConfig) -> type[BaseHTTPRequestHandler]:
             token = self._bearer_token()
             if token is None:
                 return None
-            if not panel_auth.login_required() and hmac.compare_digest(token, config.token):
+            if (
+                not panel_auth.login_required()
+                and _is_loopback_address(self.client_address[0])
+                and hmac.compare_digest(token, config.token)
+            ):
                 return _run_token_principal()
             if not panel_auth.login_required() and panel_setup.setup_secret_matches(token):
                 # A domainless panel prints no run token, so the setup link is
@@ -2988,6 +3099,7 @@ def make_panel_handler(config: PanelConfig) -> type[BaseHTTPRequestHandler]:
             data = target.read_bytes()
             self._close_if_body_unread()
             self.send_response(200)
+            self._send_security_headers()
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(data)))
             self.send_header("X-Content-Type-Options", "nosniff")
@@ -2999,6 +3111,7 @@ def make_panel_handler(config: PanelConfig) -> type[BaseHTTPRequestHandler]:
 
         def _handle_api(self, method: str) -> None:
             route = None
+            principal = None
             parsed = urlparse(self.path)
             try:
                 route = next(
@@ -3022,7 +3135,11 @@ def make_panel_handler(config: PanelConfig) -> type[BaseHTTPRequestHandler]:
                 if route.meta.action.startswith("file_manager."):
                     _file_manager_gate()
                 if route.meta.mutates:
-                    _assert_same_origin(self.headers, self.headers.get("Host", ""))
+                    _assert_same_origin(
+                        self.headers,
+                        self.headers.get("Host", ""),
+                        scheme="https" if config.edge_bind or config.self_signed_tls else "http",
+                    )
                 if route.meta.scope == "setup" and panel_auth.login_required():
                     raise PanelError(410, "first-run setup is permanently closed")
                 if route.meta.scope == "setup-session" and (
@@ -3057,6 +3174,10 @@ def make_panel_handler(config: PanelConfig) -> type[BaseHTTPRequestHandler]:
                     status, payload, response_headers = result
                 else:
                     status, payload = result
+                if status == 500 and principal is not None:
+                    payload = _internal_error_payload(payload)
+                    response_headers = None
+                    status = 500
                 preview_response = isinstance(payload, dict) and (
                     payload.get("dry_run") is True or payload.get("acknowledgement_required") is True
                 )
@@ -3072,14 +3193,15 @@ def make_panel_handler(config: PanelConfig) -> type[BaseHTTPRequestHandler]:
                     )
                     _emit_event(route.meta.action, domain=domain, actor=actor)
             except PanelError as exc:
+                if exc.status >= 500:
+                    self._send_json(500, _internal_error_payload(exc)); return
                 self._send_json(exc.status, {"error": str(exc)}, exc.headers); return
             except (FileNotFoundError, ValueError) as exc:
                 self._send_json(400, {"error": str(exc)}); return
             except (OSError, subprocess.SubprocessError) as exc:
-                self._send_json(500, {"error": str(exc)}); return
-            except Exception:
-                _LOGGER.exception("unhandled panel API error")
-                self._send_json(500, {"error": "internal server error"}); return
+                self._send_json(500, _internal_error_payload(exc)); return
+            except Exception as exc:
+                self._send_json(500, _internal_error_payload(exc)); return
             if isinstance(payload, _StreamAlreadySent):
                 return
             if isinstance(payload, _FileManagerProxyResponse):

@@ -224,12 +224,6 @@ def create_account(body: dict, *, client: str | None, remote: bool) -> tuple[str
     # `wpfy panel expose` printed on the host. The secret is burned on use, so a
     # request that gets this far cannot be replayed -- and without one the
     # original refusal is unchanged, including its wording.
-    if remote:
-        if not consume_setup_secret(body.get("setup_secret")):
-            raise ValueError(
-                "first-run setup is disabled on a panel reachable from off this host; "
-                "open the one-time setup link printed by `wpfy panel expose`, or use the SSH tunnel"
-            )
     if panel_auth.client_throttled(client):
         raise panel_auth.ClientThrottleError("too many setup attempts; try again later")
     try:
@@ -253,31 +247,53 @@ def create_account(body: dict, *, client: str | None, remote: bool) -> tuple[str
         panel_auth.register_client_failure(client)
         raise
 
-    with state_lock():
-        if panel_auth.login_required():
-            raise ValueError("first-run setup is permanently closed")
-        current = _default_state()
-        current.update(_read_state())
-        if not current.get("install_id"):
-            current["install_id"] = str(uuid.uuid4())
-        current.update({
-            "telemetry_enabled": telemetry_enabled,
-            "license_accepted_at": _now(),
-            "license_accepted_by": username,
-            "license_version": LICENSE_VERSION,
-        })
-        _write_state(current)
-        panel_auth.add_user(
-            username,
-            password,
-            role=panel_auth.ROLE_ADMIN,
-            first_name=first_name,
-            last_name=last_name,
-            email=email,
-        )
+    # Recheck immediately before the atomic burn. The check releases the auth
+    # lock before state_lock is acquired, preserving lock-order independence.
+    if remote:
+        if panel_auth.client_throttled(client):
+            raise panel_auth.ClientThrottleError("too many setup attempts; try again later")
+        try:
+            consumed = consume_setup_secret(body.get("setup_secret"))
+        except ValueError:
+            panel_auth.register_client_failure(client)
+            raise
+        if not consumed:
+            panel_auth.register_client_failure(client)
+            raise ValueError(
+                "first-run setup is disabled on a panel reachable from off this host; "
+                "open the one-time setup link printed by `wpfy panel expose`, or use the SSH tunnel"
+            )
+
+    try:
+        with state_lock():
+            if panel_auth.login_required():
+                raise ValueError("first-run setup is permanently closed")
+            current = _default_state()
+            current.update(_read_state())
+            if not current.get("install_id"):
+                current["install_id"] = str(uuid.uuid4())
+            current.update({
+                "telemetry_enabled": telemetry_enabled,
+                "license_accepted_at": _now(),
+                "license_accepted_by": username,
+                "license_version": LICENSE_VERSION,
+            })
+            _write_state(current)
+            panel_auth.add_user(
+                username,
+                password,
+                role=panel_auth.ROLE_ADMIN,
+                first_name=first_name,
+                last_name=last_name,
+                email=email,
+            )
+    except ValueError:
+        panel_auth.register_client_failure(client)
+        raise
     events.record_event("panel.setup.completed", actor=username)
     result = panel_auth.login(username, password, client=client, setup=True)
     if result is None:
+        panel_auth.register_client_failure(client)
         raise ValueError("account was created but the setup session could not be opened")
     return result
 

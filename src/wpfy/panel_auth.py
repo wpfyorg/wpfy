@@ -7,6 +7,7 @@ import fcntl
 import hashlib
 import hmac
 import ipaddress
+from itertools import islice
 import json
 import math
 import os
@@ -32,6 +33,9 @@ PASSWORD_MIN_LENGTH = 12
 
 SESSION_IDLE_SECONDS = 30 * 60
 SESSION_ABSOLUTE_SECONDS = 12 * 60 * 60
+MAX_SESSIONS = 4096
+MAX_SESSIONS_PER_USER = 8
+SESSION_REAPER_BATCH = 256
 MAX_LOGIN_FAILURES = 5
 LOCKOUT_SECONDS = 5 * 60
 MAX_FM_ENABLE = 5
@@ -40,13 +44,33 @@ MAX_CLIENT_FAILURES = 10
 CLIENT_COOLDOWN_SECONDS = 60
 TOTP_STEP_SECONDS = 30
 TOTP_SKEW_STEPS = 1
+TOTP_ENROLLMENT_TTL_SECONDS = 10 * 60
 
-_SCRYPT_N = 2**14
-_SCRYPT_R = 8
-_SCRYPT_P = 1
+_LEGACY_SCRYPT_N = 2**14
+_LEGACY_SCRYPT_R = 8
+_LEGACY_SCRYPT_P = 1
+_PRIOR_SCRYPT_N = 2**15
+_PRIOR_SCRYPT_R = 4
+_PRIOR_SCRYPT_P = 2
 _SCRYPT_LENGTH = 32
 _SALT_BYTES = 16
 _TOTP_SECRET_BYTES = 20
+
+# Python/OpenSSL's default scrypt maxmem rejects OWASP's N=2**17,r=8,p=1
+# (128 MiB working set) on this host: N=2**17 raises "memory limit exceeded"
+# with hashlib.scrypt's default maxmem. N=2**14,r=8,p=5 stays within the same
+# 16 MiB working set and measured ~0.23 seconds per derivation here. Keep
+# parameters encoded so future hosts can migrate safely. Previous versioned
+# records (N=2**15,r=4,p=2) remain accepted during migration.
+_SCRYPT_VERSION = 1
+_SCRYPT_N = 2**14
+_SCRYPT_R = 8
+_SCRYPT_P = 5
+_SUPPORTED_SCRYPT_PARAMS = frozenset({
+    (_LEGACY_SCRYPT_N, _LEGACY_SCRYPT_R, _LEGACY_SCRYPT_P, _SCRYPT_LENGTH),
+    (_PRIOR_SCRYPT_N, _PRIOR_SCRYPT_R, _PRIOR_SCRYPT_P, _SCRYPT_LENGTH),
+    (_SCRYPT_N, _SCRYPT_R, _SCRYPT_P, _SCRYPT_LENGTH),
+})
 _USERNAME = re.compile(r"^[A-Za-z0-9_.@-]{1,64}$")
 _DUMMY_SALT = b"wpfy-panel-auth-dummy-salt"
 _STATE_LOCK = threading.RLock()
@@ -83,6 +107,7 @@ class Session:
     created_at: float
     last_seen_at: float
     setup: bool = False
+    credential_fingerprint: tuple[object, object, object] | None = None
 
 
 class ClientThrottleError(ValueError):
@@ -109,6 +134,7 @@ _FM_ENABLE: dict[str, list[float]] = {}
 _LAST_TOTP_STEPS: dict[str, int] = {}
 _PENDING_TOTP: dict[str, str] = {}
 _PENDING_TOTP_DISCLOSED: set[str] = set()
+_PENDING_TOTP_EXPIRES: dict[str, float] = {}
 
 
 class UserStoreError(ValueError):
@@ -449,12 +475,22 @@ def _find_user(users: list[dict], username: str) -> dict | None:
     return next((entry for entry in users if entry.get("username") == username), None)
 
 
+def _scrypt_derive(password: str, salt: bytes, *, n: int, r: int, p: int, dklen: int) -> bytes:
+    return hashlib.scrypt(password.encode("utf-8"), salt=salt, n=n, r=r, p=p, dklen=dklen)
+
+
+def _encode_password_record(salt: bytes, digest: bytes) -> tuple[str, str]:
+    encoded = (
+        f"scrypt$v={_SCRYPT_VERSION}$n={_SCRYPT_N}$r={_SCRYPT_R}$p={_SCRYPT_P}"
+        f"$dklen={_SCRYPT_LENGTH}$salt={salt.hex()}$hash={digest.hex()}"
+    )
+    return encoded, salt.hex()
+
+
 def _password_record(password: str) -> tuple[str, str]:
     salt = secrets.token_bytes(_SALT_BYTES)
-    digest = hashlib.scrypt(
-        password.encode("utf-8"), salt=salt, n=_SCRYPT_N, r=_SCRYPT_R, p=_SCRYPT_P, dklen=_SCRYPT_LENGTH,
-    )
-    return digest.hex(), salt.hex()
+    digest = _scrypt_derive(password, salt, n=_SCRYPT_N, r=_SCRYPT_R, p=_SCRYPT_P, dklen=_SCRYPT_LENGTH)
+    return _encode_password_record(salt, digest)
 
 
 def _public_user(user: dict) -> dict:
@@ -472,6 +508,46 @@ def _public_user(user: dict) -> dict:
 def _revoke_user_sessions(username: str) -> None:
     for token, session in tuple(_SESSIONS.items()):
         if session.username == username:
+            _SESSIONS.pop(token, None)
+
+
+def _prune_user_sessions(username: str) -> None:
+    sessions = [
+        (token, session) for token, session in _SESSIONS.items()
+        if session.username == username
+    ]
+    overflow = len(sessions) - MAX_SESSIONS_PER_USER
+    if overflow <= 0:
+        return
+    sessions.sort(key=lambda item: (item[1].last_seen_at, item[1].created_at))
+    for token, _session in sessions[:overflow]:
+        _SESSIONS.pop(token, None)
+
+
+def _prune_sessions(now: float) -> None:
+    """Remove expired sessions and enforce a bounded in-memory session table."""
+    for token in tuple(islice(_SESSIONS, SESSION_REAPER_BATCH)):
+        session = _SESSIONS.get(token)
+        if session is not None and (
+            now - session.last_seen_at > SESSION_IDLE_SECONDS
+            or now - session.created_at > SESSION_ABSOLUTE_SECONDS
+        ):
+            _SESSIONS.pop(token, None)
+
+    overflow = len(_SESSIONS) - MAX_SESSIONS
+    if overflow > 0:
+        candidates = sorted(
+            _SESSIONS.items(),
+            key=lambda item: (
+                not (
+                    now - item[1].last_seen_at > SESSION_IDLE_SECONDS
+                    or now - item[1].created_at > SESSION_ABSOLUTE_SECONDS
+                ),
+                item[1].last_seen_at,
+                item[1].created_at,
+            ),
+        )
+        for token, _session in candidates[:overflow]:
             _SESSIONS.pop(token, None)
 
 
@@ -624,29 +700,167 @@ def revoke_site(username, domain) -> None:
 
 
 def _scrypt_candidate(password: str, salt: bytes) -> bytes:
-    return hashlib.scrypt(
-        password.encode("utf-8"), salt=salt, n=_SCRYPT_N, r=_SCRYPT_R, p=_SCRYPT_P, dklen=_SCRYPT_LENGTH,
+    """Derive dummy-password work with current parameters."""
+    return _scrypt_derive(password, salt, n=_SCRYPT_N, r=_SCRYPT_R, p=_SCRYPT_P, dklen=_SCRYPT_LENGTH)
+
+
+def _legacy_scrypt_candidate(password: str, salt: bytes) -> bytes:
+    return _scrypt_derive(
+        password, salt, n=_LEGACY_SCRYPT_N, r=_LEGACY_SCRYPT_R,
+        p=_LEGACY_SCRYPT_P, dklen=_SCRYPT_LENGTH,
     )
+
+
+def _prior_scrypt_candidate(password: str, salt: bytes) -> bytes:
+    return _scrypt_derive(
+        password, salt, n=_PRIOR_SCRYPT_N, r=_PRIOR_SCRYPT_R,
+        p=_PRIOR_SCRYPT_P, dklen=_SCRYPT_LENGTH,
+    )
+
+
+def _composite_password_work(password: str, salt: bytes) -> tuple[bytes, bytes, bytes]:
+    """Always perform every supported KDF generation for uniform timing."""
+    legacy = _legacy_scrypt_candidate(password, salt)
+    prior = _prior_scrypt_candidate(password, salt)
+    current = _scrypt_candidate(password, salt)
+    return legacy, prior, current
 
 
 def _dummy_password_work(password) -> None:
     try:
-        _scrypt_candidate(password if isinstance(password, str) else "", _DUMMY_SALT)
+        legacy, prior, current = _composite_password_work(
+            password if isinstance(password, str) else "", _DUMMY_SALT,
+        )
+        zero = bytes(_SCRYPT_LENGTH)
+        hmac.compare_digest(legacy, zero)
+        hmac.compare_digest(prior, zero)
+        hmac.compare_digest(current, zero)
     except (TypeError, ValueError, OverflowError):
         pass
 
 
-def verify_password(username, password) -> bool:
+def _parse_password_record(user: dict) -> tuple[int, int, int, int, bytes, bytes, bool] | None:
+    """Return KDF material and whether record uses pre-versioned legacy fields."""
+    stored_hash = user.get("password_hash")
+    stored_salt = user.get("password_salt")
+    if not isinstance(stored_hash, str) or not isinstance(stored_salt, str):
+        return None
+    if stored_hash.startswith("scrypt$"):
+        fields: dict[str, str] = {}
+        for component in stored_hash.split("$")[1:]:
+            key, separator, value = component.partition("=")
+            if not separator or not key or key in fields:
+                return None
+            fields[key] = value
+        if set(fields) != {"v", "n", "r", "p", "dklen", "salt", "hash"}:
+            return None
+        try:
+            version = int(fields["v"], 10)
+            params = tuple(int(fields[key], 10) for key in ("n", "r", "p", "dklen"))
+            salt = bytes.fromhex(fields["salt"])
+            digest = bytes.fromhex(fields["hash"])
+            duplicate_salt = bytes.fromhex(stored_salt)
+        except (TypeError, ValueError):
+            return None
+        if (
+            version != _SCRYPT_VERSION
+            or params not in _SUPPORTED_SCRYPT_PARAMS
+            or len(salt) != _SALT_BYTES
+            or len(digest) != _SCRYPT_LENGTH
+            or not hmac.compare_digest(salt, duplicate_salt)
+        ):
+            return None
+        prior_params = params == (_PRIOR_SCRYPT_N, _PRIOR_SCRYPT_R, _PRIOR_SCRYPT_P, _SCRYPT_LENGTH)
+        return (params[0], params[1], params[2], params[3], salt, digest, prior_params)
+
+    try:
+        digest = bytes.fromhex(stored_hash)
+        salt = bytes.fromhex(stored_salt)
+    except (TypeError, ValueError):
+        return None
+    if len(digest) != _SCRYPT_LENGTH or len(salt) != _SALT_BYTES:
+        return None
+    return (_LEGACY_SCRYPT_N, _LEGACY_SCRYPT_R, _LEGACY_SCRYPT_P, _SCRYPT_LENGTH, salt, digest, True)
+
+
+def _upgrade_legacy_password(
+    username: str, legacy_hash: str, legacy_salt: str, current_digest: bytes,
+) -> tuple[str, str] | None:
+    """Replace unchanged legacy credentials with a versioned current record."""
+    salt = bytes.fromhex(legacy_salt)
+    password_hash, password_salt = _encode_password_record(salt, current_digest)
+    with _STATE_LOCK, _store_lock():
+        users = _read_users()
+        user = _find_user(users, username)
+        if user is None or user.get("password_hash") != legacy_hash or user.get("password_salt") != legacy_salt:
+            return None
+        user["password_hash"] = password_hash
+        user["password_salt"] = password_salt
+        _write_users(users)
+        return password_hash, password_salt
+
+
+def _password_matches_user(user: dict | None, password: object) -> tuple[bool, bool, bytes | None]:
+    """Return password validity and whether successful auth needs migration."""
+    supplied = password if isinstance(password, str) else ""
+    if user is None:
+        _dummy_password_work(password)
+        return False, False, None
+    material = _parse_password_record(user)
+    if material is None:
+        _dummy_password_work(password)
+        return False, False, None
+    n, r, p, dklen, salt, expected, upgrade = material
+    try:
+        legacy_candidate, prior_candidate, current_candidate = _composite_password_work(supplied, salt)
+    except (TypeError, ValueError, OverflowError):
+        _dummy_password_work(password)
+        return False, False, None
+    legacy_match = hmac.compare_digest(legacy_candidate, expected)
+    prior_match = hmac.compare_digest(prior_candidate, expected)
+    current_match = hmac.compare_digest(current_candidate, expected)
+    # ``n/r/p/dklen`` are validated above; retain explicit use of parsed
+    # parameters so malformed/future records cannot silently select a KDF.
+    params = (n, r, p, dklen)
+    legacy_params = params == (
+        _LEGACY_SCRYPT_N, _LEGACY_SCRYPT_R, _LEGACY_SCRYPT_P, _SCRYPT_LENGTH,
+    )
+    prior_params = params == (
+        _PRIOR_SCRYPT_N, _PRIOR_SCRYPT_R, _PRIOR_SCRYPT_P, _SCRYPT_LENGTH,
+    )
+    valid = legacy_match if legacy_params else prior_match if prior_params else current_match
+    return valid, valid and upgrade, current_candidate
+
+
+def _verify_password_with_fingerprint(username, password) -> tuple[bool, tuple[object, object, object] | None]:
     try:
         user = _find_user(_read_users(), username) if isinstance(username, str) else None
-        supplied = password if isinstance(password, str) else ""
-        salt = bytes.fromhex(user["password_salt"]) if user is not None else _DUMMY_SALT
-        expected = bytes.fromhex(user["password_hash"]) if user is not None else bytes(_SCRYPT_LENGTH)
-        candidate = _scrypt_candidate(supplied, salt)
-        return user is not None and hmac.compare_digest(candidate, expected)
-    except (KeyError, TypeError, ValueError, OverflowError):
+    except UserStoreError:
         _dummy_password_work(password)
-        return False
+        return False, None
+    valid, upgrade, current_digest = _password_matches_user(user, password)
+    if not valid or user is None:
+        return False, None
+    fingerprint = _auth_fingerprint(user)
+    if upgrade and current_digest is not None:
+        try:
+            migrated = _upgrade_legacy_password(
+                username, user["password_hash"], user["password_salt"], current_digest,
+            )
+            if migrated is not None:
+                # Preserve TOTP from user snapshot used for authentication;
+                # migration CAS must not bind a newer TOTP state to old code.
+                fingerprint = (migrated[0], migrated[1], user.get("totp_secret"))
+        except (OSError, UserStoreError, TypeError, ValueError, OverflowError):
+            # Successful authentication must not become an outage when only
+            # best-effort credential migration cannot write the store.
+            pass
+    return True, fingerprint
+
+
+def verify_password(username, password) -> bool:
+    valid, _fingerprint = _verify_password_with_fingerprint(username, password)
+    return valid
 
 
 def enable_totp(username) -> tuple[str, str]:
@@ -666,24 +880,40 @@ def enable_totp(username) -> tuple[str, str]:
     return secret, uri
 
 
+def _prune_pending_totp(now: float) -> None:
+    for username, expires_at in tuple(_PENDING_TOTP_EXPIRES.items()):
+        if expires_at <= now:
+            _PENDING_TOTP.pop(username, None)
+            _PENDING_TOTP_EXPIRES.pop(username, None)
+            _PENDING_TOTP_DISCLOSED.discard(username)
+
+
 def begin_totp_enrollment(username) -> tuple[str, str]:
     username = _validate_username(username)
+    now = time.time()
     with _STATE_LOCK:
+        _prune_pending_totp(now)
         user = _find_user(_read_users(), username)
         if user is None:
             raise ValueError(f"panel user not found: {username}")
         if user.get("totp_secret"):
             raise ValueError("TOTP is already enabled")
-        if username in _PENDING_TOTP_DISCLOSED:
+        expires_at = _PENDING_TOTP_EXPIRES.get(username, 0.0)
+        if username in _PENDING_TOTP_DISCLOSED and expires_at > now:
             raise ValueError("the setup TOTP secret has already been disclosed")
+        if expires_at <= now:
+            _PENDING_TOTP.pop(username, None)
+            _PENDING_TOTP_EXPIRES.pop(username, None)
+            _PENDING_TOTP_DISCLOSED.discard(username)
         secret = base64.b32encode(secrets.token_bytes(_TOTP_SECRET_BYTES)).decode("ascii").rstrip("=")
         _PENDING_TOTP[username] = secret
+        _PENDING_TOTP_EXPIRES[username] = now + TOTP_ENROLLMENT_TTL_SECONDS
         _PENDING_TOTP_DISCLOSED.add(username)
     uri = f"otpauth://totp/wpfy:{quote(username, safe='')}?secret={secret}&issuer=wpfy"
     return secret, uri
 
 
-def complete_totp_enrollment(username, code: object) -> None:
+def complete_totp_enrollment(username, code: object) -> tuple[object, object, object]:
     username = _validate_username(username)
     now = time.time()
     with _STATE_LOCK, _store_lock():
@@ -694,6 +924,11 @@ def complete_totp_enrollment(username, code: object) -> None:
             raise ValueError(f"panel user not found: {username}")
         if not secret:
             raise ValueError("start TOTP enrollment before verifying a code")
+        if _PENDING_TOTP_EXPIRES.get(username, 0.0) <= now:
+            _PENDING_TOTP.pop(username, None)
+            _PENDING_TOTP_EXPIRES.pop(username, None)
+            _PENDING_TOTP_DISCLOSED.discard(username)
+            raise ValueError("TOTP enrollment expired; start again")
         candidate = dict(user)
         candidate["totp_secret"] = secret
         matched_step = _matching_totp_step(candidate, code, now)
@@ -703,28 +938,75 @@ def complete_totp_enrollment(username, code: object) -> None:
         _write_users(users)
         _LAST_TOTP_STEPS[username] = matched_step
         _PENDING_TOTP.pop(username, None)
+        _PENDING_TOTP_EXPIRES.pop(username, None)
         _PENDING_TOTP_DISCLOSED.discard(username)
+        return _auth_fingerprint(user)
 
 
 def cancel_totp_enrollment(username) -> None:
     username = _validate_username(username)
     with _STATE_LOCK:
         _PENDING_TOTP.pop(username, None)
+        _PENDING_TOTP_EXPIRES.pop(username, None)
         _PENDING_TOTP_DISCLOSED.discard(username)
 
 
-def disable_totp(username) -> None:
+def _auth_fingerprint(user: dict) -> tuple[object, object, object]:
+    return user.get("password_hash"), user.get("password_salt"), user.get("totp_secret")
+
+
+def _clear_totp_locked(users: list[dict], user: dict, username: str) -> None:
+    user["totp_secret"] = None
+    _write_users(users)
+    _LAST_TOTP_STEPS.pop(username, None)
+    _PENDING_TOTP.pop(username, None)
+    _PENDING_TOTP_EXPIRES.pop(username, None)
+    _PENDING_TOTP_DISCLOSED.discard(username)
+    _revoke_user_sessions(username)
+
+
+def disable_totp(username, password: object = None, totp: object = None) -> None:
+    """Self-disable contract: password plus current TOTP when currently enabled.
+
+    Password KDF work and initial reads happen outside auth/store locks. The
+    final locked read compares the authentication fingerprint, preventing a
+    concurrent password/TOTP change from being overwritten with stale data.
+    """
+    username = _validate_username(username)
+    now = time.time()
+    users = _read_users()
+    user = _find_user(users, username)
+    if user is None:
+        raise ValueError(f"panel user not found: {username}")
+    password_ok, _legacy, _current_digest = _password_matches_user(user, password)
+    if not password_ok:
+        raise ValueError("reauthentication failed")
+    fingerprint = _auth_fingerprint(user)
+
+    with _STATE_LOCK, _store_lock():
+        current_users = _read_users()
+        current = _find_user(current_users, username)
+        if current is None:
+            raise ValueError(f"panel user not found: {username}")
+        if _auth_fingerprint(current) != fingerprint:
+            raise ValueError("reauthentication state changed; retry")
+        current_step = _matching_totp_step(current, totp, now) if current.get("totp_secret") else 0
+        if current_step is None:
+            raise ValueError("current TOTP code required")
+        if current.get("totp_secret") and current_step <= _LAST_TOTP_STEPS.get(username, -1):
+            raise ValueError("TOTP code has already been used")
+        _clear_totp_locked(current_users, current, username)
+
+
+def recover_disable_totp(username) -> None:
+    """Trusted host-admin recovery operation; never use for self-service APIs."""
     username = _validate_username(username)
     with _STATE_LOCK, _store_lock():
         users = _read_users()
         user = _find_user(users, username)
         if user is None:
             raise ValueError(f"panel user not found: {username}")
-        user["totp_secret"] = None
-        _write_users(users)
-        _LAST_TOTP_STEPS.pop(username, None)
-        _PENDING_TOTP.pop(username, None)
-        _PENDING_TOTP_DISCLOSED.discard(username)
+        _clear_totp_locked(users, user, username)
 
 
 def login_required() -> bool:
@@ -874,10 +1156,12 @@ def login(
             _LOGIN_FAILURES.pop(username_key, None)
     if locked:
         _dummy_password_work(password)
+        with _STATE_LOCK:
+            _register_client_failure(client_key, now)
         _append_panel_auth_failure("password", client, username_key, "locked")
         return None
 
-    password_ok = verify_password(username_key, password)
+    password_ok, credential_fingerprint = _verify_password_with_fingerprint(username_key, password)
     try:
         user = _find_user(_read_users(), username_key)
     except UserStoreError:
@@ -885,7 +1169,21 @@ def login(
     matched_step = _matching_totp_step(user, totp, now) if user is not None else None
     credentials_ok = password_ok and user is not None and matched_step is not None
 
-    with _STATE_LOCK:
+    with _STATE_LOCK, _store_lock():
+        _prune_sessions(now)
+        if credentials_ok:
+            try:
+                current_user = _find_user(_read_users(), username_key)
+            except UserStoreError:
+                current_user = None
+            if (
+                current_user is None
+                or credential_fingerprint is None
+                or _auth_fingerprint(current_user) != credential_fingerprint
+            ):
+                credentials_ok = False
+            else:
+                user = current_user
         if credentials_ok and matched_step:
             if matched_step <= _LAST_TOTP_STEPS.get(username_key, -1):
                 credentials_ok = False
@@ -903,7 +1201,11 @@ def login(
         token = secrets.token_urlsafe(32)
         while token in _SESSIONS:
             token = secrets.token_urlsafe(32)
-        _SESSIONS[token] = Session(username_key, now, now, setup=setup)
+        _SESSIONS[token] = Session(
+            username_key, now, now, setup=setup, credential_fingerprint=credential_fingerprint,
+        )
+        _prune_user_sessions(username_key)
+        _prune_sessions(now)
     return token, _public_user(user)
 
 
@@ -911,7 +1213,8 @@ def authenticate_session(token: object) -> dict | None:
     if not isinstance(token, str) or not token:
         return None
     now = time.time()
-    with _STATE_LOCK:
+    with _STATE_LOCK, _store_lock():
+        _prune_sessions(now)
         session = _SESSIONS.get(token)
         if session is None:
             return None
@@ -925,19 +1228,39 @@ def authenticate_session(token: object) -> dict | None:
         if user is None:
             _SESSIONS.pop(token, None)
             return None
+        if session.credential_fingerprint is None or _auth_fingerprint(user) != session.credential_fingerprint:
+            _SESSIONS.pop(token, None)
+            return None
         _SESSIONS[token] = replace(session, last_seen_at=now)
         public = _public_user(user)
         public["_setup_session"] = session.setup
         return public
 
 
-def finish_setup_session(token: object) -> None:
+def finish_setup_session(
+    token: object, expected_fingerprint: tuple[object, object, object] | None = None,
+) -> bool:
     if not isinstance(token, str) or not token:
-        return
-    with _STATE_LOCK:
+        return False
+    with _STATE_LOCK, _store_lock():
         session = _SESSIONS.get(token)
-        if session is not None:
-            _SESSIONS[token] = replace(session, setup=False)
+        if session is None or not session.setup:
+            return False
+        try:
+            user = _find_user(_read_users(), session.username)
+        except UserStoreError:
+            user = None
+        if user is None:
+            _SESSIONS.pop(token, None)
+            return False
+        expected = expected_fingerprint if expected_fingerprint is not None else session.credential_fingerprint
+        if expected is None or _auth_fingerprint(user) != expected:
+            # A credential mutation between enrollment and this CAS invalidates
+            # setup token rather than rebinding it to arbitrary disk state.
+            _SESSIONS.pop(token, None)
+            return False
+        _SESSIONS[token] = replace(session, setup=False, credential_fingerprint=expected)
+        return True
 
 
 def logout(token: object) -> None:
@@ -953,4 +1276,5 @@ def reset_state() -> None:
         _CLIENT_FAILURES.clear()
         _LAST_TOTP_STEPS.clear()
         _PENDING_TOTP.clear()
+        _PENDING_TOTP_EXPIRES.clear()
         _PENDING_TOTP_DISCLOSED.clear()

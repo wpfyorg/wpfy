@@ -1875,6 +1875,8 @@ def ensure_site_scaffold(spec: SiteSpec) -> list[str]:
         "    location = /healthz.html {",
         "        access_log off;",
         "        auth_basic off;",
+        *(f"        {header}" for header in BASE_SECURITY_HEADERS),
+        *([f"        {HSTS_HEADER}"] if spec.ssl_enabled else []),
         "        add_header Content-Type text/plain;",
         "    }",
         "    location = /wp-admin/install.php {",
