@@ -171,6 +171,51 @@ directly rather than running the command an operator types.
 
 - Apply per-site security mutations to the running edge before reporting success: basic authentication, deny-IP, user-agent blocks, and login rate limits reload the site's nginx service; Cloudflare-only recreates `web` when the rendered Traefik labels differ from the running container's `traefik.*` label slice. Already-applied Cloudflare-only labels are not re-applied on an unchanged panel save. If a site is stopped, wpfy stages the configuration and reports success that it will apply when the site starts. If either runtime operation fails, wpfy retains the staged configuration but returns a non-zero result that says it was not applied. Repeating the same CLI or panel request retries the runtime operation safely; documented offline behavior remains unchanged.
 
+### Security
+
+- Traefik no longer mounts the Docker socket. A digest-pinned
+  `wollomatic/socket-proxy` holds it on the new `internal: true`
+  `wpfy-docker-socket` network, publishes no host port, and allows only
+  `GET /version`, `GET /v1.NN/(version|containers/.*|events.*)` and
+  `HEAD /_ping`; Traefik reads `tcp://socket-proxy:2375`. Existing installs
+  pick the topology up on the next `wpfy stack install --nginx`. This removes
+  the write half of the Docker API from the edge; container environment stays
+  readable to anything that owns the Traefik container, because that is what
+  routing needs. See ADR 0034.
+
+- Pin every runtime image by digest through the new
+  `src/wpfy/image_references.py` inventory — nginx-unprivileged, all six
+  PHP-FPM tags, MariaDB, Redis, Traefik and the socket proxy — with
+  `docs/IMAGE_UPDATE_POLICY.md` owning the update procedure. The PHP image
+  workflow now also publishes an immutable `<version>-<sha>` tag.
+  `atmoz/sftp:alpine` remains an explicit exception: its manifest is amd64-only
+  while wpfy supports arm hosts.
+
+- Serve `/healthz.html` only to `127.0.0.1` and `::1`. The generated Nginx
+  config for both static and WordPress flavors denies everything else, closing
+  a public liveness and identification oracle.
+
+- Report `system_diagnostics()` as allowlisted states — `running`, `stopped`,
+  `unavailable`, `available`, `consistent`, `mismatch` — with fixed messages.
+  Raw `docker compose ps` output, container names, images, commands, host port
+  bindings, and subprocess or exception text no longer reach the panel API.
+
+- Answer `421` to any Host header other than the configured one when the panel
+  runs self-signed or domainless, before routing. Origin checks stay exact on
+  scheme, host, and port.
+
+- Bound login cost: `auth.login` caps its body at 8 KiB, rejects malformed or
+  oversized credentials before any KDF runs, and admits scrypt work through a
+  non-blocking gate (2 concurrent, 1 per client) that returns a generic `429`
+  with `Retry-After` instead of queueing. scrypt parameters, the dummy KDF for
+  unknown users, TOTP, CSRF, and the per-user throttles are unchanged. The
+  panel's client-address checks now read a startup-refreshed edge snapshot
+  rather than performing Docker discovery during request handling.
+
+- Ban DOM-to-code and DOM-to-HTML sinks in the first-party panel client, with
+  `tests/test_panel_frontend_security.py` enforcing it; vendored `tabler.min.js`
+  and `qrcode.min.js` are the two explicit exclusions.
+
 ## [1.0.0-rc4] - 2026-08-02
 
 ### Added

@@ -191,6 +191,33 @@ def trusted_edge_networks() -> tuple[str, ...]:
     return discovered
 
 
+def cached_trusted_edge_networks() -> tuple[str, ...]:
+    """Return only the startup/refreshed in-memory edge trust snapshot.
+
+    Login requests must not invoke Docker or wait on a cache refresh.  An
+    expired or unavailable snapshot fails closed to the peer-address bucket.
+    """
+    now = time.monotonic()
+    with _TRUSTED_EDGE_LOCK:
+        cached = _TRUSTED_EDGE_CACHE
+        if cached is not None and cached[1] > now:
+            return cached[0]
+    return ()
+
+
+def refresh_trusted_edge_networks() -> tuple[str, ...]:
+    """Refresh edge trust outside request handling, failing closed on errors."""
+    global _TRUSTED_EDGE_CACHE
+    discovered = trusted_edge_networks()
+    # Keep this assignment as well as the normal discoverer's assignment: it
+    # makes the boundary explicit and keeps test/deployment adapters that
+    # provide an in-memory discovery function equivalent.
+    if discovered:
+        with _TRUSTED_EDGE_LOCK:
+            _TRUSTED_EDGE_CACHE = (tuple(discovered), time.monotonic() + _TRUSTED_EDGE_TTL_SECONDS)
+    return discovered
+
+
 @dataclass(frozen=True, slots=True)
 class PanelConfig:
     host: str = "127.0.0.1"
@@ -385,6 +412,55 @@ def _origin_tuple(value: str, *, scheme: str, referer: bool = False) -> tuple[st
     if port is None:
         port = 443 if normalized_scheme == "https" else 80
     return normalized_scheme, hostname.lower().rstrip("."), port
+
+
+def _host_tuple(value: object) -> tuple[str, int | None] | None:
+    if not isinstance(value, str) or not value or any(character.isspace() for character in value):
+        return None
+    try:
+        parsed = urlparse(f"//{value}")
+        hostname = parsed.hostname
+        port = parsed.port
+    except (AttributeError, ValueError):
+        return None
+    if (
+        hostname is None
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path
+        or parsed.query
+        or parsed.fragment
+    ):
+        return None
+    return hostname.lower().rstrip("."), port
+
+
+def _canonical_host(value: str) -> str:
+    try:
+        return ipaddress.ip_address(value).compressed
+    except ValueError:
+        return value.lower().rstrip(".")
+
+
+def _assert_configured_panel_host(
+    host_header: object, config: PanelConfig, *, expected_port: int | None = None,
+) -> None:
+    """Pin domainless/self-signed requests to the address and port operator saw.
+
+    This is deliberately not a DNS allowlist: accepting any name that resolves
+    to the bind address would make DNS rebinding a valid panel origin. The
+    domain-backed deployment remains behind Traefik and keeps its router-level
+    hostname policy.
+    """
+    if not config.self_signed_tls:
+        return
+    actual = _host_tuple(host_header)
+    port = config.port if config.port else expected_port
+    if actual is None or port is None or actual[1] != port:
+        raise PanelError(421, "misdirected panel request")
+    configured = _canonical_host(config.host)
+    if _canonical_host(actual[0]) != configured:
+        raise PanelError(421, "misdirected panel request")
 
 
 def _assert_same_origin(headers, host_header: str, *, scheme: str = "http") -> None:
@@ -1708,7 +1784,18 @@ def _post_setup_totp(principal, match, query, body):
 
 def _post_auth_login(principal, match, query, body):
     client = body.get("_socket_client")
-    result = panel_auth.login(body.get("username"), body.get("password"), body.get("totp"), client=client)
+    try:
+        result = panel_auth.login(body.get("username"), body.get("password"), body.get("totp"), client=client)
+    except panel_auth.LoginAdmissionError as exc:
+        panel_auth.register_client_failure(client)
+        panel_auth._append_panel_auth_failure(
+            "password", client, body.get("username") if isinstance(body.get("username"), str) else "", "throttled",
+        )
+        raise PanelError(
+            429,
+            "login verification capacity is temporarily busy; try again later",
+            {"Retry-After": str(exc.retry_after)},
+        ) from None
     if result is None:
         if panel_auth.client_throttled(client):
             retry_after = panel_auth.client_retry_after(client)
@@ -2727,7 +2814,10 @@ _SETUP_ROUTES = (
 
 
 _ROUTES = (
-    Route("POST", re.compile(r"^/api/auth/login$"), _post_auth_login, RouteMeta("auth.login", "public", True)),
+    Route(
+        "POST", re.compile(r"^/api/auth/login$"), _post_auth_login,
+        RouteMeta("auth.login", "public", True, max_body=8 * 1024),
+    ),
     Route("GET", re.compile(r"^/api/auth/me$"), _get_auth_me, RouteMeta("auth.me", "session")),
     Route("POST", re.compile(r"^/api/auth/totp$"), _post_auth_totp, RouteMeta("auth.totp.enable", "session", True)),
     Route(
@@ -3114,6 +3204,10 @@ def make_panel_handler(config: PanelConfig) -> type[BaseHTTPRequestHandler]:
             principal = None
             parsed = urlparse(self.path)
             try:
+                _assert_configured_panel_host(
+                    self.headers.get("Host", ""), config,
+                    expected_port=self.server.server_address[1],
+                )
                 route = next(
                     (
                         route for route in (*_SETUP_ROUTES, *_ROUTES)
@@ -3156,7 +3250,7 @@ def make_panel_handler(config: PanelConfig) -> type[BaseHTTPRequestHandler]:
                     body["_socket_client"] = resolve_client_address(
                         self.client_address[0],
                         self.headers.get("X-Forwarded-For"),
-                        trusted_edge_networks(),
+                        cached_trusted_edge_networks(),
                     )
                 if route.meta.action in {"setup.status", "setup.create"}:
                     # "Can this request have come from off the host?" -- not
@@ -3215,22 +3309,62 @@ def make_panel_handler(config: PanelConfig) -> type[BaseHTTPRequestHandler]:
                 self._send_json(status, payload, response_headers)
 
         def do_GET(self) -> None:
+            try:
+                _assert_configured_panel_host(
+                    self.headers.get("Host", ""), config,
+                    expected_port=self.server.server_address[1],
+                )
+            except PanelError as exc:
+                self._send_json(exc.status, {"error": str(exc)}, exc.headers)
+                return
             if urlparse(self.path).path.startswith("/api/"): self._handle_api("GET")
             else: self._serve_static(urlparse(self.path).path)
 
         def do_POST(self) -> None:
+            try:
+                _assert_configured_panel_host(
+                    self.headers.get("Host", ""), config,
+                    expected_port=self.server.server_address[1],
+                )
+            except PanelError as exc:
+                self._send_json(exc.status, {"error": str(exc)}, exc.headers)
+                return
             if urlparse(self.path).path.startswith("/api/"): self._handle_api("POST")
             else: self._send_json(404, {"error": "not found"})
 
         def do_PUT(self) -> None:
+            try:
+                _assert_configured_panel_host(
+                    self.headers.get("Host", ""), config,
+                    expected_port=self.server.server_address[1],
+                )
+            except PanelError as exc:
+                self._send_json(exc.status, {"error": str(exc)}, exc.headers)
+                return
             if urlparse(self.path).path.startswith("/api/"): self._handle_api("PUT")
             else: self._send_json(404, {"error": "not found"})
 
         def do_DELETE(self) -> None:
+            try:
+                _assert_configured_panel_host(
+                    self.headers.get("Host", ""), config,
+                    expected_port=self.server.server_address[1],
+                )
+            except PanelError as exc:
+                self._send_json(exc.status, {"error": str(exc)}, exc.headers)
+                return
             if urlparse(self.path).path.startswith("/api/"): self._handle_api("DELETE")
             else: self._send_json(404, {"error": "not found"})
 
         def do_PATCH(self) -> None:
+            try:
+                _assert_configured_panel_host(
+                    self.headers.get("Host", ""), config,
+                    expected_port=self.server.server_address[1],
+                )
+            except PanelError as exc:
+                self._send_json(exc.status, {"error": str(exc)}, exc.headers)
+                return
             if urlparse(self.path).path.startswith("/api/"): self._handle_api("PATCH")
             else: self._send_json(404, {"error": "not found"})
 
@@ -3269,6 +3403,11 @@ def make_panel_server(config: PanelConfig) -> ThreadingHTTPServer:
                 ) from None
     else:
         validate_loopback_host(config.host)
+    # Docker trust discovery is startup work, never a login-request side
+    # effect.  Failure leaves the cache empty and client resolution fails
+    # closed to the connected peer.
+    refresh_trusted_edge_networks()
+    panel_auth.refresh_never_ban_edge_cidrs()
     _rediscover_file_managers()
     server = _PanelHTTPServer((config.host, config.port), make_panel_handler(config))
     if config.self_signed_tls:

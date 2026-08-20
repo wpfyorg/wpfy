@@ -20,6 +20,7 @@ from . import registry
 from . import site_event_pipeline
 from . import site_security
 from .events import record_event
+from .image_references import MARIADB_IMAGE, REDIS_IMAGE, WEB_IMAGE
 from .php_runtime import PHP_IMAGE_REPOSITORY as _PHP_IMAGE_REPOSITORY, php_image
 from .redaction import redact_values
 from .s3_backup import S3ConfigError, S3Uploader, load_s3_config, redact_s3_secrets
@@ -72,12 +73,6 @@ def _current_paths():
 
 
 PHP_IMAGE_REPOSITORY = _PHP_IMAGE_REPOSITORY
-
-# Single source of truth for non-PHP service images: compose_content renders
-# these and `wpfy stack install` pre-pulls the same tags.
-WEB_IMAGE = "nginxinc/nginx-unprivileged:1.27-alpine"
-MARIADB_IMAGE = "mariadb:11.4"
-REDIS_IMAGE = "redis:7.2-alpine"
 
 # Base for per-site UID/GID allocation. Each site gets a unique uid (== gid) used
 # by every one of its containers and to own its host files, so a compromised (or
@@ -1875,6 +1870,9 @@ def ensure_site_scaffold(spec: SiteSpec) -> list[str]:
         "    location = /healthz.html {",
         "        access_log off;",
         "        auth_basic off;",
+        "        allow 127.0.0.1;",
+        "        allow ::1;",
+        "        deny all;",
         *(f"        {header}" for header in BASE_SECURITY_HEADERS),
         *([f"        {HSTS_HEADER}"] if spec.ssl_enabled else []),
         "        add_header Content-Type text/plain;",

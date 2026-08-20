@@ -62,7 +62,9 @@ jobs:
           context: ./docker/php-fpm/${{ matrix.php-version }}
           platforms: linux/amd64,linux/arm64
           push: ${{ github.repository == 'wpfyorg/wpfy' && github.event_name != 'pull_request' }}
-          tags: ghcr.io/wpfyorg/php-fpm:${{ matrix.php-version }}
+          tags: |
+            ghcr.io/wpfyorg/php-fpm:${{ matrix.php-version }}
+            ghcr.io/wpfyorg/php-fpm:${{ matrix.php-version }}-${{ github.sha }}
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.description=wpfy PHP-FPM runtime for WordPress

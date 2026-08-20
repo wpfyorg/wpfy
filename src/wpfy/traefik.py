@@ -16,13 +16,19 @@ import uuid
 from pathlib import Path
 
 from . import settings
+from .image_references import SOCKET_PROXY_IMAGE, TRAEFIK_IMAGE
 from .site_runtime import RuntimeResult, docker_available, runtime_skip_requested
 from .dns import cloudflare_config_path
 from .site_definition import compose_hardening_lines
 from .site_paths import read_env
 
 
-TRAEFIK_IMAGE = "traefik:v3.6.17"
+SOCKET_PROXY_ENVIRONMENT = (
+    "SP_ALLOW_FROM=traefik",
+    "SP_ALLOW_GET=/version",
+    "SP_ALLOW_GET_2=/v1\\..{1,2}/(version|containers/.*|events.*)",
+    "SP_ALLOW_HEAD=/_ping",
+)
 _DEFAULT_ACME_EMAIL = "admin@localhost"
 _ACME_EMAIL_RE = re.compile(
     r"[A-Za-z0-9][A-Za-z0-9.!#$%&'+/=?^_`{|}~-]*@"
@@ -31,7 +37,9 @@ _ACME_EMAIL_RE = re.compile(
 )
 TRAEFIK_NETWORK = "wpfy"
 PANEL_EDGE_NETWORK = "wpfy-panel-edge"
+DOCKER_SOCKET_NETWORK = "wpfy-docker-socket"
 TRAEFIK_CONTAINER = "wpfy-traefik"
+SOCKET_PROXY_CONTAINER = "wpfy-socket-proxy"
 TRAEFIK_PROJECT = "wpfy-traefik"
 _COMPOSE_TIMEOUT_SECONDS = 120
 _HEALTH_TIMEOUT_SECONDS = 180
@@ -412,7 +420,7 @@ def _traefik_static_config() -> str:
         "",
         "providers:",
         "  docker:",
-        "    endpoint: \"unix:///var/run/docker.sock\"",
+        "    endpoint: \"tcp://socket-proxy:2375\"",
         "    exposedByDefault: false",
         f"    network: {TRAEFIK_NETWORK}",
         "  file:",
@@ -475,6 +483,18 @@ def traefik_compose_content() -> str:
     lines = [
         f"name: {TRAEFIK_PROJECT}",
         "services:",
+        "  socket-proxy:",
+        f"    image: {SOCKET_PROXY_IMAGE}",
+        f"    container_name: {SOCKET_PROXY_CONTAINER}",
+        "    restart: unless-stopped",
+        *compose_hardening_lines(128, "128m", "0.25"),
+        "    environment:",
+        *(f"      - {setting}" for setting in SOCKET_PROXY_ENVIRONMENT),
+        "    volumes:",
+        "      - /var/run/docker.sock:/var/run/docker.sock:ro",
+        "    networks:",
+        f"      - {DOCKER_SOCKET_NETWORK}",
+        "",
         "  traefik:",
         f"    image: {TRAEFIK_IMAGE}",
         f"    container_name: {TRAEFIK_CONTAINER}",
@@ -484,6 +504,8 @@ def traefik_compose_content() -> str:
         "    ports:",
         '      - "80:80"',
         '      - "443:443"',
+        "    depends_on:",
+        "      - socket-proxy",
     ]
     cf_config = cloudflare_config_path()
     if cf_config.exists():
@@ -493,13 +515,13 @@ def traefik_compose_content() -> str:
         ])
     lines.extend([
         "    volumes:",
-        "      - /var/run/docker.sock:/var/run/docker.sock:ro",
         f"      - {config_mount}:/etc/traefik/traefik.yml:ro",
         f"      - {dynamic_mount}:/etc/traefik/dynamic:ro",
         "      - letsencrypt_data:/letsencrypt",
         "    networks:",
         f"      - {TRAEFIK_NETWORK}",
         f"      - {PANEL_EDGE_NETWORK}",
+        f"      - {DOCKER_SOCKET_NETWORK}",
         "    healthcheck:",
         "      test: [\"CMD\", \"traefik\", \"healthcheck\", \"--ping\"]",
         "      interval: 30s",
@@ -511,6 +533,8 @@ def traefik_compose_content() -> str:
         "    external: true",
         f"  {PANEL_EDGE_NETWORK}:",
         "    external: true",
+        f"  {DOCKER_SOCKET_NETWORK}:",
+        "    internal: true",
         "",
         "volumes:",
         "  letsencrypt_data:",

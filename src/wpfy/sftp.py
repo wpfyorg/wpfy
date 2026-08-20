@@ -5,6 +5,7 @@ import re
 import socket
 import time
 
+from .image_references import SFTP_IMAGE
 from .site_definition import SiteDefinition
 from .site_layout import (
     ensure_site_scaffold,
@@ -15,7 +16,9 @@ from .site_runtime import RuntimeResult, compose_command, runtime_skip_requested
 from .events import record_event
 
 
-_SFTP_IMAGE = "atmoz/sftp:alpine"
+# Compatibility alias for callers that used the private status constant; the
+# authority is image_references.SFTP_IMAGE.
+_SFTP_IMAGE = SFTP_IMAGE
 _SFTP_PORT = "2222"
 _SFTP_READY_TIMEOUT_SECONDS = 15.0
 

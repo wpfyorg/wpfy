@@ -6,15 +6,14 @@ import subprocess
 
 from . import traefik
 from .fail2ban_host import ensure_fail2ban_host
+from .image_references import ADMINER_IMAGE, HELPER_IMAGE_REFERENCES, MARIADB_IMAGE, REDIS_IMAGE
 from .php_runtime import DEFAULT_PHP_VERSION, PHP_IMAGE_REPOSITORY, php_image
-from .site_layout import MARIADB_IMAGE, REDIS_IMAGE
 from .site_runtime import RuntimeResult
 
 
 HELPER_IMAGES = {
-    "phpmyadmin": "phpmyadmin:5-apache",
-    "adminer": "adminer:5",
-    "composer": "composer:2",
+    **HELPER_IMAGE_REFERENCES,
+    "adminer": ADMINER_IMAGE,
 }
 HOST_TOOLS = ("netdata", "fail2ban", "ufw", "ngxblocker", "nanorc", "dashboard", "extplorer")
 
@@ -85,6 +84,12 @@ def install(
     pulled_php_versions: set[str] = set()
 
     if request.install_all or request.nginx:
+        for name, image in (
+            ("Traefik image", traefik.TRAEFIK_IMAGE),
+            ("Docker socket proxy image", traefik.SOCKET_PROXY_IMAGE),
+        ):
+            notify(f"Pulling {image} image...")
+            facts.append(pull_image(image))
         notify("Starting shared Traefik edge proxy...")
         result = traefik.start_traefik()
         status_name = "SKIP" if result.skipped else "OK" if result.exit_code == 0 else "FAIL"
@@ -210,7 +215,7 @@ def upgrade() -> StackResult:
         fact = StackFact("Traefik", "FAIL", f"restart failed: {message}", restart.returncode)
         return StackResult((fact,), restart.returncode)
     return StackResult((
-        StackFact("Traefik", "OK", "pulled latest images and restarted"),
+        StackFact("Traefik", "OK", "restarted with checked-in digest-pinned images"),
         StackFact("pull", "OK", "complete"),
     ))
 

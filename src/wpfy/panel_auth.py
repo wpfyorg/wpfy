@@ -30,6 +30,9 @@ ROLE_ADMIN = "admin"
 ROLE_SITE_MANAGER = "site-manager"
 ROLES = frozenset({ROLE_ADMIN, ROLE_SITE_MANAGER})
 PASSWORD_MIN_LENGTH = 12
+MAX_LOGIN_USERNAME_LENGTH = 64
+MAX_LOGIN_PASSWORD_LENGTH = 4096
+MAX_LOGIN_TOTP_LENGTH = 64
 
 SESSION_IDLE_SECONDS = 30 * 60
 SESSION_ABSOLUTE_SECONDS = 12 * 60 * 60
@@ -76,6 +79,27 @@ _DUMMY_SALT = b"wpfy-panel-auth-dummy-salt"
 _STATE_LOCK = threading.RLock()
 _AUTH_LOG_LOCK = threading.Lock()
 
+
+def _bounded_int_env(name: str, default: int, *, minimum: int, maximum: int) -> int:
+    try:
+        value = int(os.environ.get(name, str(default)), 10)
+    except (TypeError, ValueError):
+        return default
+    return max(minimum, min(maximum, value))
+
+
+# Admission is deliberately small and non-blocking.  Login requests never
+# queue behind a KDF, and the cap is bounded even when an operator supplies an
+# unsafe environment value.
+LOGIN_KDF_CONCURRENCY = _bounded_int_env(
+    "WPFY_PANEL_LOGIN_KDF_CONCURRENCY", 2, minimum=1, maximum=8,
+)
+LOGIN_KDF_PER_CLIENT_CONCURRENCY = _bounded_int_env(
+    "WPFY_PANEL_LOGIN_KDF_PER_CLIENT_CONCURRENCY", 1, minimum=1, maximum=2,
+)
+_LOGIN_KDF_SEMAPHORE = threading.BoundedSemaphore(LOGIN_KDF_CONCURRENCY)
+_LOGIN_KDF_CLIENTS: dict[str, int] = {}
+
 # Sentinel for a client address that cannot be determined (trusted edge with
 # no usable forwarded chain) or that must never be written as a bannable
 # identity. Banning 0.0.0.0 is a no-op in iptables, so keeping the record
@@ -94,6 +118,7 @@ _NEVER_BAN_STATIC_CIDRS = ("0.0.0.0/32", "127.0.0.0/8", "::1/128", "172.17.0.0/1
 _NEVER_BAN_EDGE_LOCK = threading.Lock()
 _NEVER_BAN_EDGE_TTL_SECONDS = 30
 _NEVER_BAN_EDGE_CACHE: tuple[tuple[str, ...], float] | None = None
+_NEVER_BAN_EDGE_REQUEST_SAFE = False
 
 _PANEL_AUTH_LOG_MAX_BYTES = int(
     os.environ.get("WPFY_PANEL_AUTH_LOG_MAX_BYTES", str(10 * 1024 * 1024))
@@ -112,6 +137,14 @@ class Session:
 
 class ClientThrottleError(ValueError):
     pass
+
+
+class LoginAdmissionError(ClientThrottleError):
+    """The bounded login-KDF admission gate is saturated."""
+
+    def __init__(self, retry_after: int = 1) -> None:
+        super().__init__("login verification capacity is temporarily busy")
+        self.retry_after = max(1, int(retry_after))
 
 
 @dataclass(frozen=True, slots=True)
@@ -253,7 +286,33 @@ def _client_ip_is_never_ban(value: str) -> bool:
         return True
     if cloudflare_ranges.is_cloudflare_ip(value):
         return True
-    return _address_in_networks(value, _discover_never_ban_edge_cidrs())
+    return _address_in_networks(value, cached_never_ban_edge_cidrs())
+
+
+def cached_never_ban_edge_cidrs() -> tuple[str, ...]:
+    """Return the startup/refreshed edge snapshot without Docker I/O."""
+    if not _NEVER_BAN_EDGE_REQUEST_SAFE:
+        # Direct library callers (including offline maintenance/tests) retain
+        # the historical discovery behavior.  The HTTP server flips this
+        # switch after startup refresh, so request handling is cache-only.
+        return _discover_never_ban_edge_cidrs()
+    now = time.monotonic()
+    with _NEVER_BAN_EDGE_LOCK:
+        cached = _NEVER_BAN_EDGE_CACHE
+        if cached is not None and cached[1] > now:
+            return cached[0]
+    return ()
+
+
+def refresh_never_ban_edge_cidrs() -> tuple[str, ...]:
+    """Refresh edge exclusions outside request handling."""
+    global _NEVER_BAN_EDGE_CACHE, _NEVER_BAN_EDGE_REQUEST_SAFE
+    discovered = _discover_never_ban_edge_cidrs()
+    _NEVER_BAN_EDGE_REQUEST_SAFE = True
+    if discovered:
+        with _NEVER_BAN_EDGE_LOCK:
+            _NEVER_BAN_EDGE_CACHE = (tuple(discovered), time.monotonic() + _NEVER_BAN_EDGE_TTL_SECONDS)
+    return discovered
 
 
 def _hash_account(identifier: str) -> str:
@@ -1068,6 +1127,44 @@ def _client_key(client: object) -> str:
     return client if isinstance(client, str) and client else "unknown"
 
 
+def _login_payload_is_possible(username: object, password: object, totp: object) -> bool:
+    """Reject malformed login material before it can reach a KDF."""
+    if not isinstance(username, str) or len(username) > MAX_LOGIN_USERNAME_LENGTH:
+        return False
+    if not isinstance(password, str) or len(password) > MAX_LOGIN_PASSWORD_LENGTH:
+        return False
+    if totp is not None and (
+        not isinstance(totp, str) or len(totp) > MAX_LOGIN_TOTP_LENGTH
+    ):
+        return False
+    return True
+
+
+@contextmanager
+def _login_kdf_admission(client: str):
+    """Reserve global and per-client capacity without ever queueing a request."""
+    if not _LOGIN_KDF_SEMAPHORE.acquire(blocking=False):
+        raise LoginAdmissionError()
+    reserved = False
+    try:
+        with _STATE_LOCK:
+            in_flight = _LOGIN_KDF_CLIENTS.get(client, 0)
+            if in_flight >= LOGIN_KDF_PER_CLIENT_CONCURRENCY:
+                raise LoginAdmissionError()
+            _LOGIN_KDF_CLIENTS[client] = in_flight + 1
+            reserved = True
+        yield
+    finally:
+        if reserved:
+            with _STATE_LOCK:
+                remaining = _LOGIN_KDF_CLIENTS.get(client, 0) - 1
+                if remaining > 0:
+                    _LOGIN_KDF_CLIENTS[client] = remaining
+                else:
+                    _LOGIN_KDF_CLIENTS.pop(client, None)
+        _LOGIN_KDF_SEMAPHORE.release()
+
+
 def _prune_client_failures(now: float) -> None:
     for client, failure in tuple(_CLIENT_FAILURES.items()):
         if failure.expires_at <= now:
@@ -1143,70 +1240,77 @@ def register_fm_enable(username: str) -> None:
 def login(
     username: object, password: object, totp: object = None, *, client=None, setup: bool = False,
 ) -> tuple[str, dict] | None:
+    # These checks are intentionally before admission and before any KDF.  The
+    # HTTP layer has already bounded the JSON body, but a valid-sized body can
+    # still contain values that would make password verification needlessly
+    # expensive or ambiguous.
+    if not _login_payload_is_possible(username, password, totp):
+        return None
     username_key = username if isinstance(username, str) and _USERNAME.fullmatch(username) else ""
     client_key = _client_key(client)
     now = time.time()
     if client_throttled(client_key):
         _append_panel_auth_failure("password", client, username_key, "throttled")
         return None
-    with _STATE_LOCK:
-        failure = _LOGIN_FAILURES.get(username_key)
-        locked = failure is not None and failure.locked_until > now
-        if failure is not None and failure.locked_until and failure.locked_until <= now:
-            _LOGIN_FAILURES.pop(username_key, None)
-    if locked:
-        _dummy_password_work(password)
+    with _login_kdf_admission(client_key):
         with _STATE_LOCK:
-            _register_client_failure(client_key, now)
-        _append_panel_auth_failure("password", client, username_key, "locked")
-        return None
-
-    password_ok, credential_fingerprint = _verify_password_with_fingerprint(username_key, password)
-    try:
-        user = _find_user(_read_users(), username_key)
-    except UserStoreError:
-        user = None
-    matched_step = _matching_totp_step(user, totp, now) if user is not None else None
-    credentials_ok = password_ok and user is not None and matched_step is not None
-
-    with _STATE_LOCK, _store_lock():
-        _prune_sessions(now)
-        if credentials_ok:
-            try:
-                current_user = _find_user(_read_users(), username_key)
-            except UserStoreError:
-                current_user = None
-            if (
-                current_user is None
-                or credential_fingerprint is None
-                or _auth_fingerprint(current_user) != credential_fingerprint
-            ):
-                credentials_ok = False
-            else:
-                user = current_user
-        if credentials_ok and matched_step:
-            if matched_step <= _LAST_TOTP_STEPS.get(username_key, -1):
-                credentials_ok = False
-            else:
-                _LAST_TOTP_STEPS[username_key] = matched_step
-        if not credentials_ok:
-            _register_client_failure(client_key, now)
-            if user is not None:
-                _register_failure(username_key, now)
-            reason = "totp_failed" if password_ok and user is not None else "invalid_credentials"
-            _append_panel_auth_failure("password", client, username_key, reason)
+            failure = _LOGIN_FAILURES.get(username_key)
+            locked = failure is not None and failure.locked_until > now
+            if failure is not None and failure.locked_until and failure.locked_until <= now:
+                _LOGIN_FAILURES.pop(username_key, None)
+        if locked:
+            _dummy_password_work(password)
+            with _STATE_LOCK:
+                _register_client_failure(client_key, now)
+            _append_panel_auth_failure("password", client, username_key, "locked")
             return None
-        _LOGIN_FAILURES.pop(username_key, None)
-        _CLIENT_FAILURES.pop(client_key, None)
-        token = secrets.token_urlsafe(32)
-        while token in _SESSIONS:
+
+        password_ok, credential_fingerprint = _verify_password_with_fingerprint(username_key, password)
+        try:
+            user = _find_user(_read_users(), username_key)
+        except UserStoreError:
+            user = None
+        matched_step = _matching_totp_step(user, totp, now) if user is not None else None
+        credentials_ok = password_ok and user is not None and matched_step is not None
+
+        with _STATE_LOCK, _store_lock():
+            _prune_sessions(now)
+            if credentials_ok:
+                try:
+                    current_user = _find_user(_read_users(), username_key)
+                except UserStoreError:
+                    current_user = None
+                if (
+                    current_user is None
+                    or credential_fingerprint is None
+                    or _auth_fingerprint(current_user) != credential_fingerprint
+                ):
+                    credentials_ok = False
+                else:
+                    user = current_user
+            if credentials_ok and matched_step:
+                if matched_step <= _LAST_TOTP_STEPS.get(username_key, -1):
+                    credentials_ok = False
+                else:
+                    _LAST_TOTP_STEPS[username_key] = matched_step
+            if not credentials_ok:
+                _register_client_failure(client_key, now)
+                if user is not None:
+                    _register_failure(username_key, now)
+                reason = "totp_failed" if password_ok and user is not None else "invalid_credentials"
+                _append_panel_auth_failure("password", client, username_key, reason)
+                return None
+            _LOGIN_FAILURES.pop(username_key, None)
+            _CLIENT_FAILURES.pop(client_key, None)
             token = secrets.token_urlsafe(32)
-        _SESSIONS[token] = Session(
-            username_key, now, now, setup=setup, credential_fingerprint=credential_fingerprint,
-        )
-        _prune_user_sessions(username_key)
-        _prune_sessions(now)
-    return token, _public_user(user)
+            while token in _SESSIONS:
+                token = secrets.token_urlsafe(32)
+            _SESSIONS[token] = Session(
+                username_key, now, now, setup=setup, credential_fingerprint=credential_fingerprint,
+            )
+            _prune_user_sessions(username_key)
+            _prune_sessions(now)
+        return token, _public_user(user)
 
 
 def authenticate_session(token: object) -> dict | None:
@@ -1270,6 +1374,7 @@ def logout(token: object) -> None:
 
 
 def reset_state() -> None:
+    global _NEVER_BAN_EDGE_CACHE, _NEVER_BAN_EDGE_REQUEST_SAFE
     with _STATE_LOCK:
         _SESSIONS.clear()
         _LOGIN_FAILURES.clear()
@@ -1278,3 +1383,7 @@ def reset_state() -> None:
         _PENDING_TOTP.clear()
         _PENDING_TOTP_EXPIRES.clear()
         _PENDING_TOTP_DISCLOSED.clear()
+        _LOGIN_KDF_CLIENTS.clear()
+    with _NEVER_BAN_EDGE_LOCK:
+        _NEVER_BAN_EDGE_CACHE = None
+    _NEVER_BAN_EDGE_REQUEST_SAFE = False

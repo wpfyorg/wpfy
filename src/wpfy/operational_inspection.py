@@ -146,40 +146,51 @@ def aggregate_info() -> AggregateInfo:
 
 
 def system_diagnostics() -> tuple[InspectionCheck, ...]:
+    """Return safe, high-level host diagnostics.
+
+    Command output is intentionally used only as an internal signal.  The
+    panel exposes these checks directly, so neither subprocess output nor
+    exception text may become part of a returned check.
+    """
     checks = []
     if not shutil.which("docker"):
-        return (InspectionCheck("Docker", False, "Docker command not found"),)
-    proc = subprocess.run(["docker", "info"], check=False, capture_output=True, text=True)
-    docker_ok = proc.returncode == 0
+        return (InspectionCheck("Docker", None, "unavailable"),)
+    try:
+        proc = subprocess.run(["docker", "info"], check=False, capture_output=True, text=True)
+        docker_ok = proc.returncode == 0
+    except Exception:
+        docker_ok = False
     checks.append(InspectionCheck(
         "Docker",
         docker_ok,
-        "Docker daemon responding" if docker_ok else f"Docker daemon unreachable ({proc.returncode})",
+        "running" if docker_ok else "unavailable",
     ))
     if not docker_ok:
         return tuple(checks)
 
-    running = traefik.traefik_running()
-    status = traefik.traefik_status().message.strip()
+    try:
+        running = traefik.traefik_running()
+        status = traefik.traefik_status()
+        traefik_state = "unavailable" if status.exit_code != 0 else ("running" if running else "stopped")
+    except Exception:
+        traefik_state = "unavailable"
     checks.append(InspectionCheck(
         "Traefik",
-        running,
-        f"Traefik {'running' if running else 'not running'}; {status}",
+        True if traefik_state == "running" else (None if traefik_state == "unavailable" else False),
+        traefik_state,
     ))
 
-    proc = subprocess.run(
-        ["docker", "system", "df", "--format", "{{.Type}}\t{{.Size}}"],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    disk_ok = proc.returncode == 0
-    disk_lines = [line.strip() for line in proc.stdout.splitlines() if line.strip()]
-    disk_message = (
-        f"disk usage: {len(disk_lines)} entries; {proc.stdout.strip()[:200]}"
-        if disk_ok else "docker system df failed"
-    )
-    checks.append(InspectionCheck("Disk", disk_ok, disk_message))
+    try:
+        proc = subprocess.run(
+            ["docker", "system", "df", "--format", "{{.Type}}\t{{.Size}}"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        disk_ok = proc.returncode == 0
+    except Exception:
+        disk_ok = False
+    checks.append(InspectionCheck("Disk", disk_ok, "available" if disk_ok else "unavailable"))
     checks.append(_registry_consistency())
     return tuple(checks)
 
@@ -187,23 +198,17 @@ def system_diagnostics() -> tuple[InspectionCheck, ...]:
 def _registry_consistency() -> InspectionCheck:
     try:
         registered = {site["domain"] for site in registry.list_sites()}
-    except (OSError, KeyError):
-        registered = set()
-    filesystem = set()
-    try:
+        filesystem = set()
         for child in Path(_current_paths().sites_dir).iterdir():
             if child.is_dir() and (child / ".env").exists() and (child / "compose.yaml").exists():
                 filesystem.add(child.name)
-    except OSError:
-        filesystem = set()
+    except Exception:
+        return InspectionCheck("Registry", None, "unavailable")
     missing_in_fs = registered - filesystem
     missing_in_registry = filesystem - registered
     if not missing_in_fs and not missing_in_registry:
-        return InspectionCheck("Registry", True, f"registry + filesystem consistent ({len(registered)} sites)")
-    messages = []
-    if missing_in_fs: messages.append(f"registry has orphaned entries: {', '.join(sorted(missing_in_fs))}")
-    if missing_in_registry: messages.append(f"filesystem has untracked dirs: {', '.join(sorted(missing_in_registry))}")
-    return InspectionCheck("Registry", False, "; ".join(messages))
+        return InspectionCheck("Registry", True, "consistent")
+    return InspectionCheck("Registry", False, "mismatch")
 
 
 def site_diagnostics(domain: str) -> tuple[InspectionCheck, ...]:

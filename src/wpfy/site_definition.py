@@ -5,6 +5,7 @@ from dataclasses import dataclass
 import re
 from typing import Final
 
+from .image_references import ADMINER_IMAGE, SFTP_IMAGE
 from .php_runtime import DEFAULT_PHP_VERSION
 from .site_paths import domain_to_project
 
@@ -36,7 +37,6 @@ WORDPRESS_FLAVORS: Final = frozenset({
     "wpsubdomain",
 })
 MYSQL_FLAVORS: Final = frozenset({"mysql", *WORDPRESS_FLAVORS})
-ADMINER_IMAGE: Final = "adminer:5"
 DEFAULT_PHP_MEMORY_LIMIT: Final = "256M"
 DEFAULT_PHP_MAX_EXECUTION_TIME: Final = "300"
 DEFAULT_PHP_MAX_INPUT_TIME: Final = "300"
@@ -276,7 +276,7 @@ def sftp_service_lines(definition: SiteDefinition) -> list[str]:
     uid = definition.site_uid if definition.site_uid is not None else 1000
     return [
         "  sftp:",
-        "    image: atmoz/sftp:alpine",
+        f"    image: {SFTP_IMAGE}",
         f"    container_name: {project}-sftp",
         "    restart: unless-stopped",
         # atmoz/sftp creates the configured account and changes ownership before
