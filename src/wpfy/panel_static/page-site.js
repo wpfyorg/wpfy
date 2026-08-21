@@ -57,8 +57,14 @@ registerPage("site-detail", async (ctx) => {
     breadcrumb: [["/sites", "Sites"], [null, site.domain || domain]],
   });
   const encodedDomain = encodeURIComponent(domain);
-  ctx.mount.append(el("ul", { class: "nav nav-tabs mb-3", role: "tablist" },
-    TABS.map(([name, label]) => el("li", { class: "nav-item", role: "presentation" },
+  // No `role="tablist"` / `role="presentation"` here, deliberately: these are
+  // real navigation links to real routes, not a tab widget. A tablist whose
+  // children carry no `role="tab"` and no `aria-selected` promises a widget
+  // that does not exist and suppresses the list semantics on the way -- worse
+  // than no role at all. `aria-current="page"` below is what conveys which
+  // section is open, and it is the correct vocabulary for links.
+  ctx.mount.append(el("ul", { class: "nav nav-tabs mb-3" },
+    TABS.map(([name, label]) => el("li", { class: "nav-item" },
       el("a", {
         class: `nav-link${name === tab ? " active" : ""}`,
         href: `/site/${encodedDomain}/${name}`,

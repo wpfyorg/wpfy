@@ -29,7 +29,6 @@
 <symbol id="i-info-circle" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 1 0 18 0a9 9 0 0 0 -18 0" /><path d="M12 9h.01" /><path d="M11 12h1v4h1" /></symbol>
 <symbol id="i-cloud-upload" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M7 18a4.6 4.4 0 0 1 0 -9a5 4.5 0 0 1 11 2h1a3.5 3.5 0 0 1 0 7h-1" /><path d="M9 15l3 -3l3 3" /><path d="M12 12l0 9" /></symbol>
 <symbol id="i-shield-lock" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3a12 12 0 0 0 8.5 3a12 12 0 0 1 -8.5 15a12 12 0 0 1 -8.5 -15a12 12 0 0 0 8.5 -3" /><path d="M12 11m-1 0a1 1 0 1 0 2 0a1 1 0 1 0 -2 0" /><path d="M12 12l0 2.5" /></symbol>
-<symbol id="i-bell" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 5a2 2 0 1 1 4 0a7 7 0 0 1 4 6v3a4 4 0 0 0 2 3h-16a4 4 0 0 0 2 -3v-3a7 7 0 0 1 4 -6" /><path d="M9 17v1a3 3 0 0 0 6 0v-1" /></symbol>
 <symbol id="i-key" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16.555 3.843l3.602 3.602a2.877 2.877 0 0 1 0 4.069l-2.643 2.643a2.877 2.877 0 0 1 -4.069 0l-.301 -.301l-6.558 6.558a2 2 0 0 1 -1.239 .578l-.175 .008h-1.172a1 1 0 0 1 -.993 -.883l-.007 -.117v-1.172a2 2 0 0 1 .467 -1.284l.119 -.13l.414 -.414h2v-2h2v-2l2.144 -2.144l-.301 -.301a2.877 2.877 0 0 1 0 -4.069l2.643 -2.643a2.877 2.877 0 0 1 4.069 0z" /><path d="M15 9h.01" /></symbol>
 <symbol id="i-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 12m-4 0a4 4 0 1 0 8 0a4 4 0 1 0 -8 0" /><path d="M3 12h1m8 -9v1m8 8h1m-9 8v1m-6.4 -15.4l.7 .7m12.1 -.7l-.7 .7m0 11.4l.7 .7m-12.1 -.7l-.7 .7" /></symbol>
 <symbol id="i-moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3c.132 0 .263 0 .393 0a7.5 7.5 0 0 0 7.92 12.446a9 9 0 1 1 -8.313 -12.454z" /></symbol>
@@ -67,7 +66,7 @@
     <div class="card card-md" id="setup-account">
       <div class="card-body">
         <h1 class="card-title text-center mb-2" id="setup-title">Create the panel administrator</h1>
-        <p class="text-secondary">This is the only browser setup window. Use the run token printed by <code>wpfy panel</code>; once the account exists, setup closes permanently.</p>
+        <p class="text-secondary" id="setup-intro">This is the only browser setup window. Use the run token printed by <code>wpfy panel</code>; once the account exists, setup closes permanently.</p>
         <form id="setup-account-form">
           <div class="row g-2">
             <div class="col-md-6"><div class="mb-3"><label class="form-label" for="setup-first-name">First name</label><input id="setup-first-name" class="form-control" type="text" autocomplete="given-name" required></div></div>
@@ -137,7 +136,19 @@
 <!-- Application shell                                                    -->
 <!-- ------------------------------------------------------------------ -->
 <div id="app" class="page d-none">
-  <aside class="navbar navbar-vertical navbar-expand-lg">
+  <!-- First focusable element in the app shell: eleven sidebar links and the
+       whole header sit ahead of <main> in the tab order on every route, so a
+       keyboard operator would otherwise traverse all of it per navigation
+       (WCAG 2.4.1). It lives inside #app rather than at the top of <body> so
+       it stays hidden -- along with its #page target -- on the setup and
+       sign-in screens, where that target does not exist yet. -->
+  <a href="#page" class="visually-hidden-focusable">Skip to main content</a>
+
+  <!-- <nav>, not <aside>: this is the panel's primary navigation, and the
+       complementary landmark <aside> maps to would leave a screen-reader user
+       with no navigation landmark to jump to. Tabler styles .navbar-vertical
+       by class, so the element name is free. -->
+  <nav class="navbar navbar-vertical navbar-expand-lg" aria-label="Sections">
     <div class="container-fluid">
       <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#sidebar-menu" aria-controls="sidebar-menu" aria-expanded="false" aria-label="Toggle navigation">
         <span class="navbar-toggler-icon"></span>
@@ -154,7 +165,7 @@
         <ul class="navbar-nav pt-lg-3" id="nav-primary" aria-label="Primary"></ul>
       </div>
     </div>
-  </aside>
+  </nav>
 
   <header class="navbar navbar-expand-md d-print-none">
     <div class="container-fluid">
@@ -237,7 +248,8 @@
           </div>
         </div>
 
-        <main id="page"></main>
+        <!-- tabindex="-1" so the skip link moves focus here, not just scroll. -->
+        <main id="page" tabindex="-1"></main>
       </div>
     </div>
 

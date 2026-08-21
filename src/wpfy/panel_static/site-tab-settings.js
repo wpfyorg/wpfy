@@ -96,7 +96,7 @@ export async function render(ctx, domain, site) {
   acknowledge.addEventListener("change", syncActions);
 
   const configPhp = el("input", { class: "form-control", value: site.php_version || "", "aria-label": "PHP version" });
-  const configFlavor = el("input", { class: "form-control", value: site.flavor || "", "aria-label": "Site flavor" });
+  const configFlavor = el("input", { class: "form-control", value: site.flavor || "", "aria-label": "Flavor" });
   const configSsl = el("input", { class: "form-check-input", type: "checkbox", checked: site.ssl_enabled || site.letsencrypt === "default" || site.letsencrypt === "wildcard" });
   const sslStatus = el("div", { class: "mt-3" });
   const preflight = el("button", { class: "btn btn-outline-secondary btn-sm", type: "button", text: "Check SSL preflight" });
@@ -255,9 +255,9 @@ export async function render(ctx, domain, site) {
   if (securityLoad.error) securityBody.replaceChildren(error(`Unable to load security settings: ${securityLoad.error.message}`));
   else if (!securityLoad.aborted) {
     const current = securityLoad.payload;
-    const denyIps = el("textarea", { class: "form-control font-monospace", rows: 5, "aria-label": "Denied IPs", value: lines(current.deny_ips) });
+    const denyIps = el("textarea", { class: "form-control font-monospace", rows: 5, "aria-label": "Denied IPs or CIDRs (one per line)", value: lines(current.deny_ips) });
     const denyError = el("div", { class: "invalid-feedback d-block d-none" });
-    const uaBlocks = el("textarea", { class: "form-control", rows: 5, "aria-label": "Blocked user agents", value: lines(current.ua_blocks) });
+    const uaBlocks = el("textarea", { class: "form-control", rows: 5, "aria-label": "Blocked user agents (one per line)", value: lines(current.ua_blocks) });
     const authEnabled = el("input", { class: "form-check-input", type: "checkbox", checked: current.basic_auth?.enabled });
     // The server sends `username: null` when basic auth was never configured,
     // and an empty input reads as "". Comparing those two directly marks the

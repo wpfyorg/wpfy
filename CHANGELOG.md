@@ -4,7 +4,7 @@ All notable changes to wpfy will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project aims to follow [Semantic Versioning](https://semver.org/) once it leaves beta.
 
-## [Unreleased]
+## [1.0.0-rc5] - Unreleased
 
 ### Added
 
@@ -13,7 +13,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   Access, Automation) with the old paths redirecting for one release; the
   site-creation wizard is rebuilt on the real API; and all ten admin pages ship
   — events, job detail, users, services, firewall, remote backup, settings,
-  instance, mail, and the basic-auth inventory. Running operations move into a
+  instance, SMTP, and the basic-auth inventory. Running operations move into a
   header popover that stays visible across navigation.
 
 - Add host port management over `ufw`: read the rule set, add and remove
@@ -41,6 +41,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
+- Rename the panel's **Mail** page and nav entry to **SMTP**. The page
+  configures an outbound SMTP transport and sends a test message; nothing in
+  wpfy sends mail when an event or failure occurs, so a name suggesting
+  alerting described software that does not exist. The route (`/admin/mail`),
+  the API paths, and the stored settings keys are unchanged — this is a copy
+  change, not a migration.
+
 - `wpfy site create --pass`, grouped `wpfy site update --password`, and
   `wpfy sftp --password` accept passwords only from stdin (`-`) or a TTY
   prompt (`prompt` or an omitted value), never process argv. SFTP still
@@ -49,6 +56,34 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- Close every WCAG AA contrast failure in the panel, both themes, measured live
+  across 17 routes (`docs/audit/panel-design-audit-2026-08-21.md`). The dark
+  theme remapped `--tblr-primary` without relighting `--tblr-primary-fg`, so
+  every filled primary button rendered its label at 2.43:1; the keyboard focus
+  ring was a 25%-alpha glow compositing to 1.57:1 against the 3:1 that WCAG
+  1.4.11 requires; `.btn-outline-danger` sat at 3.15:1 on exactly the controls
+  that stop containers and rotate credentials; and `.btn-link` — which the site
+  file browser uses for every filename — bypassed `--tblr-link-color` entirely
+  at 3.55:1. Inactive site tabs, the header health and jobs chips, and the
+  light-theme filled danger button are relit to match.
+- Give the panel a skip link and a real navigation landmark: the sidebar was an
+  `<aside>` (complementary), leaving screen-reader users with no navigation to
+  jump to, and eleven nav links plus the header preceded `<main>` in the tab
+  order on every route.
+- Drop `role="tablist"`/`role="presentation"` from the site tab strip. Those are
+  navigation links carrying `aria-current="page"`; a tablist whose children have
+  no `role="tab"` promised a widget that did not exist.
+- Make visible `.form-label` text focus its control. The field builders pair a
+  visual label with an `aria-label`ed control rather than a `for`/`id` pair, so
+  clicking a label did nothing; one delegated handler covers every field.
+- Align three accessible names with their visible labels (WCAG 2.5.3), so voice
+  control reaches the flavor, denied-IP, and blocked-user-agent fields.
+- Stop the site tab strip wrapping to two rows at 375px, and reserve room under
+  the sticky form action bar so it no longer permanently occludes the last card.
+- Honour `prefers-reduced-motion` for the three `scrollIntoView` calls — an
+  explicit `behavior` argument overrides the CSS the reduced-motion block sets.
+- Shorten the sidebar `.nav-link` colour transition from 300ms to 150ms and give
+  buttons press feedback, dropped under reduced motion.
 - Validate edge-bound panel addresses against the discovered `wpfy-panel-edge`
   CIDRs, rejecting network, IPv4 broadcast, and off-network addresses without
   restricting the public-address bind used by domainless self-signed TLS.
@@ -173,6 +208,18 @@ directly rather than running the command an operator types.
 
 ### Security
 
+- Add a per-client-IP token-bucket rate limiter to the panel's own request
+  handler, checked once per request across `do_GET`/`do_POST`/`do_PUT`/
+  `do_DELETE`/`do_PATCH`. `wpfy panel expose --no-domain` binds the panel
+  directly and never passes through Traefik, so it inherited none of the
+  `rateLimit` middleware the domain-fronted router gets; only the
+  credential-guessing throttle in `panel_auth` applied. The limiter lives in
+  the handler rather than behind a domainless branch, so it covers every
+  exposure mode — Traefik-fronted, direct-bind, and loopback — and is keyed on
+  the same resolved client address as login throttling, which walks the
+  forwarded chain right-to-left and so cannot be pinned onto another caller.
+  Refused requests get `429` with `Retry-After`. Amends ADR 0033.
+
 - Traefik no longer mounts the Docker socket. A digest-pinned
   `wollomatic/socket-proxy` holds it on the new `internal: true`
   `wpfy-docker-socket` network, publishes no host port, and allows only
@@ -215,6 +262,22 @@ directly rather than running the command an operator types.
 - Ban DOM-to-code and DOM-to-HTML sinks in the first-party panel client, with
   `tests/test_panel_frontend_security.py` enforcing it; vendored `tabler.min.js`
   and `qrcode.min.js` are the two explicit exclusions.
+
+- Close a panel login-throttle oracle, fail closed on CSRF token validation, and
+  enforce a strict `Origin` check on state-changing panel requests. Verified
+  live against a running panel on rc5.
+
+- Return a generic `Server` header and add HSTS across panel responses; bind
+  `RUN_TOKEN` to loopback only; mark the `wpfy_fm` file-manager cookie
+  `Secure`. Verified live against a running panel on rc5.
+
+- Reject TOTP replay and require reauthentication to disable TOTP; close an
+  authorization/IDOR gap that let a caller reach data outside its assigned
+  scope; close a host port exposure gap. Verified live against a running panel
+  on rc5.
+
+- Fix a tar-slip path on backup restore and site-level `X-Forwarded-For`
+  spoofing into fail2ban banning. Both closed and now gated by tests.
 
 ## [1.0.0-rc4] - 2026-08-02
 

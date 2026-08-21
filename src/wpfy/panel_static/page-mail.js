@@ -1,10 +1,10 @@
-/* Mail: the SMTP transport this host sends through.
+/* SMTP: the mail transport this host sends through.
  *
- * Deliberately named Mail rather than Notifications. Nothing in wpfy sends mail
- * on its own today -- `smtp.send_test_message` has exactly one caller, the
- * explicit test below -- so a page promising alerts would be describing software
- * that does not exist. It says what it is, and what it will be used for once
- * there is something to send.
+ * Deliberately named SMTP rather than Mail or Notifications. Nothing in wpfy
+ * sends mail on its own today -- `smtp.send_test_message` has exactly one
+ * caller, the explicit test below -- so a page promising alerts would be
+ * describing software that does not exist. It says what it is, and what it
+ * will be used for once there is something to send.
  *
  * The password is write-only. A blank field on a configured transport keeps the
  * stored one; only a typed value replaces it.
@@ -35,9 +35,9 @@ function field(label, control, hint = "") {
 
 registerPage("notifications", async (ctx) => {
   ctx.header({ icon: "mail",
-    title: "Mail",
+    title: "SMTP",
     subtitle: "The SMTP transport for this host",
-    breadcrumb: [["/dashboard", "Dashboard"], [null, "Mail"]],
+    breadcrumb: [["/dashboard", "Dashboard"], [null, "SMTP"]],
   });
 
   const configMount = el("div", {});
@@ -50,8 +50,8 @@ registerPage("notifications", async (ctx) => {
       render(payload);
     } catch (error) {
       if (ctx.signal.aborted) return;
-      configMount.replaceChildren(card("Mail", "",
-        el("div", { class: "alert alert-danger mb-0", role: "alert", text: `Unable to read the mail configuration: ${error.message}` })));
+      configMount.replaceChildren(card("SMTP", "",
+        el("div", { class: "alert alert-danger mb-0", role: "alert", text: `Unable to read the SMTP configuration: ${error.message}` })));
     }
   }
 
@@ -103,7 +103,7 @@ registerPage("notifications", async (ctx) => {
         await withBusy(save, async () => {
           await api("/api/notifications/smtp", { method: "PUT", body, signal: ctx.signal });
           if (ctx.signal.aborted) return;
-          toast("Mail transport saved.");
+          toast("SMTP transport saved.");
           password.value = "";
           await refresh();
         });
@@ -142,7 +142,7 @@ registerPage("notifications", async (ctx) => {
     const clear = el("button", { class: "btn btn-outline-danger", type: "button", icon: "trash", text: "Remove transport" });
     clear.addEventListener("click", async () => {
       const typed = await confirmAction({
-        title: "Remove the mail transport?",
+        title: "Remove the SMTP transport?",
         message: "The stored host, credentials and sender are deleted. Anything configured to send through them stops.",
         confirmLabel: "Remove it",
         keyword: "remove",
@@ -152,7 +152,7 @@ registerPage("notifications", async (ctx) => {
         await withBusy(clear, async () => {
           await api("/api/notifications/smtp", { method: "DELETE", body: {}, signal: ctx.signal });
           if (ctx.signal.aborted) return;
-          toast("Mail transport removed.");
+          toast("SMTP transport removed.");
           await refresh();
         });
       } catch (error) {

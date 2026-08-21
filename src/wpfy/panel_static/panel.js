@@ -86,6 +86,20 @@ export function emptyRow(columns, glyph, text) {
     el("span", { text })));
 }
 
+/**
+ * `scrollIntoView` with the motion preference honoured.
+ *
+ * Tabler's `prefers-reduced-motion` block sets `scroll-behavior` in CSS, but an
+ * explicit `behavior` argument beats it -- so a bare
+ * `scrollIntoView({ behavior: "smooth" })` keeps animating for an operator who
+ * asked their OS for no motion. The query is read per call, not once at module
+ * load, because the setting can change while the panel is open.
+ */
+export function scrollIntoViewSafe(element, options = {}) {
+  const reduce = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  element?.scrollIntoView({ ...options, behavior: reduce ? "auto" : "smooth" });
+}
+
 const show = (node, visible) => node?.classList.toggle("d-none", !visible);
 const tabler = () => window.tabler;
 
@@ -161,6 +175,17 @@ function showSetup() {
   show($("gate"), false);
   show($("app"), false);
   show($("setup"), true);
+  /* A domainless panel prints no run token -- the one-time setup link is the
+     only credential the operator was given. Telling them to find a run token
+     sends them hunting for something that was never printed. */
+  const intro = $("setup-intro");
+  if (intro) {
+    intro.replaceChildren(
+      document.createTextNode(`This is the only browser setup window. Use the ${setupSecret ? "one-time setup link" : "run token"} printed by `),
+      el("code", { text: setupSecret ? "wpfy panel expose --no-domain" : "wpfy panel" }),
+      document.createTextNode("; once the account exists, setup closes permanently."),
+    );
+  }
   $("setup-first-name")?.focus();
 }
 
@@ -470,7 +495,7 @@ export function renderOneTime(title, oneTime) {
   oneTimeCopyText = entries.map(([key, value]) => `${key.replaceAll("_", " ")}: ${value}`).join("\n");
   $("one-time-copy-status").textContent = "";
   show(panel, true);
-  panel.scrollIntoView({ behavior: "smooth", block: "nearest" });
+  scrollIntoViewSafe(panel, { block: "nearest" });
 }
 
 export function dismissOneTime() {
@@ -630,10 +655,11 @@ const NAV_LINKS = [
   { href: "/admin/services", label: "Services", icon: "server-2", admin: true },
   { href: "/admin/backup", label: "Remote backup", icon: "cloud-upload", admin: true },
   { href: "/admin/firewall", label: "Firewall", icon: "shield-lock", admin: true },
-  // "Mail", not "Notifications": the page configures an SMTP transport. Nothing
-  // in wpfy sends mail on its own yet, and a nav entry promising alerts that do
-  // not exist is the same lie the old wizard's fake steps told.
-  { href: "/admin/mail", label: "Mail", icon: "bell", admin: true },
+  // "SMTP", not "Mail" or "Notifications": the page configures an SMTP transport
+  // and nothing else. Nothing in wpfy sends mail on its own yet, and a nav entry
+  // promising alerts that do not exist is the same lie the old wizard's fake
+  // steps told.
+  { href: "/admin/mail", label: "SMTP", icon: "mail", admin: true },
   { href: "/admin/basic-auth", label: "Basic auth", icon: "key", admin: true },
   { href: "/admin/settings", label: "Settings", icon: "settings", admin: true },
   { href: "/admin/instance", label: "Instance", icon: "info-circle", admin: true },
@@ -1009,6 +1035,22 @@ function wireRouter() {
 
   window.addEventListener("popstate", () => {
     handleRoute(location.pathname).catch((error) => toast(error.message || "Unable to navigate.", true));
+  });
+
+  // The field builders pair a visual `.form-label` with a control that carries
+  // its own `aria-label`, rather than a `for`/`id` pair. Names reach assistive
+  // tech correctly that way, but the browser's native "click the label, focus
+  // the field" behaviour needs the association, so without this the label text
+  // is dead to the pointer. One delegated handler covers every field in the
+  // panel -- roughly fifty call sites across fifteen modules -- and every field
+  // added later, at no cost to the builders.
+  document.addEventListener("click", (event) => {
+    const label = event.target.closest(".form-label");
+    if (!label || label.hasAttribute("for")) return;
+    const control = label.parentElement?.querySelector("input, select, textarea");
+    if (!control || control.disabled) return;
+    control.focus();
+    if (control.type === "checkbox" || control.type === "radio") control.click();
   });
 }
 

@@ -3629,7 +3629,11 @@ def handle_stack_acme_email(args: argparse.Namespace) -> CommandResult:
             return CommandResult(str(exc), exit_code=2)
     resolution = stack.traefik.resolve_acme_email()
     pending = stack.traefik.static_config_needs_apply()
-    action = "Traefik restart required" if pending else "Traefik already has desired config"
+    action = (
+        "Traefik restart required: run 'wpfy stack install --nginx'"
+        if pending
+        else "Traefik already has desired config"
+    )
     return CommandResult(
         _render_summary(
             "stack acme-email",

@@ -1,4 +1,4 @@
-import { registerPage, el, api, confirmAction, withBusy, toast, onPanelEvent, session, emptyRow } from "./panel.js";
+import { registerPage, el, api, confirmAction, withBusy, toast, onPanelEvent, session, emptyRow, scrollIntoViewSafe } from "./panel.js";
 
 function badge(value, good = true) {
   return el("span", { class: `badge ${good ? "bg-green-lt text-green" : "bg-yellow-lt text-yellow"}`, text: value });
@@ -132,7 +132,7 @@ registerPage("users", async (ctx) => {
     const edit = el("button", { class: "btn btn-sm btn-outline-primary", type: "button", text: "Edit" });
     const resetTotp = user.totp_enabled ? el("button", { class: "btn btn-sm btn-outline-warning", type: "button", text: "Reset 2FA" }) : null;
     const remove = user.username === session.principal?.username ? null : el("button", { class: "btn btn-sm btn-outline-danger", type: "button", icon: "trash", text: "Delete" });
-    edit.addEventListener("click", () => { error.replaceChildren(); editor.replaceChildren(userEditor(user)); editor.scrollIntoView({ behavior: "smooth", block: "nearest" }); });
+    edit.addEventListener("click", () => { error.replaceChildren(); editor.replaceChildren(userEditor(user)); scrollIntoViewSafe(editor, { block: "nearest" }); });
     resetTotp?.addEventListener("click", async () => {
       const confirmed = await confirmAction({
         title: `Reset 2FA for ${user.username}?`, message: "This disables their current second factor. They must enrol again at next login.", confirmLabel: "Reset 2FA",
@@ -201,7 +201,7 @@ registerPage("users", async (ctx) => {
     }
   }
 
-  add.addEventListener("click", () => { error.replaceChildren(); editor.replaceChildren(userEditor()); editor.scrollIntoView({ behavior: "smooth", block: "nearest" }); });
+  add.addEventListener("click", () => { error.replaceChildren(); editor.replaceChildren(userEditor()); scrollIntoViewSafe(editor, { block: "nearest" }); });
   await refresh();
   if (ctx.signal.aborted) return;
   ctx.onLeave(onPanelEvent((event) => { if (!ctx.signal.aborted && String(event.action || "").startsWith("user.")) refresh(); }));

@@ -93,6 +93,41 @@ _LOGGER = logging.getLogger(__name__)
 _MAX_BODY_BYTES = 64 * 1024
 _FM_PROXY_MAX_BODY = files.MAX_UPLOAD_BYTES  # ponytail: reuse existing upload ceiling
 _MAX_LOG_LINES = 2000
+# General request-rate guard, checked once per request in every do_* method --
+# the one place all three exposure modes (Traefik, `--no-domain` direct bind,
+# loopback) converge. Behind Traefik this is a harmless second layer under its
+# `rateLimit` middleware (panel_exposure.RATE_LIMIT_AVERAGE/BURST = 10/20);
+# domainless it is the *only* layer, so it must not 429 an operator's own cold
+# boot.
+#
+# Measured cold boot (index.html, landing on /dashboard, admin session):
+#   static: index.html, tabler.min.css, panel.css, tabler.min.js,
+#           qrcode.min.js, panel.js, page-dashboard.js (lazy-loaded page
+#           modules are fetched on first navigation, not at boot)   = 7
+#   api:    setup/status, auth/me, stream (SSE open), overview (chip),
+#           system/services (chip), jobs (chip), events, overview (page),
+#           sites (page)                                            = 9
+#   total ~= 16 requests
+#
+# Burst is set with headroom above that measured cold boot, not above an
+# artificial access pattern: the panel runs on ThreadingHTTPServer, which
+# spawns a thread per request, so the burst size *is* the thread-spike an
+# attacker gets. A caller that walks the whole declared API surface in one
+# pass -- a health-check script, or (concretely) this project's own security
+# gate tests in tests/gates/, which enumerate every one of the panel's 101
+# routes -- is not the access pattern this default protects against; those
+# callers pass a larger `PanelConfig.rate_limit_burst` for their own server
+# instead of loosening the production default. These two constants are also
+# where `PanelConfig.rate_limit_burst` / `rate_limit_refill_per_second` get
+# their defaults, so the cold-boot derivation above stays the one place that
+# math lives.
+_RATE_LIMIT_BURST = 40
+_RATE_LIMIT_REFILL_PER_SECOND = 10.0
+# Buckets idle at least this long have fully refilled several times over --
+# safe to drop. Pruning only runs once the table has grown past
+# _RATE_LIMIT_PRUNE_THRESHOLD, so normal traffic never pays for a dict scan.
+_RATE_LIMIT_BUCKET_TTL_SECONDS = 300.0
+_RATE_LIMIT_PRUNE_THRESHOLD = 256
 RUN_TOKEN_ADMIN = "run-token-admin"
 _ALLOWED_PANEL_FLAVORS = frozenset({"php", "html", *WORDPRESS_FLAVORS})
 _SITE_MANAGER_ALLOWED_ACTIONS = frozenset({
@@ -166,6 +201,55 @@ def resolve_client_address(peer: str, forwarded: object, trusted: tuple[str, ...
     return _UNKNOWN_CLIENT
 
 
+def _prune_rate_limit_buckets(buckets: dict[str, tuple[float, float]], now: float) -> None:
+    """Drop buckets idle long enough to have fully refilled. Caller holds the lock.
+
+    Bounds `buckets` so a flood of distinct source addresses cannot grow it
+    without bound -- that is the DoS this limiter exists to blunt in the
+    first place.
+    """
+    stale = [
+        ip for ip, (_tokens, last) in buckets.items()
+        if now - last > _RATE_LIMIT_BUCKET_TTL_SECONDS
+    ]
+    for ip in stale:
+        del buckets[ip]
+
+
+def _check_rate_limit(
+    buckets: dict[str, tuple[float, float]],
+    lock: threading.Lock,
+    burst: int,
+    refill_per_second: float,
+    client_ip: str,
+) -> float | None:
+    """Token-bucket admission check, one bucket per resolved client IP.
+
+    Pure of module state -- `buckets` and `lock` belong to one panel server
+    (see `make_panel_handler`), not the process, so two servers in one
+    process never share a bucket table. `burst`/`refill_per_second` come from
+    `PanelConfig` so a caller with a legitimate reason to sweep the whole
+    route table (this project's own gates tests) can raise its own server's
+    ceiling instead of the production default.
+
+    Returns ``None`` when the request is admitted, or the number of seconds
+    the caller should wait (for a ``Retry-After`` header) when refused.
+    """
+    now = time.monotonic()
+    with lock:
+        tokens, last = buckets.get(client_ip, (float(burst), now))
+        tokens = min(burst, tokens + (now - last) * refill_per_second)
+        if tokens < 1.0:
+            buckets[client_ip] = (tokens, now)
+            retry_after = (1.0 - tokens) / refill_per_second
+        else:
+            buckets[client_ip] = (tokens - 1.0, now)
+            retry_after = None
+        if len(buckets) > _RATE_LIMIT_PRUNE_THRESHOLD:
+            _prune_rate_limit_buckets(buckets, now)
+        return retry_after
+
+
 def trusted_edge_networks() -> tuple[str, ...]:
     """CIDRs whose peers may assert a forwarded client address.
 
@@ -229,6 +313,13 @@ class PanelConfig:
     #: for a bare address and plaintext would put the first-run password, the
     #: TOTP secret and every session token on the wire in the clear.
     self_signed_tls: bool = False
+    #: Per-client-IP request-rate limiter. Defaults are the production values
+    #: derived above `_RATE_LIMIT_BURST` -- override only for a server with a
+    #: legitimate reason to receive more traffic from one IP than an operator's
+    #: browser ever would (this project's own gates tests, which sweep the
+    #: whole route table).
+    rate_limit_burst: int = _RATE_LIMIT_BURST
+    rate_limit_refill_per_second: float = _RATE_LIMIT_REFILL_PER_SECOND
 
 
 @dataclass(frozen=True, slots=True)
@@ -3007,6 +3098,13 @@ _ROUTES = (
 
 
 def make_panel_handler(config: PanelConfig) -> type[BaseHTTPRequestHandler]:
+    # Owned by this server, not the module: two panels in one process (as in
+    # tests, which call `make_panel_server` per test) get independent budgets
+    # instead of fighting over one process-lifetime dict. A fresh server
+    # naturally starts with an empty table -- no explicit reset needed.
+    rate_limit_buckets: dict[str, tuple[float, float]] = {}
+    rate_limit_lock = threading.Lock()
+
     class PanelHandler(BaseHTTPRequestHandler):
         server_version = "wpfy-panel"
         sys_version = ""
@@ -3308,6 +3406,32 @@ def make_panel_handler(config: PanelConfig) -> type[BaseHTTPRequestHandler]:
             else:
                 self._send_json(status, payload, response_headers)
 
+        def _enforce_rate_limit(self) -> bool:
+            """Return True if admitted; sends a 429 (with Retry-After) and returns
+            False otherwise. Called once per request from every do_* method --
+            the one place all exposure modes (Traefik, `--no-domain` direct
+            bind, loopback) converge.
+
+            Keyed on the same resolved client address as login throttling
+            (`resolve_client_address`): behind a trusted edge that is the
+            caller identified by `X-Forwarded-For`, otherwise the raw peer --
+            never the shared proxy address, or every caller behind Traefik
+            would fight over one bucket.
+            """
+            client_ip = resolve_client_address(
+                self.client_address[0], self.headers.get("X-Forwarded-For"), cached_trusted_edge_networks(),
+            )
+            retry_after = _check_rate_limit(
+                rate_limit_buckets, rate_limit_lock,
+                config.rate_limit_burst, config.rate_limit_refill_per_second,
+                client_ip,
+            )
+            if retry_after is None:
+                return True
+            retry_seconds = max(1, int(-(-retry_after // 1)))  # ceil without importing math
+            self._send_json(429, {"error": "too many requests"}, {"Retry-After": str(retry_seconds)})
+            return False
+
         def do_GET(self) -> None:
             try:
                 _assert_configured_panel_host(
@@ -3317,6 +3441,7 @@ def make_panel_handler(config: PanelConfig) -> type[BaseHTTPRequestHandler]:
             except PanelError as exc:
                 self._send_json(exc.status, {"error": str(exc)}, exc.headers)
                 return
+            if not self._enforce_rate_limit(): return
             if urlparse(self.path).path.startswith("/api/"): self._handle_api("GET")
             else: self._serve_static(urlparse(self.path).path)
 
@@ -3329,6 +3454,7 @@ def make_panel_handler(config: PanelConfig) -> type[BaseHTTPRequestHandler]:
             except PanelError as exc:
                 self._send_json(exc.status, {"error": str(exc)}, exc.headers)
                 return
+            if not self._enforce_rate_limit(): return
             if urlparse(self.path).path.startswith("/api/"): self._handle_api("POST")
             else: self._send_json(404, {"error": "not found"})
 
@@ -3341,6 +3467,7 @@ def make_panel_handler(config: PanelConfig) -> type[BaseHTTPRequestHandler]:
             except PanelError as exc:
                 self._send_json(exc.status, {"error": str(exc)}, exc.headers)
                 return
+            if not self._enforce_rate_limit(): return
             if urlparse(self.path).path.startswith("/api/"): self._handle_api("PUT")
             else: self._send_json(404, {"error": "not found"})
 
@@ -3353,6 +3480,7 @@ def make_panel_handler(config: PanelConfig) -> type[BaseHTTPRequestHandler]:
             except PanelError as exc:
                 self._send_json(exc.status, {"error": str(exc)}, exc.headers)
                 return
+            if not self._enforce_rate_limit(): return
             if urlparse(self.path).path.startswith("/api/"): self._handle_api("DELETE")
             else: self._send_json(404, {"error": "not found"})
 
@@ -3365,6 +3493,7 @@ def make_panel_handler(config: PanelConfig) -> type[BaseHTTPRequestHandler]:
             except PanelError as exc:
                 self._send_json(exc.status, {"error": str(exc)}, exc.headers)
                 return
+            if not self._enforce_rate_limit(): return
             if urlparse(self.path).path.startswith("/api/"): self._handle_api("PATCH")
             else: self._send_json(404, {"error": "not found"})
 

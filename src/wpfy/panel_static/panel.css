@@ -1,10 +1,13 @@
 /* wpfy panel — the only stylesheet the panel authors.
  *
  * Tabler ships the component layer (see tabler.PROVENANCE.md). This file does
- * three things and nothing else:
+ * four things and nothing else:
  *   1. remaps Tabler's semantic custom properties onto the wpfy brand,
  *   2. keeps the theme tokens the canvas metric charts read at paint time,
- *   3. holds the handful of rules Tabler has no component for.
+ *   3. holds the handful of rules Tabler has no component for,
+ *   4. corrects contrast/motion defects in Tabler's own component defaults
+ *      (docs/audit/panel-design-audit-2026-08-21.md) that a brand remap alone
+ *      does not cover.
  *
  * The panel CSP is `default-src 'self'` and blocks inline `style=` attributes,
  * so anything positional belongs here as a class, never on the element.
@@ -42,6 +45,32 @@
   --chart-alert: #ff6b5a;
   --chart-grid: rgba(255, 255, 255, 0.12);
   --chart-text: #a0a0b0;
+
+  /* [P1-1] #60a5fa is a good dark accent (5.77:1 as link text on the page
+     background) but Tabler's own --tblr-primary-fg stays near-white, so every
+     filled .btn-primary read 2.43:1. Dark ink on the light accent measures
+     6.99:1. WCAG 1.4.3 needs 4.5:1. */
+  --tblr-primary-fg: #111827;
+
+  /* [P1-3] .btn-outline-danger measured 3.15:1 (rgb(214,57,57) on the
+     rgb(31,41,55) card) — below the 4.5:1 WCAG 1.4.3 floor. Lightening
+     --tblr-danger clears both the label and the border (both read this same
+     token): 5.31:1 on the card, 6.41:1 on the page. The filled/hover states
+     of .btn-danger and .btn-outline-danger swap to this same fill, so
+     --tblr-danger-fg moves to dark ink too (6.41:1) — the near-white default
+     would drop to ~2.65:1 against the lighter fill. */
+  --tblr-danger: #f87171;
+  --tblr-danger-rgb: 248, 113, 113;
+  --tblr-danger-fg: #111827;
+}
+
+/* Light-mode .btn-danger ("Delete site", "Run against live site") measures
+   4.46:1 against its near-white label — a hair under the 4.5:1 floor, on the
+   two most destructive controls in the panel. Darkening the fill one step
+   clears it at 5.22:1. Dark mode is handled by the block above. */
+:root[data-bs-theme="light"] {
+  --tblr-danger: #c92a2a;
+  --tblr-danger-rgb: 201, 42, 42;
 }
 
 .navbar-brand {
@@ -113,4 +142,137 @@
   margin-right: .5rem;
   vertical-align: -.2rem;
   color: var(--tblr-secondary);
+}
+
+/* ---------------------------------------------------------------------
+ * Accessibility + motion corrections (docs/audit/panel-design-audit-2026-08-21.md)
+ * The dark primary/danger token fixes for buttons live in the
+ * :root[data-bs-theme="dark"] block above, next to the tokens they patch.
+ * Everything below needs its own selector rather than a token swap.
+ * --------------------------------------------------------------------- */
+
+/* [P1-2] Tabler's shared focus ring — .nav-link, .form-control, .form-select,
+   .form-check-input all box-shadow the same rgba(var(--tblr-primary-rgb),.25)
+   0 0 0 4px. At 25% alpha that composites to 1.57:1 on the rgb(31,41,55) card
+   in dark mode — below the 3:1 WCAG 1.4.11 floor (full opacity is 5.77:1).
+   These elements sit on the page/card surface, so a plain alpha bump is
+   enough — bumping to 1 is strictly higher contrast than .25 in both themes,
+   so light mode (already passing) cannot regress. */
+.nav-link:focus-visible,
+.form-control:focus,
+.form-select:focus,
+.form-check-input:focus {
+  box-shadow: 0 0 0 .25rem rgba(var(--tblr-primary-rgb), 1);
+}
+
+/* .btn:focus-visible cannot use the same trick: its ring sits on the
+   button's own fill, not the page/card, so a primary-blue ring on a filled
+   primary button in dark mode would be the same colour as the button
+   (1:1 — invisible) regardless of alpha. outline-offset moves the ring
+   outside the button, onto the surrounding page/card, where full-opacity
+   primary blue is the same 5.77:1+ as above — for every button variant,
+   filled or outline, in both themes. */
+:root {
+  --tblr-btn-focus-box-shadow: none;
+}
+
+.btn:focus-visible {
+  outline: 3px solid rgba(var(--tblr-primary-rgb), 1);
+  outline-offset: 2px;
+}
+
+/* [P1-4] Inactive .nav-tabs .nav-link inherits --tblr-gray-500 (#6b7280),
+   which measures 3.67:1 on the rgb(17,24,39) dark page — below 4.5:1. Light
+   mode already clears it (4.83:1) so only dark needs a rule. #9ca3af is
+   6.99:1 on the dark page and stays a clearly muted step below the active
+   tab's near-white --tblr-body-color, so the active/inactive distinction
+   the audit asked to preserve is untouched. */
+:root[data-bs-theme="dark"] .nav-tabs .nav-link:not(.active) {
+  color: #9ca3af;
+}
+
+/* [P1-5] Header status chips. Both foregrounds sit on a 10%-alpha tint of
+   their own --tblr-status-color-rgb; overriding `color` alone (not the
+   custom property) keeps that tint background exactly as-is per the audit's
+   instruction and only relights the text.
+     .status-secondary ("N jobs"): 2.74:1 dark / 4.27:1 light — both fail.
+     .status-green ("Healthy"): 2.49:1 light; dark already clears 4.5:1 at
+       the default #2fb344, so dark gets no override. */
+.status-secondary {
+  color: #4b5563;
+}
+:root[data-bs-theme="dark"] .status-secondary {
+  color: #9ca3af;
+}
+.status-green {
+  color: #166534;
+}
+:root[data-bs-theme="dark"] .status-green {
+  color: #2fb344;
+}
+
+/* [P2-3] .nav-tabs (the five site tabs) is a plain flex row and wraps at
+   375px — 75px tall, orphaning "Automation" onto a second line. Same idiom
+   as .scroll-x above: stop wrapping, scroll horizontally instead. */
+.nav-tabs {
+  flex-wrap: nowrap;
+  overflow-x: auto;
+}
+
+/* [P2-4] .card.sticky-bottom (the dirty-form action bar) is
+   `position: sticky; bottom: 0` and permanently covers whatever scrolls
+   beneath it — at 375px it sits over the last card's heading on the site
+   settings page. Bottom padding on the scroll container reserves room for
+   the bar so the last card can clear it. */
+#page {
+  padding-bottom: 6rem;
+}
+
+/* [M1] .nav-link inherits `transition: color .3s, background-color .3s` from
+   Tabler. The sidebar is the highest-frequency surface in the panel; a
+   colour-change budget is 150ms, and 300ms means a theme flip tweens all 11
+   nav items for a third of a second. */
+.nav-link {
+  transition: color .15s ease, background-color .15s ease;
+}
+
+/* [M2] No button anywhere gives press feedback. A subtle scale confirms the
+   click landed — every mutation in this panel is consequential enough to
+   deserve it. Position/scale change is dropped under reduced motion; the
+   existing colour feedback (hover/active background from Tabler) still
+   applies without it.
+
+   The colour properties are restated here because `transition` is a
+   shorthand: declaring transform alone would drop Tabler's own
+   `color, background-color, border-color, box-shadow .15s` and make every
+   button snap on hover instead of easing. */
+.btn {
+  transition: color .15s ease-in-out, background-color .15s ease-in-out,
+              border-color .15s ease-in-out, box-shadow .15s ease-in-out,
+              transform 160ms ease-out;
+}
+.btn:active {
+  transform: scale(.97);
+}
+
+/* Tabler hardcodes .btn-link to a literal rgb(7,124,234) instead of reading
+   --tblr-link-color, so the dark-mode link remap above never reaches it:
+   3.55:1 dark, 4.13:1 light, both under 4.5:1. This is not one stray control
+   — the site file browser renders every filename as a .btn-link, so a whole
+   directory listing sits below the floor. Pointing it back at the token that
+   was always meant to own it gives 5.77:1 dark and 5.39:1 light. */
+.btn-link {
+  color: var(--tblr-link-color);
+}
+.btn-link:hover,
+.btn-link:focus-visible {
+  color: var(--tblr-link-hover-color);
+}
+@media (prefers-reduced-motion: reduce) {
+  .btn {
+    transition: none;
+  }
+  .btn:active {
+    transform: none;
+  }
 }
