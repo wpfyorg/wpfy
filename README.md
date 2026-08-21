@@ -67,11 +67,11 @@ curl -fsSLO https://raw.githubusercontent.com/wpfyorg/wpfy/v1.0.0-rc5/install.sh
 less install.sh
 
 sudo WPFY_REF=v1.0.0-rc5 \
-  WPFY_SOURCE_SHA256=<paste the SHA-256 from the v1.0.0-rc5 release page once it is published> \
+  WPFY_SOURCE_SHA256=<paste the SHA-256 from the v1.0.0-rc5 release page> \
   bash install.sh
 ```
 
-Take the checksum from the [v1.0.0-rc5 release](https://github.com/wpfyorg/wpfy/releases/tag/v1.0.0-rc5) once the owner has tagged and published it — it is the official source-archive SHA-256 for that tag, and pasting one from an earlier release will correctly abort the install. The installer logs to `/var/log/wpfy/install.log`; `--dry-run`, `--verbose`, and `--no-color` are available when needed.
+Take the checksum from the [v1.0.0-rc5 release](https://github.com/wpfyorg/wpfy/releases/tag/v1.0.0-rc5) — it is the official source-archive SHA-256 for that tag, and pasting one from an earlier release will correctly abort the install. The installer logs to `/var/log/wpfy/install.log`; `--dry-run`, `--verbose`, and `--no-color` are available when needed.
 
 ### Create, secure, and verify a site
 

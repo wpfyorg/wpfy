@@ -4,7 +4,7 @@ All notable changes to wpfy will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project aims to follow [Semantic Versioning](https://semver.org/) once it leaves beta.
 
-## [1.0.0-rc5] - Unreleased
+## [1.0.0-rc5] - 2026-08-21
 
 ### Added
 
