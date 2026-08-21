@@ -4,6 +4,44 @@ All notable changes to wpfy will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project aims to follow [Semantic Versioning](https://semver.org/) once it leaves beta.
 
+## [1.0.0-rc6] - 2026-08-21
+
+Fixes an outage in rc5: the Traefik Docker-socket proxy never started on a
+standard Docker host, so no site was routable through the edge on a clean
+install. Anyone running rc5 should upgrade.
+
+### Fixed
+
+- Make the Traefik Docker-socket proxy actually work. Three defects, each
+  fatal on its own, meant the proxy never started on a standard Docker host,
+  so Traefik never obtained a Docker provider and **no site was routable
+  through the edge** on a clean install:
+  - The container runs as an unprivileged image user, but the generated
+    compose emitted no `group_add`, so it could not open `/var/run/docker.sock`
+    (mode 660, `root:docker`) and exited with `permission denied`. The host's
+    `docker` group GID is now resolved at render time and added; if no such
+    group exists, rendering fails loudly with the reason instead of writing a
+    compose file that cannot work.
+  - The image defaults to listening on `127.0.0.1:2375`. `SP_LISTENIP=0.0.0.0`
+    is now set — safe because the service publishes no host port and sits on an
+    `internal: true` network.
+  - The allowlist source filter was set as `SP_ALLOW_FROM`, but the pinned
+    image reads `SP_ALLOWFROM`. The value was therefore ignored and fell back
+    to the image default of `127.0.0.1/32`. The impact was availability, not
+    exposure — the fallback is more restrictive, not less.
+
+  Found by running the release on a clean Ubuntu 24.04 host. The offline suite
+  could not see any of it, and `tests/docker-runtime-hardening.sh` had only
+  ever reported SKIP on macOS. That script's synthetic compose also omitted the
+  `user:` directive real site compose always sets, producing a false failure;
+  it now mirrors what the product generates. On Linux the suite reports
+  `failures=0 skips=0`, including the POST-mutation refusal that is the actual
+  proof the allowlist enforces.
+
+- Surface the ufw SSH-deletion guard's refusal as `409` instead of a generic
+  `500`. The guard always worked and no mutation occurred, but the actionable
+  message naming the port was lost behind an internal-error response.
+
 ## [1.0.0-rc5] - 2026-08-21
 
 ### Added
@@ -55,36 +93,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   now refuses raw values; use `--token-file` or `WPFY_PANEL_TOKEN`.
 
 ### Fixed
-
-- Make the Traefik Docker-socket proxy actually work. Three defects, each
-  fatal on its own, meant the proxy never started on a standard Docker host,
-  so Traefik never obtained a Docker provider and **no site was routable
-  through the edge** on a clean install:
-  - The container runs as an unprivileged image user, but the generated
-    compose emitted no `group_add`, so it could not open `/var/run/docker.sock`
-    (mode 660, `root:docker`) and exited with `permission denied`. The host's
-    `docker` group GID is now resolved at render time and added; if no such
-    group exists, rendering fails loudly with the reason instead of writing a
-    compose file that cannot work.
-  - The image defaults to listening on `127.0.0.1:2375`. `SP_LISTENIP=0.0.0.0`
-    is now set — safe because the service publishes no host port and sits on an
-    `internal: true` network.
-  - The allowlist source filter was set as `SP_ALLOW_FROM`, but the pinned
-    image reads `SP_ALLOWFROM`. The value was therefore ignored and fell back
-    to the image default of `127.0.0.1/32`. The impact was availability, not
-    exposure — the fallback is more restrictive, not less.
-
-  Found by running the release on a clean Ubuntu 24.04 host. The offline suite
-  could not see any of it, and `tests/docker-runtime-hardening.sh` had only
-  ever reported SKIP on macOS. That script's synthetic compose also omitted the
-  `user:` directive real site compose always sets, producing a false failure;
-  it now mirrors what the product generates. On Linux the suite reports
-  `failures=0 skips=0`, including the POST-mutation refusal that is the actual
-  proof the allowlist enforces.
-
-- Surface the ufw SSH-deletion guard's refusal as `409` instead of a generic
-  `500`. The guard always worked and no mutation occurred, but the actionable
-  message naming the port was lost behind an internal-error response.
 
 - Close every WCAG AA contrast failure in the panel, both themes, measured live
   across 17 routes (`docs/audit/panel-design-audit-2026-08-21.md`). The dark

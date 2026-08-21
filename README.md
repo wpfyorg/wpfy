@@ -8,7 +8,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/wpfyorg/wpfy/releases/tag/v1.0.0-rc5"><img src="https://img.shields.io/github/v/release/wpfyorg/wpfy?include_prereleases&display_name=tag&sort=semver" alt="Current release: v1.0.0-rc5"></a>
+  <a href="https://github.com/wpfyorg/wpfy/releases/tag/v1.0.0-rc6"><img src="https://img.shields.io/github/v/release/wpfyorg/wpfy?include_prereleases&display_name=tag&sort=semver" alt="Current release: v1.0.0-rc6"></a>
   <a href="https://github.com/wpfyorg/wpfy/blob/main/pyproject.toml"><img src="https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white" alt="Python 3.10 or later"></a>
   <a href="https://github.com/wpfyorg/wpfy/blob/main/LICENSE"><img src="https://img.shields.io/github/license/wpfyorg/wpfy" alt="AGPL-3.0-only license"></a>
   <a href="https://docs.docker.com/compose/"><img src="https://img.shields.io/badge/Docker-Compose-2496ED?logo=docker&logoColor=white" alt="Uses Docker Compose"></a>
@@ -26,7 +26,7 @@
 ![wpfy control panel showing a sanitized local demonstration site](.github/assets/wpfy-panel-overview.jpg)
 
 > [!WARNING]
-> **`v1.0.0-rc5` is a release candidate, not a production-readiness claim.** It passed local tests and public CI, and the panel's authentication, authorization, and HTTP-hardening surface was verified live against a running server on rc5 (see the [changelog](CHANGELOG.md)). The Traefik Docker-socket-proxy allowlist (ADR 0034) is proven only as written configuration, not live-tested enforcement; fail2ban banning on a real host, ufw and IPv6 beyond one box, provider-S3, real systemd timers, destructive shared-stack mutations, and an external scanner run remain unvalidated. Start on a fresh or disposable VPS, read the [safety model](#safety-and-isolation), and [report problems](https://github.com/wpfyorg/wpfy/issues/new/choose). See the [release notes](https://github.com/wpfyorg/wpfy/releases/tag/v1.0.0-rc5) and [roadmap](ROADMAP.md) for open release work.
+> **`v1.0.0-rc6` is a release candidate, not a production-readiness claim.** It passed local tests and public CI; the panel's authentication, authorization, and HTTP-hardening surface was verified live against a running server, and on rc6 the Traefik Docker-socket-proxy allowlist (ADR 0034) was verified live on Linux — reachable reads, POST mutation refused — along with the install path and checksum gate, ufw against operator-authored rules, `DOCKER-USER` ban placement, and diagnostics redaction. Still unvalidated: IPv6 firewall paths, refusal of an external-origin connection by a ban, provider-S3, real systemd timers, destructive shared-stack mutations, and an external scanner run. Start on a fresh or disposable VPS, read the [safety model](#safety-and-isolation), and [report problems](https://github.com/wpfyorg/wpfy/issues/new/choose). See the [release notes](https://github.com/wpfyorg/wpfy/releases/tag/v1.0.0-rc6) and [roadmap](ROADMAP.md) for open release work.
 
 ## Why wpfy?
 
@@ -63,15 +63,15 @@ Built for developers and WordPress server administrators who operate their own U
 Review the installer, pin the immutable release tag, and let the installer verify the downloaded source archive with the checksum published for the release:
 
 ```bash
-curl -fsSLO https://raw.githubusercontent.com/wpfyorg/wpfy/v1.0.0-rc5/install.sh
+curl -fsSLO https://raw.githubusercontent.com/wpfyorg/wpfy/v1.0.0-rc6/install.sh
 less install.sh
 
-sudo WPFY_REF=v1.0.0-rc5 \
-  WPFY_SOURCE_SHA256=<paste the SHA-256 from the v1.0.0-rc5 release page> \
+sudo WPFY_REF=v1.0.0-rc6 \
+  WPFY_SOURCE_SHA256=<paste the SHA-256 from the v1.0.0-rc6 release page> \
   bash install.sh
 ```
 
-Take the checksum from the [v1.0.0-rc5 release](https://github.com/wpfyorg/wpfy/releases/tag/v1.0.0-rc5) — it is the official source-archive SHA-256 for that tag, and pasting one from an earlier release will correctly abort the install. The installer logs to `/var/log/wpfy/install.log`; `--dry-run`, `--verbose`, and `--no-color` are available when needed.
+Take the checksum from the [v1.0.0-rc6 release](https://github.com/wpfyorg/wpfy/releases/tag/v1.0.0-rc6) — it is the official source-archive SHA-256 for that tag, and pasting one from an earlier release will correctly abort the install. The installer logs to `/var/log/wpfy/install.log`; `--dry-run`, `--verbose`, and `--no-color` are available when needed.
 
 ### Create, secure, and verify a site
 
@@ -270,7 +270,7 @@ Important limits:
 
 - Docker-daemon access and Traefik’s Docker socket access are host-level trust boundaries. A Docker or host compromise defeats per-site isolation.
 - wpfy has **not** had an independent security audit or penetration test.
-- RC5’s release validation is incomplete; do not infer production readiness from local tests or CI alone.
+- RC6’s release validation is incomplete; do not infer production readiness from local tests or CI alone.
 - Hosting mutually untrusted tenants on a shared host is out of scope during beta.
 
 Read [SECURITY.md](SECURITY.md) before production use or security testing.
@@ -303,7 +303,7 @@ Remote deletion and pruning are explicit operations. wpfy manages its own object
 ## Known limitations
 
 - This is beta software. Interfaces and behavior may change before a final v1.0.0 release.
-- RC5’s panel authentication, authorization, and HTTP-hardening surface has been verified live against a running server, but the Traefik Docker-socket-proxy allowlist (ADR 0034) is proven only as written configuration — not live-tested enforcement — and fail2ban banning on a real host, ufw/IPv6 beyond one box, live diagnostics-redaction, provider-S3, real systemd timers, destructive shared-stack mutations, and an external scanner run remain unvalidated; see its [release notes](https://github.com/wpfyorg/wpfy/releases/tag/v1.0.0-rc5) for the remaining gates.
+- RC6’s panel auth/authz/HTTP-hardening surface, the Traefik Docker-socket-proxy allowlist (ADR 0034, including POST-mutation refusal), the install path and its checksum gate, ufw against operator-authored rules, `DOCKER-USER` ban placement, and diagnostics redaction have all been verified live on a clean Ubuntu 24.04 host. Still unvalidated: the IPv6 firewall paths (the validation host has no global IPv6), refusal of an external-origin connection by a ban (`DOCKER-USER` hooks `FORWARD`, which same-host traffic never traverses), provider-S3, real systemd timers, destructive shared-stack mutations, and an external scanner run; see the [release notes](https://github.com/wpfyorg/wpfy/releases/tag/v1.0.0-rc6) for the remaining gates.
 - `wpfy stack migrate` does not migrate host-installed WordPress stacks in v1.
 - The MySQLTuner helper is skipped until a vetted pinned image exists.
 - phpMyAdmin, Adminer, and Composer helpers are pull-only; they do not create a public dashboard.
@@ -313,7 +313,7 @@ See [ROADMAP.md](ROADMAP.md) for planned hardening and future work. Planned item
 
 ## Documentation and support
 
-- [Release notes](https://github.com/wpfyorg/wpfy/releases/tag/v1.0.0-rc5) for rc5 provenance, validation, and known deferred checks.
+- [Release notes](https://github.com/wpfyorg/wpfy/releases/tag/v1.0.0-rc6) for rc6 provenance, validation, and known deferred checks.
 - [Roadmap](ROADMAP.md) for beta hardening and v2 candidates.
 - [Security policy](SECURITY.md) for private vulnerability reporting and threat-model boundaries.
 - [Bug report](https://github.com/wpfyorg/wpfy/issues/new?template=bug_report.md) for reproducible problems. Redact domains, IPs, tokens, passwords, and `.env` contents.
