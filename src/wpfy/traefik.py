@@ -24,7 +24,17 @@ from .site_paths import read_env
 
 
 SOCKET_PROXY_ENVIRONMENT = (
-    "SP_ALLOW_FROM=traefik",
+    # The pinned wollomatic/socket-proxy:1.12.3 image reads SP_ALLOWFROM (no
+    # underscore) -- SP_ALLOW_FROM is silently ignored and the image falls
+    # back to its 127.0.0.1/32-only default, verified A/B on the pinned image.
+    "SP_ALLOWFROM=traefik",
+    # The image defaults to listenaddress=127.0.0.1:2375, which the "traefik"
+    # container can never reach. SP_LISTENIP=0.0.0.0 is safe here: this
+    # service publishes no host port and sits on the wpfy-docker-socket
+    # network, which is `internal: true` (see the networks block below) --
+    # 0.0.0.0 means "reachable by Traefik on that private network", not
+    # "reachable from the internet".
+    "SP_LISTENIP=0.0.0.0",
     "SP_ALLOW_GET=/version",
     "SP_ALLOW_GET_2=/v1\\..{1,2}/(version|containers/.*|events.*)",
     "SP_ALLOW_HEAD=/_ping",
@@ -477,9 +487,51 @@ def static_config_needs_apply() -> bool:
         return _static_config_needs_apply()
 
 
+def _resolve_docker_gid() -> int | None:
+    """Resolve the host's ``docker`` group GID, or None if it can't be found.
+
+    The socket-proxy container runs as an unprivileged image user; it can
+    only open /var/run/docker.sock (mode 660, root:docker) by joining that
+    group via compose's ``group_add``. ``WPFY_DOCKER_GID`` is a test-only
+    override (set for the whole suite in tests/conftest.py) so offline tests
+    never depend on the runner having a docker group -- macOS and
+    Docker-less CI images normally don't have one. An empty override value
+    deliberately simulates "no docker group found" for tests that exercise
+    that path. ``grp`` is POSIX-only and this module may be imported on
+    macOS during tests, so both the import and the lookup are guarded.
+    """
+    override = os.environ.get("WPFY_DOCKER_GID")
+    if override is not None:
+        override = override.strip()
+        if not override:
+            return None
+        try:
+            return int(override)
+        except ValueError as exc:
+            raise RuntimeError(f"WPFY_DOCKER_GID must be an integer GID, got {override!r}") from exc
+    try:
+        import grp
+    except ImportError:
+        return None
+    try:
+        return grp.getgrnam("docker").gr_gid
+    except KeyError:
+        return None
+
+
 def traefik_compose_content() -> str:
     config_mount = str(traefik_config_path())
     dynamic_mount = str(traefik_dir() / "dynamic")
+    docker_gid = _resolve_docker_gid()
+    if docker_gid is None and not runtime_skip_requested():
+        raise RuntimeError(
+            "cannot render Traefik compose: no 'docker' group found on this host. "
+            "The socket-proxy container needs that group's GID to read "
+            "/var/run/docker.sock -- install Docker Engine (which creates the "
+            "group) before starting Traefik, or set WPFY_DOCKER_GID to the "
+            "correct GID. Rendering a compose file without it would silently "
+            "reproduce the socket-proxy 'permission denied' outage."
+        )
     lines = [
         f"name: {TRAEFIK_PROJECT}",
         "services:",
@@ -488,6 +540,13 @@ def traefik_compose_content() -> str:
         f"    container_name: {SOCKET_PROXY_CONTAINER}",
         "    restart: unless-stopped",
         *compose_hardening_lines(128, "128m", "0.25"),
+    ]
+    if docker_gid is not None:
+        lines.extend([
+            "    group_add:",
+            f'      - "{docker_gid}"',
+        ])
+    lines.extend([
         "    environment:",
         *(f"      - {setting}" for setting in SOCKET_PROXY_ENVIRONMENT),
         "    volumes:",
@@ -506,7 +565,7 @@ def traefik_compose_content() -> str:
         '      - "443:443"',
         "    depends_on:",
         "      - socket-proxy",
-    ]
+    ])
     cf_config = cloudflare_config_path()
     if cf_config.exists():
         lines.extend([

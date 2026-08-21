@@ -727,6 +727,11 @@ def _operation_status(
     message = str(result.message).lower()
     if any(marker in message for marker in ("runtime unavailable", "runtime to be running", "docker unavailable")):
         return 503
+    # firewall_ports._guard() refuses to touch the SSH port so the caller's
+    # own connection can't be cut; that's a policy conflict, not a server
+    # fault, so the actionable message must survive as 409, not a generic 500.
+    if "it carries ssh on port" in message:
+        return 409
     if nginx_validation and result.exit_code != 3:
         return 422
     return 500
