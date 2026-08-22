@@ -4,6 +4,20 @@ All notable changes to wpfy will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project aims to follow [Semantic Versioning](https://semver.org/) once it leaves beta.
 
+## [Unreleased]
+
+### Added
+
+- `scripts/panel-demo.sh` — spins up a throwaway control panel for auditing the
+  UI without touching a real install. It seeds a sandbox (`./.panel-demo` by
+  default) with its own install root, config, state and log dirs, five demo
+  sites across flavors/PHP versions/cache modes, and two panel users (an admin
+  and a site-manager scoped to one site), then serves `wpfy panel` against it.
+  `WPFY_SKIP_RUNTIME=1` is set throughout, so no root and no Docker daemon are
+  required and runtime/health panels report unavailable by design. Seeding still
+  attempts the WordPress core download; without network access it fails and the
+  sites stay at `needs-bootstrap`, which is the expected demo state.
+
 ## [1.0.0-rc6] - 2026-08-21
 
 Fixes an outage in rc5: the Traefik Docker-socket proxy never started on a

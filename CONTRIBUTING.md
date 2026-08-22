@@ -35,6 +35,43 @@ pushes, pull requests, and manual dispatch for Python 3.10 and 3.12. Add tests
 for any behavior change; the existing files in `tests/` show established mocking
 patterns for Docker and network interactions.
 
+## Auditing the panel locally
+
+`scripts/panel-demo.sh` serves the control panel against a throwaway sandbox so
+the UI can be reviewed without a provisioned server:
+
+```bash
+scripts/panel-demo.sh              # seed (if needed) and serve on 127.0.0.1:8642
+scripts/panel-demo.sh --reset      # wipe the sandbox and reseed
+scripts/panel-demo.sh --seed-only  # seed and print credentials, don't serve
+scripts/panel-demo.sh --port 9000
+scripts/panel-demo.sh --token-mode # skip panel users; the URL carries a token
+```
+
+The sandbox lives in `./.panel-demo` (gitignored; override with `--home` or
+`WPFY_DEMO_HOME`) and carries its own install root, config, state and log dirs,
+so `/opt/wpfy` is never touched. The script refuses a `--home` that names a
+system path, `$HOME` or the repository root, and `--reset` deletes a directory
+only when it carries the sandbox marker the script writes.
+
+It seeds five sites across flavors, PHP versions and cache modes, plus two
+users — `demo-admin` (admin) and `demo-manager` (site-manager, scoped to
+`demo-shop.test`). A fresh sandbox gives both the password printed on startup
+(`WPFY_DEMO_PASSWORD`, default `demo-panel-passw0rd`). Re-running against an
+existing sandbox does not reset passwords, so it prints the accounts without
+one; `--reset` reseeds them. `--token-mode` skips the users entirely and lets
+the panel's run token stand in — the panel accepts that token only while no
+named user exists, so it requires a sandbox with none (re-run with `--reset`).
+
+`WPFY_SKIP_RUNTIME=1` is exported throughout, so no root and no Docker daemon
+are needed, and runtime, health and service panels report unavailable. Seeding
+does reach for the network: `wpfy site create` writes the scaffold, `.env` and
+registry entry first, then bootstraps WordPress core over HTTP. Without network
+access that download fails and each site stays at `needs-bootstrap` — expected
+here, and the only `site create` failure the script tolerates. Everything that
+reads the registry, the generated `.env`/compose scaffold, panel auth, roles and
+site scoping is real.
+
 ## Style expectations
 
 - Python: standard library only (no new runtime dependencies without prior discussion), type hints on new code, match the structure and naming of the surrounding module.

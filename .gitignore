@@ -46,3 +46,6 @@ codedebrief-out/*.hash.json
 codedebrief-out/codedebrief.html
 codedebrief-out/codedebrief.toml
 .opencode/
+
+# Sandbox created by scripts/panel-demo.sh
+.panel-demo/
