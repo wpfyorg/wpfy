@@ -360,13 +360,19 @@ def action_content(
     ports_csv = ",".join(str(p) for p in BLOCKED_PORTS)
 
     # IPv6 block — included only when the host can route public IPv6.
+    #
+    # Every line here continues the `actionstart` value, so it must carry the
+    # same indent as the IPv4 lines above. fail2ban parses this file with
+    # configparser: an unindented line inside a multi-line value is a hard
+    # parse error that fails `fail2ban-server --test` and takes the whole
+    # install down. That is invisible on an IPv4-only host, where this block
+    # is never rendered at all -- see `test_action_content_parses_as_ini`.
     if ipv6:
         ip6_block = (
-            "\n"
-            "# IPv6 (host has public IPv6 or Docker IPv6)\n"
-            "ip6tables -w -N {chain} 2>/dev/null || true\n"
-            "ip6tables -w -F {chain} 2>/dev/null || true\n"
-            "ip6tables -w -C DOCKER-USER -j {chain} 2>/dev/null"
+            "              # IPv6 (host has public IPv6 or Docker IPv6)\n"
+            "              ip6tables -w -N {chain} 2>/dev/null || true\n"
+            "              ip6tables -w -F {chain} 2>/dev/null || true\n"
+            "              ip6tables -w -C DOCKER-USER -j {chain} 2>/dev/null"
             " || ip6tables -w -I DOCKER-USER 1 -j {chain}\n"
         ).format(chain=chain)
     else:
@@ -407,15 +413,22 @@ def action_content(
             f" -j REJECT --reject-with icmp6-port-unreachable"
             f" 2>/dev/null || true"
         )
+        # fail2ban expands <family> to "inet4"/"inet6" -- NOT "ipv4"/"ipv6".
+        # Testing for "ipv6" always fell through to the IPv4 branch, which ran
+        # `iptables -s <v6 address>` and died with "host/network not found",
+        # while `fail2ban-client status` went on reporting the address as
+        # banned. An IPv6 client was never blocked and nothing showed the
+        # operator that. Verified against fail2ban 1.0.2 on a live host.
+        family_test = 'if [ "<family>" = "inet6" ]; then'
         actionban = (
-            f"actionban   = if [ \"<family>\" = \"ipv6\" ]; then\n"
+            f"actionban   = {family_test}\n"
             f"              {v6_ban}\n"
             f"              else\n"
             f"              {v4_ban}\n"
             f"              fi\n"
         )
         actionunban = (
-            f"actionunban = if [ \"<family>\" = \"ipv6\" ]; then\n"
+            f"actionunban = {family_test}\n"
             f"              {v6_unban}\n"
             f"              else\n"
             f"              {v4_unban}\n"
@@ -591,12 +604,24 @@ def enforcement_status(*, chain: str | None = None) -> EnforcementStatus:
     elif docker_user_result.skipped:
         attached = True  # assume OK when runtime skipped
 
-    # IPv6 status: ipv6_active requires ACTUAL ban capability, not just an
-    # ip6tables DOCKER-USER chain. The installed action must have been
-    # rendered with real ip6tables ban/unban commands (render marker yes),
-    # the ip6tables DOCKER-USER chain must exist, and the WPFY chain must be
-    # attached to it. Chain existence alone (pre-t12 behavior) silently left
-    # public IPv6 unprotected.
+    # IPv6 status: ipv6_active is currently never True, and the three checks
+    # below decide only *which* reason the operator is told.
+    #
+    # Those checks -- action rendered with ip6tables commands, ip6tables
+    # DOCKER-USER present, WPFY chain attached to it -- were all satisfied on
+    # an IPv6-only host on 2026-08-21, and the ban still did not hold. wpfy
+    # enables IPv6 on neither the Docker daemon nor any Docker network, so
+    # inbound IPv6 to a published port is relayed by docker-proxy in userland:
+    # it never enters ip6tables FORWARD, the correctly installed rule sits at
+    # zero packets while the v4 chain counts normally, and Traefik sees the
+    # bridge gateway instead of the client. Nothing this module can install
+    # changes that.
+    #
+    # So the claim is withheld rather than dressed up. Reporting "active" for
+    # a rule that cannot match is worse than reporting nothing: it tells an
+    # operator with public IPv6 that half their surface is covered when none
+    # of it is. Restoring a real check belongs with the decision to enable
+    # Docker IPv6, which needs its own ADR.
     ipv6_active = False
     degraded_reason = ""
     if ipv6:
@@ -613,7 +638,12 @@ def enforcement_status(*, chain: str | None = None) -> EnforcementStatus:
             ip6_attached = True
         ban_capable = action_rendered_ipv6() is True
         if ip6_docker_user_present and ip6_attached and ban_capable:
-            ipv6_active = True
+            # Everything this module owns is in place; the gap is above it.
+            degraded_reason = (
+                "IPv6 ban rules install but never match: wpfy does not enable "
+                "IPv6 on the Docker network, so inbound IPv6 is relayed in "
+                "userland and bypasses DOCKER-USER"
+            )
         else:
             reasons = []
             if not ban_capable:

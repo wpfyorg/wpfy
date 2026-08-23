@@ -9,6 +9,7 @@ import os
 import queue
 import re
 import secrets
+import socket
 import subprocess
 import threading
 import time
@@ -131,7 +132,8 @@ _RATE_LIMIT_PRUNE_THRESHOLD = 256
 RUN_TOKEN_ADMIN = "run-token-admin"
 _ALLOWED_PANEL_FLAVORS = frozenset({"php", "html", *WORDPRESS_FLAVORS})
 _SITE_MANAGER_ALLOWED_ACTIONS = frozenset({
-    "auth.me", "auth.logout", "auth.totp.enable", "auth.totp.disable",
+    "auth.me", "auth.logout", "auth.totp.enable", "auth.totp.disable", "auth.totp.cancel",
+    "auth.profile.update", "auth.password.change", "auth.sessions.list", "auth.sessions.revoke",
     "site.list", "job.list", "job.read", "event.list", "event.stream",
 })
 
@@ -362,6 +364,13 @@ class PanelError(Exception):
 
 class _PanelHTTPServer(ThreadingHTTPServer):
     def __init__(self, *args, **kwargs):
+        # The address family must follow the bind address: an IPv6 public
+        # address cannot be served over an AF_INET socket.
+        try:
+            if ipaddress.ip_address(str(args[0][0])).version == 6:
+                self.address_family = socket.AF_INET6
+        except ValueError:
+            pass
         super().__init__(*args, **kwargs)
         # t19: reaper stop signal so a closed panel server never leaks a
         # forever-looping daemon thread into the process (full-suite race).
@@ -732,6 +741,11 @@ def _operation_status(
     # fault, so the actionable message must survive as 409, not a generic 500.
     if "it carries ssh on port" in message:
         return 409
+    # panel_exposure.clear_panel_basic_auth() refuses to drop the credential
+    # while an unrecognized router may still enforce it; same policy-conflict
+    # reasoning -- the operator must see why, not a generic 500.
+    if "no managed router" in message:
+        return 409
     if nginx_validation and result.exit_code != 3:
         return 422
     return 500
@@ -860,6 +874,47 @@ def _get_stream(request, principal, match, query, body):
     return 200, _StreamAlreadySent()
 
 
+def _memory_total_bytes() -> int | None:
+    """Total RAM in bytes from /proc/meminfo, or None when unreadable.
+
+    Non-Linux dev hosts have no /proc; the dashboard degrades to an em dash
+    instead of failing the whole overview. WPFY_TEST_PROC_DIR redirects the
+    read for offline tests.
+    """
+    proc_dir = os.environ.get("WPFY_TEST_PROC_DIR") or "/proc"
+    try:
+        for line in Path(proc_dir, "meminfo").read_text(encoding="utf-8").splitlines():
+            if line.startswith("MemTotal:"):
+                return int(line.split()[1]) * 1024
+    except (OSError, ValueError, IndexError):
+        return None
+    return None
+
+
+# public_bind_address() may run three sequential external lookups with a 3s
+# timeout each, and overview is fetched on every admin boot and dashboard
+# visit -- an offline host would stall each request behind ~9s of doomed DNS.
+# Cache the answer module-wide: hits for 5 minutes, misses for 60s, so one
+# lookup serves them all and a failure is not re-paid per request.
+_PUBLIC_IP_CACHE: dict[str, tuple[float, str | None]] = {}
+_PUBLIC_IP_TTL_POSITIVE_S = 300.0
+_PUBLIC_IP_TTL_NEGATIVE_S = 60.0
+
+
+def _cached_public_ip() -> str | None:
+    now = time.monotonic()
+    entry = _PUBLIC_IP_CACHE.get("ip")
+    if entry is not None and entry[0] > now:
+        return entry[1]
+    try:
+        ip = panel_exposure.public_bind_address()
+    except (OSError, ValueError, RuntimeError):
+        ip = None
+    ttl = _PUBLIC_IP_TTL_POSITIVE_S if ip is not None else _PUBLIC_IP_TTL_NEGATIVE_S
+    _PUBLIC_IP_CACHE["ip"] = (now + ttl, ip)
+    return ip
+
+
 def api_overview() -> dict:
     facts = operational_inspection.aggregate_info()
     # `aggregate_info` carries the `docker compose ps` table, which is what
@@ -872,7 +927,9 @@ def api_overview() -> dict:
     if health not in ("running", "healthy"):
         warnings += 1
     return {"version": __version__, "docker_version": facts.docker_version, "traefik": health,
-            "site_count": len(facts.sites), "warnings": warnings}
+            "site_count": len(facts.sites), "warnings": warnings,
+            "public_ip": _cached_public_ip(), "cpu_count": os.cpu_count(),
+            "memory_total": _memory_total_bytes()}
 
 
 def api_sites() -> dict:
@@ -1008,7 +1065,27 @@ def api_site_runtime(domain: str, action: str) -> tuple[int, dict]:
 def api_site_sftp(domain: str) -> tuple[int, dict]:
     _known_domain(domain)
     result = sftp.sftp_status(domain)
-    return _operation_status(result, not_found=True), _runtime_payload(result)
+    status, payload = _operation_status(result, not_found=True), _runtime_payload(result)
+    # Structured connection details on the site-scoped route, so a site
+    # manager -- who gets a 403 from the system-scoped /api/overview -- still
+    # sees host/port/user without parsing the human-readable message. The
+    # password is plaintext in the site .env and recoverable by design, so it
+    # surfaces here behind the client's reveal toggle instead of being
+    # one-time-only.
+    env_values = read_env(env_path(domain))
+    try:
+        host = _cached_public_ip()
+    except (OSError, ValueError, RuntimeError):
+        host = None
+    password_configured = bool(env_values.get("SFTP_PASSWORD"))
+    payload["connection"] = {
+        "host": host,
+        "port": env_values.get("SFTP_PORT", ""),
+        "user": "sftpuser" if password_configured else "",
+    }
+    payload["password"] = env_values.get("SFTP_PASSWORD") or None
+    payload["enabled"] = password_configured
+    return status, payload
 
 
 _SFTP_PASSWORD_MARKER = "\npassword (shown once):"
@@ -1034,7 +1111,15 @@ def _sftp_payload(result) -> dict:
 def api_site_sftp_action(domain: str, action: str) -> tuple[int, dict]:
     _known_domain(domain)
     if action == "enable":
-        result = sftp.ensure_sftp_container(domain)
+        # Generate here and pass explicitly, mirroring rotate: the generated
+        # secret must reach the client through one_time exactly once, not die
+        # in a message line the payload stripper removes.
+        password = generated_secret()[:16]
+        result = sftp.ensure_sftp_container(domain, password=password)
+        payload = _sftp_payload(result)
+        if result.exit_code == 0:
+            payload["one_time"] = {"password": password}
+        return _operation_status(result, not_found=True), payload
     elif action == "disable":
         result = sftp.remove_sftp_container(domain)
     elif action == "rotate":
@@ -1817,11 +1902,16 @@ def _get_setup_status(principal, match, query, body):
 
 def _post_setup(principal, match, query, body):
     client = body.pop("_socket_client", None)
-    if isinstance(principal, dict) and principal.get("_setup_secret"):
+    setup_authenticated = isinstance(principal, dict) and bool(principal.get("_setup_secret"))
+    if setup_authenticated:
         # The request authenticated with the secret; making the body repeat it
         # would be two credentials for one grant.
         body.setdefault("setup_secret", principal["_setup_secret"])
-    remote = body.pop("_edge_bind", False) is True
+    # A request that authenticated with the setup secret must burn it, whatever
+    # bind mode the server runs in -- a secret that survived creation would
+    # re-open first-run setup once the last user is removed. The run-token
+    # bootstrap is a separate grant and consumes nothing.
+    remote = body.pop("_edge_bind", False) is True or setup_authenticated
     setup_username = body.get("username", "") if isinstance(body.get("username"), str) else ""
     try:
         token, user = panel_setup.create_account(body, client=client, remote=remote)
@@ -1923,10 +2013,20 @@ def _post_auth_logout(principal, match, query, body):
 
 
 def _get_auth_me(principal, match, query, body):
+    # `version` rides the session-scoped identity payload because site managers
+    # get 403 from system-scoped /api/overview and their footer chip would
+    # otherwise fall back to a generic label. Profile and TOTP state ride here
+    # for the same reachability reason: the account pages are session-scoped.
+    record = panel_auth.get_public_user(principal["username"]) or {}
     return 200, {
         "username": principal["username"],
         "role": principal["role"],
         "sites": list(principal.get("sites") or []),
+        "version": __version__,
+        "first_name": record.get("first_name", ""),
+        "last_name": record.get("last_name", ""),
+        "email": record.get("email", ""),
+        "totp_enabled": bool(record.get("totp_enabled")),
     }
 
 
@@ -1952,6 +2052,78 @@ def _delete_auth_totp(principal, match, query, body):
             panel_auth.disable_totp(username, body.get("password"), body.get("current_totp"))
     except ValueError as exc:
         raise PanelError(400, str(exc)) from exc
+    return 200, {"ok": True}
+
+
+def _delete_auth_totp_pending(principal, match, query, body):
+    # Discard a begun enrollment so the next Begin issues a fresh secret
+    # immediately instead of failing with "already disclosed" until the TTL.
+    panel_auth.cancel_totp_enrollment(principal["username"])
+    return 200, {"ok": True}
+
+
+def _put_auth_profile(principal, match, query, body):
+    # Self-scoped by construction: the session names the account, so a
+    # username in the body is noise to drop, never an address to honor.
+    allowed = {"first_name", "last_name", "email"}
+    if any(key not in allowed and key != "username" for key in body):
+        raise PanelError(400, "profile contains an unsupported field")
+    updates = {key: body[key] for key in sorted(allowed & set(body))}
+    if not updates:
+        raise PanelError(400, "profile update requires first_name, last_name, and/or email")
+    try:
+        user = panel_auth.update_profile(principal["username"], **updates)
+    except ValueError as exc:
+        raise PanelError(400, str(exc)) from exc
+    return 200, {
+        "ok": True,
+        "user": {key: user[key] for key in ("username", "first_name", "last_name", "email")},
+    }
+
+
+def _post_auth_password(principal, match, query, body):
+    if set(body) != {"current_password", "new_password"}:
+        raise PanelError(400, "password change requires current_password and new_password")
+    try:
+        panel_auth.change_password(
+            principal["username"], body["current_password"], body["new_password"],
+            keep_token=principal.get("_session_token"),
+        )
+    except panel_auth.ReauthenticationError as exc:
+        # 400, not 401: the caller IS authenticated -- the current-password
+        # check failed -- and the shell's api() treats any 401 as a dead
+        # session, which would sign the user out mid-form.
+        raise PanelError(400, str(exc)) from exc
+    except ValueError as exc:
+        raise PanelError(400, str(exc)) from exc
+    return 200, {"ok": True}
+
+
+def _get_auth_sessions(principal, match, query, body):
+    current_id = panel_auth.session_token_id(principal.get("_session_token"))
+    sessions = [
+        {**row, "current": row["id"] == current_id}
+        for row in panel_auth.list_sessions(principal["username"])
+    ]
+    return 200, {"sessions": sessions}
+
+
+def _delete_auth_session(principal, match, query, body):
+    session_id = unquote(match.group("session_id"))
+    username = principal["username"]
+    if not panel_auth.revoke_session_by_id(username, session_id):
+        raise PanelError(404, "session not found")
+    if session_id == panel_auth.session_token_id(principal.get("_session_token")):
+        # Revoking the current session is a logout: release file-manager
+        # leases exactly as POST /api/auth/logout would.
+        for entry in list_sites():
+            domain = entry.get("domain")
+            if isinstance(domain, str):
+                threading.Thread(
+                    target=_revoke_fm_for_logout,
+                    args=(domain, username),
+                    daemon=True,
+                ).start()
     return 200, {"ok": True}
 
 
@@ -2048,6 +2220,44 @@ def _put_settings_telemetry(principal, match, query, body):
         raise PanelError(400, "telemetry requires an enabled boolean")
     telemetry.set_enabled(body["enabled"])
     return 200, telemetry.status()
+
+
+def _get_settings_basic_auth(principal, match, query, body):
+    # Status only: the stored APR1 hash never leaves the 0600 file. `auth_state`
+    # distinguishes a stored credential from one a recognized router actually
+    # applies -- and flags the exposed-but-unrecognized case where enforcement
+    # cannot be verified either way, so the operator is never told the public
+    # domain is guarded when that is not known.
+    status = panel_exposure.panel_basic_auth_status()
+    return 200, {
+        "enabled": status["enabled"],
+        "username": status["username"],
+        "auth_state": panel_exposure.panel_basic_auth_enforcement(),
+    }
+
+
+def _put_settings_basic_auth(principal, match, query, body):
+    if set(body) != {"username", "password"}:
+        raise PanelError(400, "basic auth requires username and password")
+    try:
+        panel_auth.validate_password(body.get("password"))
+    except ValueError as exc:
+        raise PanelError(400, str(exc)) from exc
+    result = panel_exposure.set_panel_basic_auth(body.get("username"), body.get("password"))
+    if result.exit_code != 0:
+        raise PanelError(_operation_status(result), result.message)
+    return 200, {
+        "enabled": True,
+        "username": panel_exposure.panel_basic_auth_status()["username"],
+        "auth_state": panel_exposure.panel_basic_auth_enforcement(),
+    }
+
+
+def _delete_settings_basic_auth(principal, match, query, body):
+    result = panel_exposure.clear_panel_basic_auth()
+    if result.exit_code != 0:
+        raise PanelError(_operation_status(result), result.message)
+    return 200, {"enabled": False}
 
 
 def _post_settings_exposure(principal, match, query, body):
@@ -2251,8 +2461,27 @@ def _post_firewall_disable(principal, match, query, body):
     return _operation_status(result), payload
 
 
-def _post_firewall_install(principal, match, query, body):
-    job = panel_jobs.create_job("firewall.install", None)
+def _post_firewall_install_ufw(principal, match, query, body):
+    job = panel_jobs.create_job("firewall.install-ufw", None)
+
+    def operation():
+        result = firewall_ports.install_ufw()
+        payload = {
+            "ok": result.exit_code == 0,
+            "exit_code": result.exit_code,
+            "message": result.message,
+            "ran": result.ran,
+            "skipped": result.skipped,
+        }
+        if result.exit_code != 0:
+            raise RuntimeError(result.message or "ufw install failed")
+        return payload, None
+    _start_job(job, operation, actor=_principal_username(principal))
+    return 202, {"job_id": job.id}
+
+
+def _post_firewall_install_fail2ban(principal, match, query, body):
+    job = panel_jobs.create_job("firewall.install-fail2ban", None)
 
     def operation():
         result = fail2ban_host.ensure_fail2ban_host()
@@ -2265,7 +2494,7 @@ def _post_firewall_install(principal, match, query, body):
             "health_ok": result.health_ok,
         }
         if result.exit_code != 0:
-            raise RuntimeError(result.message or "firewall install failed")
+            raise RuntimeError(result.message or "fail2ban install failed")
         return payload, None
     _start_job(job, operation, actor=_principal_username(principal))
     return 202, {"job_id": job.id}
@@ -2428,7 +2657,8 @@ def _get_events(principal, match, query, body):
 
 _CREATE_SITE_FIELDS = frozenset({
     "domain", "flavor", "php_version", "letsencrypt", "dns_provider",
-    "admin_user", "admin_email", "object_cache", "page_cache", "enable_sftp", "dry_run",
+    "admin_user", "admin_email", "admin_password", "wp_version", "multisite",
+    "object_cache", "page_cache", "enable_sftp", "dry_run",
 })
 
 
@@ -2470,6 +2700,28 @@ def _post_create_site(principal, match, query, body):
             raise PanelError(400, str(exc)) from exc
     if (object_cache is not None or page_cache is not None) and flavor not in WORDPRESS_FLAVORS:
         raise PanelError(400, f"cache integration requires a WordPress site: {domain}")
+    admin_password = body.get("admin_password")
+    if admin_password is not None and not isinstance(admin_password, str):
+        raise PanelError(400, "admin_password must be a string")
+    if admin_password:
+        # Same 12-character floor as every other panel write path.
+        try:
+            panel_auth._validate_password(admin_password)
+        except ValueError as exc:
+            raise PanelError(400, f"invalid admin_password: {exc}") from exc
+    wp_version = body.get("wp_version")
+    if wp_version is not None:
+        if not isinstance(wp_version, str):
+            raise PanelError(400, "wp_version must be a string")
+        wp_version = wp_version.strip() or None
+    multisite = body.get("multisite")
+    if multisite is not None and not isinstance(multisite, str):
+        raise PanelError(400, "multisite must be a string")
+    multisite = multisite or "no"
+    if multisite not in ("no", "yes"):
+        raise PanelError(400, 'multisite must be "no" or "yes"')
+    if multisite == "yes" and flavor not in WORDPRESS_FLAVORS:
+        raise PanelError(400, f"multisite requires a WordPress site: {domain}")
     enable_sftp = body.get("enable_sftp")
     if enable_sftp is not None and not isinstance(enable_sftp, bool):
         raise PanelError(400, "enable_sftp must be a boolean")
@@ -2481,19 +2733,39 @@ def _post_create_site(principal, match, query, body):
     def operation():
         admin_user = body.get("admin_user") or "admin"
         admin_email = body.get("admin_email") or f"admin@{domain}"
+
         def credentials():
-            return site_lifecycle.WordPressCredentials(admin_user, admin_email, generated_secret(), True)
+            # Shared with the CLI: blank password generates a shown-once
+            # secret, a supplied one is validated and used as-is.
+            return site_lifecycle.resolve_wp_admin_credentials(
+                admin_user, admin_email, admin_password, domain=domain,
+            )
+
         result = site_lifecycle.create_site(
             site_lifecycle.CreateSiteRequest(
                 domain=domain, flavor=flavor, php_version=php_version,
                 letsencrypt=body.get("letsencrypt"), dns_provider=body.get("dns_provider"),
+                wp_version=wp_version, multisite=multisite == "yes",
+                admin_password=admin_password,
             ),
             credentials=credentials,
             progress=lambda step: panel_jobs.append_step(job.id, step),
         )
         payload = {"ok": result.exit_code == 0, "exit_code": result.exit_code,
                    "touched": list(result.touched), "runtime": _runtime_payload(result.runtime)}
-        one_time = {"wordpress_admin_password": result.generated_password} if result.generated_password else None
+        one_time: dict = {}
+        if result.generated_password:
+            one_time["wordpress_admin_password"] = result.generated_password
+        if result.exit_code == 0:
+            # Database and SFTP connection details ride the one-time payload so
+            # the success screen can show everything exactly once. Secrets stay
+            # out of `message` and `job.result`.
+            env_values = read_env(env_path(domain))
+            definition = SiteDefinition.from_env(domain, env_values)
+            if definition.use_mysql:
+                one_time["db_name"] = env_values.get("DB_NAME", "")
+                one_time["db_user"] = env_values.get("DB_USER", "")
+                one_time["db_password"] = env_values.get("DB_PASSWORD", "")
         if result.exit_code != 0:
             raise RuntimeError("site creation failed")
 
@@ -2531,9 +2803,16 @@ def _post_create_site(principal, match, query, body):
             payload["sftp"] = _sftp_payload(sftp_result)
             if sftp_result.exit_code != 0:
                 raise RuntimeError(sftp_result.message or "sftp provisioning failed")
-            one_time = {**(one_time or {}), "sftp_password": sftp_password}
+            one_time["sftp_password"] = sftp_password
+            try:
+                one_time["sftp_host"] = panel_exposure.public_bind_address()
+            except (OSError, ValueError, RuntimeError):
+                pass
+            sftp_env = read_env(env_path(domain))
+            one_time["sftp_port"] = sftp_env.get("SFTP_PORT", "")
+            one_time["sftp_user"] = "sftpuser"
 
-        return payload, one_time
+        return payload, one_time or None
     _start_job(job, operation, actor=_principal_username(principal))
     return 202, {"job_id": job.id}
 
@@ -2915,10 +3194,30 @@ _ROUTES = (
         RouteMeta("auth.login", "public", True, max_body=8 * 1024),
     ),
     Route("GET", re.compile(r"^/api/auth/me$"), _get_auth_me, RouteMeta("auth.me", "session")),
+    Route(
+        "PUT", re.compile(r"^/api/auth/profile$"),
+        _put_auth_profile, RouteMeta("auth.profile.update", "session", True),
+    ),
+    Route(
+        "POST", re.compile(r"^/api/auth/password$"),
+        _post_auth_password, RouteMeta("auth.password.change", "session", True),
+    ),
+    Route(
+        "GET", re.compile(r"^/api/auth/sessions$"),
+        _get_auth_sessions, RouteMeta("auth.sessions.list", "session"),
+    ),
+    Route(
+        "DELETE", re.compile(r"^/api/auth/sessions/(?P<session_id>[^/]+)$"),
+        _delete_auth_session, RouteMeta("auth.sessions.revoke", "session", True),
+    ),
     Route("POST", re.compile(r"^/api/auth/totp$"), _post_auth_totp, RouteMeta("auth.totp.enable", "session", True)),
     Route(
         "DELETE", re.compile(r"^/api/auth/totp$"),
         _delete_auth_totp, RouteMeta("auth.totp.disable", "session", True),
+    ),
+    Route(
+        "DELETE", re.compile(r"^/api/auth/totp/pending$"),
+        _delete_auth_totp_pending, RouteMeta("auth.totp.cancel", "session", True),
     ),
     Route("GET", re.compile(r"^/api/users$"), _get_users, RouteMeta("user.list", "system")),
     Route("POST", re.compile(r"^/api/users$"), _post_user, RouteMeta("user.add", "system", True)),
@@ -2944,6 +3243,9 @@ _ROUTES = (
     Route("GET", re.compile(r"^/api/system/diagnostics$"), _get_system_diagnostics, RouteMeta("system.diagnostics", "system")),
     Route("GET", re.compile(r"^/api/settings$"), _get_settings, RouteMeta("settings.read", "system")),
     Route("PUT", re.compile(r"^/api/settings/telemetry$"), _put_settings_telemetry, RouteMeta("settings.telemetry", "system", True)),
+    Route("GET", re.compile(r"^/api/settings/basic-auth$"), _get_settings_basic_auth, RouteMeta("settings.basic_auth.read", "system")),
+    Route("PUT", re.compile(r"^/api/settings/basic-auth$"), _put_settings_basic_auth, RouteMeta("settings.basic_auth.write", "system", True)),
+    Route("DELETE", re.compile(r"^/api/settings/basic-auth$"), _delete_settings_basic_auth, RouteMeta("settings.basic_auth.clear", "system", True, True)),
     Route("POST", re.compile(r"^/api/settings/exposure$"), _post_settings_exposure, RouteMeta("settings.exposure", "system", True, True)),
     Route("DELETE", re.compile(r"^/api/settings/exposure$"), _delete_settings_exposure, RouteMeta("settings.exposure.disable", "system", True, True)),
     Route("GET", re.compile(r"^/api/backup/remote$"), _get_remote_backup, RouteMeta("backup.remote.read", "system")),
@@ -2952,7 +3254,8 @@ _ROUTES = (
     Route("PUT", re.compile(r"^/api/backup/schedule$"), _put_backup_schedule, RouteMeta("backup.schedule.write", "system", True)),
     Route("DELETE", re.compile(r"^/api/backup/schedule$"), _delete_backup_schedule, RouteMeta("backup.schedule.disable", "system", True, True)),
     Route("GET", re.compile(r"^/api/firewall$"), _get_firewall, RouteMeta("firewall.read", "system")),
-    Route("POST", re.compile(r"^/api/firewall/install$"), _post_firewall_install, RouteMeta("firewall.install", "system", True)),
+    Route("POST", re.compile(r"^/api/firewall/install-ufw$"), _post_firewall_install_ufw, RouteMeta("firewall.ufw.install", "system", True)),
+    Route("POST", re.compile(r"^/api/firewall/install-fail2ban$"), _post_firewall_install_fail2ban, RouteMeta("firewall.fail2ban.install", "system", True)),
     Route("POST", re.compile(r"^/api/firewall/ports$"), _post_firewall_port, RouteMeta("firewall.port.add", "system", True, True)),
     Route("DELETE", re.compile(r"^/api/firewall/ports$"), _delete_firewall_port, RouteMeta("firewall.port.remove", "system", True, True)),
     Route("POST", re.compile(r"^/api/firewall/enable$"), _post_firewall_enable, RouteMeta("firewall.enable", "system", True, True)),
@@ -3102,13 +3405,19 @@ _ROUTES = (
 )
 
 
-def make_panel_handler(config: PanelConfig) -> type[BaseHTTPRequestHandler]:
+def make_panel_handler(config: PanelConfig, *, allow_remote_run_token: bool = False) -> type[BaseHTTPRequestHandler]:
     # Owned by this server, not the module: two panels in one process (as in
     # tests, which call `make_panel_server` per test) get independent budgets
     # instead of fighting over one process-lifetime dict. A fresh server
     # naturally starts with an empty table -- no explicit reset needed.
     rate_limit_buckets: dict[str, tuple[float, float]] = {}
     rate_limit_lock = threading.Lock()
+    # Remote run-token authentication is granted only where the caller proved
+    # it: `make_panel_server` passes allow_remote_run_token after validating
+    # that the bind really is this host's public address in plain-HTTP mode.
+    # Raw handler construction defaults to DENIED -- a host string alone says
+    # nothing about what was validated.
+    direct_public_bind = allow_remote_run_token
 
     class PanelHandler(BaseHTTPRequestHandler):
         server_version = "wpfy-panel"
@@ -3222,7 +3531,7 @@ def make_panel_handler(config: PanelConfig) -> type[BaseHTTPRequestHandler]:
                 return None
             if (
                 not panel_auth.login_required()
-                and _is_loopback_address(self.client_address[0])
+                and (direct_public_bind or _is_loopback_address(self.client_address[0]))
                 and hmac.compare_digest(token, config.token)
             ):
                 return _run_token_principal()
@@ -3506,15 +3815,14 @@ def make_panel_handler(config: PanelConfig) -> type[BaseHTTPRequestHandler]:
 
 
 def make_panel_server(config: PanelConfig) -> ThreadingHTTPServer:
+    # Only the validated direct-public plain-HTTP bind may accept the printed
+    # run token from a remote peer; every other mode keeps loopback-only.
+    remote_token_allowed = False
     if not config.token:
         raise ValueError("panel requires a non-empty token")
     if config.edge_bind:
         from . import panel_exposure
 
-        if not panel_auth.login_required():
-            raise ValueError("edge-bound panel requires named-user login")
-        if not any(user.get("totp_enabled") for user in panel_auth.list_users()):
-            raise ValueError("edge-bound panel requires an enrolled TOTP factor")
         if not panel_exposure.exposure_status().get("exposed"):
             raise ValueError("edge-bound panel requires an active exposure router")
         panel_exposure.validate_panel_edge_bind(config.host)
@@ -3536,14 +3844,40 @@ def make_panel_server(config: PanelConfig) -> ThreadingHTTPServer:
                     f"not {config.host}; run: wpfy panel --public"
                 ) from None
     else:
-        validate_loopback_host(config.host)
+        try:
+            validate_loopback_host(config.host)
+        except ValueError:
+            from . import panel_exposure
+
+            # Plain HTTP on the host's own public address is the default
+            # `wpfy panel` bind now. Any other non-loopback host stays refused:
+            # wildcards are meaningless as a bind target, and an arbitrary
+            # address would advertise a panel location nothing resolved.
+            permitted = False
+            try:
+                candidate = panel_exposure.validate_edge_bind(config.host)
+                permitted = candidate == panel_exposure.public_bind_address()
+            except (RuntimeError, TypeError, ValueError):
+                permitted = False
+            if not permitted:
+                raise ValueError(
+                    "panel host must be a loopback address or this host's public address, "
+                    f"got {config.host!r}; pass --local to bind 127.0.0.1"
+                ) from None
+            # Only here has the caller proved the bind is this host's public
+            # address in plain-HTTP mode, so only here may the printed run
+            # token authenticate a remote peer.
+            remote_token_allowed = True
     # Docker trust discovery is startup work, never a login-request side
     # effect.  Failure leaves the cache empty and client resolution fails
     # closed to the connected peer.
     refresh_trusted_edge_networks()
     panel_auth.refresh_never_ban_edge_cidrs()
     _rediscover_file_managers()
-    server = _PanelHTTPServer((config.host, config.port), make_panel_handler(config))
+    server = _PanelHTTPServer(
+        (config.host, config.port),
+        make_panel_handler(config, allow_remote_run_token=remote_token_allowed),
+    )
     if config.self_signed_tls:
         from . import panel_tls
 
@@ -3563,7 +3897,7 @@ def make_panel_server(config: PanelConfig) -> ThreadingHTTPServer:
 
 def panel_url(config: PanelConfig, port: int | None = None) -> str:
     scheme = "https" if config.self_signed_tls else "http"
-    base = f"{scheme}://{config.host}:{port or config.port}/"
+    base = f"{scheme}://{panel_exposure.display_host(config.host)}:{port or config.port}/"
     if panel_auth.login_required() or config.self_signed_tls:
         # The run token stands in for an account on a loopback panel, where
         # reaching it already proves shell access. On a public address it is a

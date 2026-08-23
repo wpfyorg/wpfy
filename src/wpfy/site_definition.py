@@ -291,7 +291,7 @@ def sftp_service_lines(definition: SiteDefinition) -> list[str]:
             cap_add=("CHOWN", "NET_BIND_SERVICE", "SETUID", "SETGID"),
         ),
         "    ports:",
-        f'      - "127.0.0.1:{definition.sftp_port or "2222"}:22"',
+        f'      - "0.0.0.0:{definition.sftp_port or "2222"}:22"',
         f"    command: sftpuser:${{SFTP_PASSWORD}}:{uid}:{uid}:app",
         "    networks:",
         "      - site",

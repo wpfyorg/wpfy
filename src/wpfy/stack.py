@@ -4,7 +4,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 import subprocess
 
-from . import traefik
+from . import firewall_ports, traefik
 from .fail2ban_host import ensure_fail2ban_host
 from .image_references import ADMINER_IMAGE, HELPER_IMAGE_REFERENCES, MARIADB_IMAGE, REDIS_IMAGE
 from .php_runtime import DEFAULT_PHP_VERSION, PHP_IMAGE_REPOSITORY, php_image
@@ -130,10 +130,16 @@ def install(
         else:
             facts.append(StackFact("fail2ban", "FAIL", f2b.message, f2b.exit_code))
 
+    if "ufw" in request.host_tools:
+        notify("Ensuring host firewall (ufw)...")
+        ufw = firewall_ports.install_ufw()
+        status_name = "SKIP" if ufw.skipped else "OK" if ufw.exit_code == 0 else "FAIL"
+        facts.append(StackFact("ufw", status_name, ufw.message, ufw.exit_code))
+
     facts.extend(
         StackFact(tool, "WARN", "not applicable in Docker-first wpfy (use host-level tooling separately)")
         for tool in request.host_tools
-        if tool in HOST_TOOLS and tool != "fail2ban"
+        if tool in HOST_TOOLS and tool not in {"fail2ban", "ufw"}
     )
     for helper in request.helpers:
         image = HELPER_IMAGES.get(helper)

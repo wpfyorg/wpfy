@@ -90,13 +90,14 @@
       <div class="card-body">
         <h1 class="card-title text-center mb-2" id="setup-totp-title">Add a second factor</h1>
         <p class="text-secondary">Scan this QR code with an authenticator, or enter the secret manually. The factor is stored only after one valid code is checked.</p>
-        <div class="row g-3 align-items-center">
-          <div class="col-md-auto"><div id="setup-qr" class="setup-qr" aria-label="TOTP QR code"></div></div>
-          <div class="col">
-            <div class="mb-3"><label class="form-label" for="setup-totp-secret">Secret</label><input id="setup-totp-secret" class="form-control font-monospace" type="text" readonly></div>
-            <div class="mb-3"><label class="form-label" for="setup-totp-code">Authenticator code</label><input id="setup-totp-code" class="form-control" type="text" inputmode="numeric" autocomplete="one-time-code" maxlength="6" pattern="[0-9]{6}"></div>
-          </div>
+        <div class="mb-3"><div id="setup-qr" class="setup-qr" aria-label="TOTP QR code"></div></div>
+        <div class="mb-3">
+          <label class="form-label" for="setup-totp-secret">Secret</label>
+          <input id="setup-totp-secret" class="form-control font-monospace" type="text" readonly>
+          <button class="btn btn-sm btn-link mt-1" id="btn-setup-totp-copy" type="button">Copy secret</button>
+          <small class="text-secondary d-block">Can't scan the code? Enter this key into your authenticator by hand.</small>
         </div>
+        <div class="mb-3"><label class="form-label" for="setup-totp-code">Authenticator code</label><input id="setup-totp-code" class="form-control" type="text" inputmode="numeric" autocomplete="one-time-code" maxlength="6" pattern="[0-9]{6}"></div>
         <div class="btn-list mt-3">
           <button class="btn btn-primary" id="btn-setup-totp-verify" type="button">Verify and enable</button>
           <button class="btn btn-link" id="btn-setup-totp-skip" type="button">Skip for now</button>
@@ -169,8 +170,7 @@
 
   <header class="navbar navbar-expand-md d-print-none">
     <div class="container-fluid">
-      <div class="navbar-nav flex-row order-md-last align-items-center">
-        <span class="badge bg-secondary-lt me-2 d-none d-md-inline" id="chip-version">–</span>
+      <div class="navbar-nav flex-row align-items-center">
         <a href="/admin/services" data-route="true" class="nav-link px-2 d-none" id="chip-health" title="Service health">
           <span class="status status-secondary" id="chip-health-status"><span class="status-dot" id="chip-health-dot"></span><span id="chip-health-text">–</span></span>
         </a>
@@ -256,7 +256,10 @@
     <footer class="footer footer-transparent d-print-none">
       <div class="container-xl">
         <div class="row text-center align-items-center">
-          <div class="col-12 text-secondary" id="foot-principal">wpfy panel</div>
+          <div class="col-12 text-secondary">
+            <span class="badge bg-secondary-lt me-2" id="chip-version">–</span>
+            <span id="foot-principal">wpfy panel</span>
+          </div>
         </div>
       </div>
     </footer>

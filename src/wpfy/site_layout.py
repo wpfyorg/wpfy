@@ -1052,6 +1052,8 @@ def provision_wordpress_site(
     admin_user: str,
     admin_email: str,
     admin_password: str,
+    *,
+    wp_version: str | None = None,
 ) -> RuntimeResult:
     validate_domain(domain)
     if runtime_skip_requested():
@@ -1069,7 +1071,11 @@ def provision_wordpress_site(
 
     root = app_dir(domain)
     if not (root / "wp-includes" / "version.php").exists():
-        download = wp_cli_command(domain, "core", "download", "--force", "--allow-root")
+        download_args = ["core", "download", "--force"]
+        if wp_version:
+            download_args.append(f"--version={wp_version}")
+        download_args.append("--allow-root")
+        download = wp_cli_command(domain, *download_args)
         if download.returncode != 0:
             return RuntimeResult(download.returncode, _wp_cli_error(download, "wp core download failed", admin_password))
 
@@ -1098,6 +1104,9 @@ def provision_wordpress_site(
         "--prompt=admin_password",
         input_text=admin_password + "\n",
     )
+    # TODO(rc7): provision the multisite network, not just the single site.
+    # A multisite selection currently persists the wpsubdir flavor only; the
+    # operator still runs `wp core multisite-install` by hand.
     if install.returncode != 0:
         return RuntimeResult(install.returncode, _wp_cli_error(install, "wp core install failed", admin_password))
 

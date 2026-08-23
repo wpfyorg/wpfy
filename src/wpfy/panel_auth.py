@@ -174,6 +174,10 @@ class UserStoreError(ValueError):
     pass
 
 
+class ReauthenticationError(ValueError):
+    """Supplied current credentials failed a self-service reauthentication."""
+
+
 def users_path() -> Path:
     return Path(settings.PATHS.config_dir) / "panel-users.json"
 
@@ -732,6 +736,79 @@ def update_user(username, *, role=None, password=None, sites=None) -> None:
         if password is not None:
             _LOGIN_FAILURES.pop(username, None)
             _revoke_user_sessions(username)
+
+
+def update_profile(username, *, first_name=None, last_name=None, email=None) -> dict:
+    """Self-service record edit: display fields only, never role/sites/password.
+
+    The caller is the authenticated account itself (the panel route passes the
+    session's own username), so there is deliberately no way to address another
+    user here. Profile fields are outside the authentication fingerprint, so
+    existing sessions survive a rename.
+    """
+    username = _validate_username(username)
+    updates = {}
+    for field, value, maximum in (
+        ("first_name", first_name, 80), ("last_name", last_name, 80), ("email", email, 254),
+    ):
+        if value is None:
+            continue
+        if not isinstance(value, str) or len(value) > maximum:
+            raise ValueError(f"{field} must be a string of at most {maximum} characters")
+        updates[field] = value
+    with _STATE_LOCK, _store_lock():
+        users = _read_users()
+        user = _find_user(users, username)
+        if user is None:
+            raise ValueError(f"panel user not found: {username}")
+        user.update(updates)
+        _write_users(users)
+        return _public_user(user)
+
+
+def get_public_user(username):
+    """Read-only public view of one user, or None when unknown."""
+    with _STATE_LOCK, _store_lock():
+        user = _find_user(_read_users(), username)
+        return _public_user(user) if user else None
+
+
+def change_password(username, current_password, new_password, *, keep_token=None) -> None:
+    """Self-service rotation: verify the current secret, then revoke other sessions.
+
+    Verification reuses the login path (`_verify_password_with_fingerprint`),
+    including its dummy-KDF work for unknown users and malformed records, so
+    this route costs the same as a login attempt for every outcome. The kept
+    session -- normally the one that initiated the change -- has its
+    credential fingerprint rebound to the new record; every other session of
+    the user is dropped.
+    """
+    username = _validate_username(username)
+    new_password = _validate_password(new_password)
+    valid, fingerprint = _verify_password_with_fingerprint(username, current_password)
+    if not valid or fingerprint is None:
+        raise ReauthenticationError("current password is incorrect")
+    new_record = _password_record(new_password)
+    with _STATE_LOCK, _store_lock():
+        users = _read_users()
+        user = _find_user(users, username)
+        if user is None:
+            raise ValueError(f"panel user not found: {username}")
+        # CAS on the credential fingerprint: a concurrent password/TOTP change
+        # between verification and this write must not be silently overwritten.
+        if _auth_fingerprint(user) != fingerprint:
+            raise ReauthenticationError("account state changed; retry")
+        user["password_hash"], user["password_salt"] = new_record
+        _write_users(users)
+        _LOGIN_FAILURES.pop(username, None)
+        for token in tuple(_SESSIONS):
+            session = _SESSIONS.get(token)
+            if session is None or session.username != username:
+                continue
+            if keep_token is not None and hmac.compare_digest(token.encode("utf-8"), str(keep_token).encode("utf-8")):
+                _SESSIONS[token] = replace(session, credential_fingerprint=_auth_fingerprint(user))
+            else:
+                _SESSIONS.pop(token, None)
 
 
 def assign_site(username, domain) -> None:
@@ -1371,6 +1448,55 @@ def logout(token: object) -> None:
     if isinstance(token, str):
         with _STATE_LOCK:
             _SESSIONS.pop(token, None)
+
+
+def session_token_id(token: object) -> str:
+    """Stable public identifier for a session token.
+
+    Sessions are keyed by the raw bearer token in memory, but that token must
+    never travel back to a client -- not even its own. The first 12 hex chars
+    of the SHA-256 are enough for a user to tell sessions apart and revoke a
+    specific one without disclosing anything replayable.
+    """
+    if not isinstance(token, str) or not token:
+        return ""
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()[:12]
+
+
+def list_sessions(username: str) -> list[dict]:
+    """The caller's own live sessions, oldest first, hash ids only."""
+    username = _validate_username(username)
+    now = time.time()
+    with _STATE_LOCK, _store_lock():
+        _prune_sessions(now)
+        rows = [
+            {
+                "id": session_token_id(token),
+                "created": datetime.fromtimestamp(session.created_at, tz=timezone.utc).isoformat(),
+                "last_seen": datetime.fromtimestamp(session.last_seen_at, tz=timezone.utc).isoformat(),
+            }
+            for token, session in _SESSIONS.items()
+            if session.username == username
+        ]
+    rows.sort(key=lambda row: (row["created"], row["id"]))
+    return rows
+
+
+def revoke_session_by_id(username: str, token_id: object) -> bool:
+    """Revoke one of the caller's own sessions by its public hash id."""
+    username = _validate_username(username)
+    if not isinstance(token_id, str) or not token_id:
+        return False
+    wanted = token_id.encode("utf-8")
+    with _STATE_LOCK:
+        for token in tuple(_SESSIONS):
+            session = _SESSIONS.get(token)
+            if session is None or session.username != username:
+                continue
+            if hmac.compare_digest(session_token_id(token).encode("utf-8"), wanted):
+                _SESSIONS.pop(token, None)
+                return True
+    return False
 
 
 def reset_state() -> None:

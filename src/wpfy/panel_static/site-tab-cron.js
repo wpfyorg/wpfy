@@ -77,6 +77,12 @@ export async function render(ctx, domain) {
           });
 
           run.addEventListener("click", async () => {
+            const confirmed = await confirmAction({
+              title: "Run scheduled job now?",
+              message: `This executes the stored command ahead of schedule (${job.schedule || "unscheduled"}).`,
+              confirmLabel: "Run now",
+            });
+            if (ctx.signal.aborted || !confirmed) return;
             try {
               await withBusy(run, async () => {
                 const response = await api(`/api/sites/${encodedDomain}/cron/${encodeURIComponent(job.id)}/run`, {

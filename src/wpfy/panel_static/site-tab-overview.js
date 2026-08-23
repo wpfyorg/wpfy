@@ -1,5 +1,5 @@
-import { el, api, confirmAction, withBusy, onPanelEvent, toast, formatTime,
-         isServiceHealthy, isServiceUnknown, emptyRow } from "./panel.js";
+import { el, api, confirmAction, withBusy, onPanelEvent, toast, formatTime, emptyRow,
+         recentOverview, renderOneTime, copyText } from "./panel.js";
 
 function card(title, body) {
   return el("div", { class: "card mb-3" },
@@ -51,10 +51,12 @@ function renderHealth(health) {
 }
 
 function renderFacts(site) {
+  // Domain and Site UID live in Connection details now; they describe where the
+  // site is reached, not what it is made of.
   const facts = [
-    ["Domain", site.domain], ["Flavor", site.flavor], ["PHP", site.php_version],
+    ["Flavor", site.flavor], ["PHP", site.php_version],
     ["SSL", site.ssl_enabled ? "Enabled" : "Disabled"], ["Page cache", site.page_cache],
-    ["Object cache", site.object_cache], ["Cache type", site.cache_type], ["Site UID", site.site_uid],
+    ["Object cache", site.object_cache], ["Cache type", site.cache_type],
     // `site.ssl` is the mode word ("enabled"/"letsencrypt"/"disabled") and
     // `site.redis` is "1"/"0" — neither is a path, and neither reads as
     // anything useful raw. SSL is already covered by ssl_enabled above.
@@ -68,16 +70,6 @@ function renderFacts(site) {
   ])));
 }
 
-function renderDiagnostics(checks) {
-  if (!checks.length) return el("p", { class: "text-secondary mb-0", text: "No diagnostics were reported." });
-  return el("div", { class: "table-responsive" }, el("table", { class: "table table-vcenter mb-0" },
-    el("thead", {}, el("tr", {}, el("th", { text: "Status" }), el("th", { text: "Check" }), el("th", { text: "Message" }))),
-    el("tbody", {}, checks.map((check) => el("tr", {},
-      el("td", { class: check.ok ? "text-green" : "text-danger", text: check.ok ? "Pass" : "Fail" }),
-      el("td", { text: check.name || "–" }),
-      el("td", { text: check.message || "–" }))))));
-}
-
 function activityRows(events) {
   if (!events.length) return [emptyRow(4, "activity", "No activity recorded yet.")];
   return events.map((event) => el("tr", {},
@@ -87,129 +79,239 @@ function activityRows(events) {
     el("td", { text: event.detail || event.actor || "–" })));
 }
 
-function serviceRows(services) {
-  if (!services.length) return [emptyRow(2, "server-2", "No services reported.")];
-  return services.map((service) => el("tr", {},
-    el("td", { class: "font-monospace", text: service.name }),
-    el("td", {}, el("span", {
-      class: `badge ${isServiceHealthy(service.status) ? "bg-green-lt text-green" : isServiceUnknown(service.status) ? "bg-secondary-lt text-secondary" : "bg-red-lt text-red"}`,
-      text: service.status || "unknown",
-    }))));
-}
+/* Runtime actions derive from the health reading instead of always offering
+   all three: a stopped or never-bootstrapped site has nothing to stop or
+   restart. `site_health` also emits `<status>-bootstrap` variants and can be
+   unreadable entirely, and every state outside the up-set offers Start only --
+   the one action that moves those states forward. */
+const RUNTIME_UP = new Set(["running", "ready", "degraded"]);
 
 export async function render(ctx, domain, site) {
   const encodedDomain = encodeURIComponent(domain);
+  const publicIp = recentOverview()?.public_ip || "";
   const healthBody = el("div", { class: "text-secondary", text: "Loading health…" });
-  const diagnosticsBody = el("div", { class: "text-secondary", text: "Loading diagnostics…" });
   const activityBody = el("tbody", {});
-  const healthCard = card("Health", healthBody);
-  const factsCard = card("Site facts", renderFacts(site));
-  const diagnosticsCard = card("Diagnostics", diagnosticsBody);
-  const activityCard = card("Recent activity", el("div", { class: "table-responsive" }, el("table", { class: "table table-vcenter mb-0" },
-    el("thead", {}, el("tr", {}, el("th", { text: "Time" }), el("th", { text: "Action" }), el("th", { text: "Outcome" }), el("th", { text: "Detail" }))), activityBody)));
-  ctx.mount.append(healthCard, factsCard, diagnosticsCard);
+  const sftpBody = el("div", { class: "text-secondary", text: "Loading SFTP status…" });
+  const runtimeBody = el("div", { class: "text-secondary", text: "Loading health…" });
+  let runtimeStatus = "";
+  let sftpConnection = null;
+
+  const detailList = () => {
+    // Site managers get a 403 from /api/overview, so the SFTP status payload
+    // (site-scoped) is the authoritative source for host/port/user here.
+    const ip = publicIp || sftpConnection?.host || "";
+    return [
+      ["Domain", site.domain || domain],
+      ["IP address", ip],
+      ["Site UID", site.site_uid],
+      ["SFTP host", sftpConnection?.host || ip],
+      ["SFTP port", sftpConnection?.port],
+      ["SFTP user", sftpConnection?.user],
+    ].filter(([, value]) => value !== null && value !== undefined && value !== "");
+  };
+  const detailNode = el("dl", { class: "row mb-3" });
+  const renderDetails = () => {
+    detailNode.replaceChildren(...detailList().flatMap(([label, value]) => [
+      el("dt", { class: "col-sm-3", text: label }),
+      el("dd", { class: "col-sm-9 font-monospace text-break", text: String(value) }),
+    ]));
+  };
+  renderDetails();
+  const connectionCard = card("Connection details", el("div", {},
+    detailNode,
+    el("h3", { class: "card-title", text: "SFTP" }),
+    sftpBody));
+
+  ctx.mount.append(
+    card("Health", healthBody),
+    card("Runtime controls", runtimeBody),
+    card("Site facts", renderFacts(site)),
+    connectionCard,
+    card("Recent activity", el("div", { class: "table-responsive" }, el("table", { class: "table table-vcenter mb-0" },
+      el("thead", {}, el("tr", {}, el("th", { text: "Time" }), el("th", { text: "Action" }), el("th", { text: "Outcome" }), el("th", { text: "Detail" }))), activityBody))));
+
+  function renderRuntimeControls() {
+    const actions = RUNTIME_UP.has(String(runtimeStatus).toLowerCase()) ? ["stop", "restart"] : ["start"];
+    const buttons = actions.map((action) => el("button", {
+      type: "button",
+      class: `btn ${action === "start" ? "btn-primary" : "btn-outline-danger"}`,
+      text: action[0].toUpperCase() + action.slice(1),
+      onclick: async (event) => {
+        if (["stop", "restart"].includes(action)) {
+          const confirmed = await confirmAction({
+            title: `${action[0].toUpperCase() + action.slice(1)} site?`,
+            message: `${action[0].toUpperCase() + action.slice(1)} interrupts the live site.`,
+            confirmLabel: action[0].toUpperCase() + action.slice(1),
+          });
+          if (ctx.signal.aborted || !confirmed) return;
+        }
+        try {
+          await withBusy(event.currentTarget, async () => {
+            await api(`/api/sites/${encodedDomain}/runtime`, { method: "POST", body: { action }, signal: ctx.signal });
+            if (ctx.signal.aborted) return;
+            await refreshHealth();
+            if (ctx.signal.aborted) return;
+            toast(`Site ${action} requested.`);
+          });
+        } catch (error) {
+          if (!ctx.signal.aborted) toast(`Unable to ${action} site: ${error.message}`, true);
+        }
+      },
+    }));
+    runtimeBody.replaceChildren(el("div", { class: "d-flex flex-wrap gap-2" }, buttons));
+  }
 
   async function refreshHealth() {
     try {
       const payload = await api(`/api/sites/${encodedDomain}/health`, { signal: ctx.signal });
       if (ctx.signal.aborted) return;
+      runtimeStatus = payload.health?.status || "";
       healthBody.replaceChildren(renderHealth(payload.health || {}));
     } catch (error) {
       if (ctx.signal.aborted) return;
+      // An unreadable state must never keep stale Stop/Restart controls alive:
+      // reset to unknown so the controls degrade to Start-only.
+      runtimeStatus = "";
       healthBody.replaceChildren(errorCard(`Unable to load health: ${error.message}`));
     }
+    renderRuntimeControls();
   }
 
-  async function refreshDiagnostics() {
+  async function refreshSftp() {
     try {
-      const payload = await api(`/api/sites/${encodedDomain}/diagnostics`, { signal: ctx.signal });
+      const payload = await api(`/api/sites/${encodedDomain}/sftp`, { signal: ctx.signal });
       if (ctx.signal.aborted) return;
-      diagnosticsBody.replaceChildren(renderDiagnostics(payload.checks || []));
-    } catch (error) {
+      sftpConnection = payload.connection || null;
+      renderDetails();
+      renderSftp(payload);
+    } catch (failed) {
       if (ctx.signal.aborted) return;
-      diagnosticsBody.replaceChildren(errorCard(`Unable to load diagnostics: ${error.message}`));
+      renderSftp(failed.payload || { message: failed.message, ok: false });
     }
   }
 
-  const controls = ["start", "stop", "restart"].map((action) => el("button", {
-    type: "button",
-    class: `btn ${action === "start" ? "btn-primary" : "btn-outline-danger"}`,
-    text: action[0].toUpperCase() + action.slice(1),
-    onclick: async (event) => {
-      if (["stop", "restart"].includes(action)) {
-        const confirmed = await confirmAction({
-          title: `${action[0].toUpperCase() + action.slice(1)} site?`,
-          message: `${action[0].toUpperCase() + action.slice(1)} interrupts the live site.`,
-          confirmLabel: action[0].toUpperCase() + action.slice(1),
-        });
-        if (ctx.signal.aborted || !confirmed) return;
-      }
+  function sftpMessage(payload, fallback) {
+    return payload?.message || payload?.error || fallback;
+  }
+
+  function renderSftp(payload) {
+    const status = el("div", {
+      class: `alert alert-${payload.ok === false ? "warning" : "secondary"} mb-3`, role: "status",
+      text: sftpMessage(payload, "SFTP status is unavailable."),
+    });
+    const actionResult = el("div", { class: "mt-3" });
+
+    async function action(name, button) {
       try {
-        await withBusy(event.currentTarget, async () => {
-          await api(`/api/sites/${encodedDomain}/runtime`, { method: "POST", body: { action }, signal: ctx.signal });
+        await withBusy(button, async () => {
+          const response = await api(`/api/sites/${encodedDomain}/sftp`, {
+            method: "POST", body: { action: name }, signal: ctx.signal,
+          });
           if (ctx.signal.aborted) return;
-          await refreshHealth();
+          if (response.ok === false) throw new Error(sftpMessage(response, `Unable to ${name} SFTP.`));
+          if (response.one_time) renderOneTime(`One-time SFTP password for ${domain}`, response.one_time);
+          actionResult.replaceChildren(el("div", { class: "alert alert-success mb-0", role: "status", text: sftpMessage(response, `SFTP ${name}d.`) }));
+          await refreshSftp();
           if (ctx.signal.aborted) return;
-          toast(`Site ${action} requested.`);
+          toast(`SFTP ${name}d.`);
         });
-      } catch (error) {
-        if (!ctx.signal.aborted) toast(`Unable to ${action} site: ${error.message}`, true);
-      }
-    },
-  }));
-  const runtimeCard = card("Runtime controls", el("div", { class: "d-flex flex-wrap gap-2" }, controls));
-
-  const service = el("select", { class: "form-select", "aria-label": "Log service" },
-    el("option", { value: "", text: "All services" }),
-    ["web", "app", "db", "redis", "sftp"].map((value) => el("option", { value, text: value })));
-  const lines = el("input", { class: "form-control", type: "number", min: 1, max: 2000, value: 200, "aria-label": "Log lines" });
-  const logResult = el("div", {});
-  const loadLogs = el("button", { class: "btn btn-primary", type: "button", text: "Load logs" });
-  const logsCard = card("Logs", el("div", {},
-    el("div", { class: "row g-2 mb-3" },
-      el("div", { class: "col-md" }, service),
-      el("div", { class: "col-md-3" }, lines),
-      el("div", { class: "col-md-auto" }, loadLogs)),
-    logResult));
-
-  loadLogs.addEventListener("click", async () => {
-    let count = Number.parseInt(lines.value, 10);
-    if (!Number.isFinite(count)) count = 200;
-    const clamped = Math.min(2000, Math.max(1, count));
-    if (clamped !== count) toast(`Log lines clamped to ${clamped}.`);
-    lines.value = clamped;
-    const query = new URLSearchParams({ lines: String(clamped) });
-    if (service.value) query.set("service", service.value);
-    try {
-      await withBusy(loadLogs, async () => {
-        const payload = await api(`/api/sites/${encodedDomain}/logs?${query}`, { signal: ctx.signal });
         if (ctx.signal.aborted) return;
-        logResult.replaceChildren(el("pre", { class: "log-output mb-0", text: payload.logs || "No log output." }));
+      } catch (failed) {
+        if (ctx.signal.aborted) return;
+        actionResult.replaceChildren(errorCard(`Unable to ${name} SFTP: ${failed.message}`));
+      }
+    }
+
+    // Tri-state derived strictly from payload.enabled: true renders the
+    // connection card; false renders exactly the explanation and Enable;
+    // anything else (error, missing field) renders status only — never a
+    // guessed action set.
+    const enabled = payload.enabled === true;
+    const knownDisabled = payload.enabled === false;
+
+    if (!enabled) {
+      if (!knownDisabled) {
+        sftpBody.replaceChildren(status);
+        return;
+      }
+      const enable = el("button", { class: "btn btn-primary", type: "button", text: "Enable SFTP" });
+      enable.addEventListener("click", () => action("enable", enable));
+      sftpBody.replaceChildren(
+        el("p", { class: "text-secondary mb-2", text: "Starts a per-site SFTP container on a public port and opens the firewall rule for it." }),
+        el("div", { class: "btn-list" }, enable),
+        actionResult);
+      return;
+    }
+
+    const connection = payload.connection || {};
+    const host = connection.host || recentOverview()?.public_ip || "";
+    const port = connection.port || "";
+    const user = connection.user || "";
+    let revealed = false;
+    const passwordValue = el("code", { class: "font-monospace text-break", text: "••••••••••••" });
+    const reveal = el("button", { class: "btn btn-outline-secondary btn-sm", type: "button", text: "Show" });
+    reveal.addEventListener("click", () => {
+      revealed = !revealed;
+      passwordValue.textContent = revealed ? (payload.password || "–") : "••••••••••••";
+      reveal.textContent = revealed ? "Hide" : "Show";
+    });
+
+    const detailRow = (label, valueNode) => el("div", { class: "row mb-1" },
+      el("dt", { class: "col-sm-3", text: label }),
+      el("dd", { class: "col-sm-9" }, valueNode));
+    const details = el("dl", { class: "mb-3" },
+      detailRow("Host", el("span", { class: "font-monospace text-break", text: host || "–" })),
+      detailRow("Port", el("span", { class: "font-monospace", text: port || "–" })),
+      detailRow("Username", el("span", { class: "font-monospace", text: user || "–" })),
+      detailRow("Password", el("span", { class: "d-inline-flex align-items-center gap-2" }, passwordValue, reveal)));
+
+    // The connection string is only offered when it can be valid: every field
+    // present, and IPv6 literals bracketed so `sftp://user@::1:22` never happens.
+    const connectionFields = [host, port, user].every((value) => String(value || "").trim());
+    const uriHost = host && host.includes(":") && !host.startsWith("[") ? `[${host}]` : host;
+    const filezillaBlock = connectionFields ? (() => {
+      const uri = `sftp://${user}@${uriHost}:${port}`;
+      const copyUri = el("button", { class: "btn btn-outline-secondary btn-sm", type: "button", text: "Copy connection string" });
+      copyUri.addEventListener("click", async () => {
+        try {
+          await copyText(uri);
+          copyUri.textContent = "Copied";
+        } catch {
+          copyUri.textContent = "Copy failed";
+        }
+        window.setTimeout(() => { copyUri.textContent = "Copy connection string"; }, 2000);
       });
-    } catch (error) {
-      if (!ctx.signal.aborted) logResult.replaceChildren(errorCard(`Unable to load logs: ${error.message}`));
-    }
-  });
+      return el("div", { class: "card card-sm mb-3" },
+        el("div", { class: "card-body" },
+          el("h4", { class: "card-title", text: "Connect with FileZilla" }),
+          el("p", { class: "text-secondary mb-2", text: "Protocol: SFTP · Host and port as above · Logon Type: Normal." }),
+          el("div", { class: "d-flex align-items-center gap-2" },
+            el("code", { class: "font-monospace text-break", text: uri }), copyUri)));
+    })() : null;
 
-  // The cross-site Services page is admin-only, so this is where a site-manager
-  // sees the containers of the site they are responsible for.
-  const servicesBody = el("tbody", {});
-  const servicesCard = card("Services", el("div", { class: "table-responsive" },
-    el("table", { class: "table table-vcenter mb-0" },
-      el("thead", {}, el("tr", {}, el("th", { text: "Service" }), el("th", { text: "Status" }))),
-      servicesBody)));
+    const rotate = el("button", { class: "btn btn-outline-danger", type: "button", text: "Rotate password" });
+    rotate.addEventListener("click", async () => {
+      const confirmed = await confirmAction({
+        title: "Rotate SFTP password?",
+        message: "The existing SFTP password will stop working.",
+        confirmLabel: "Rotate password",
+      });
+      if (ctx.signal.aborted || !confirmed) return;
+      action("rotate", rotate);
+    });
+    const disable = el("button", { class: "btn btn-outline-danger", type: "button", text: "Disable" });
+    disable.addEventListener("click", async () => {
+      const confirmed = await confirmAction({
+        title: "Disable SFTP?",
+        message: "Existing SFTP access will stop working.",
+        confirmLabel: "Disable SFTP",
+      });
+      if (ctx.signal.aborted || !confirmed) return;
+      action("disable", disable);
+    });
 
-  async function refreshServices() {
-    try {
-      const payload = await api(`/api/sites/${encodedDomain}/services`, { signal: ctx.signal });
-      if (ctx.signal.aborted) return;
-      servicesBody.replaceChildren(...serviceRows(payload.services || []));
-    } catch (error) {
-      if (ctx.signal.aborted) return;
-      servicesBody.replaceChildren(el("tr", {}, el("td", {
-        colspan: 2, class: "text-danger", text: `Unable to load services: ${error.message}`,
-      })));
-    }
+    sftpBody.replaceChildren(status, details, filezillaBlock,
+      el("div", { class: "btn-list" }, rotate, disable), actionResult);
   }
 
   async function refreshActivity() {
@@ -223,10 +325,17 @@ export async function render(ctx, domain, site) {
     }
   }
 
-  ctx.mount.append(servicesCard, runtimeCard, logsCard, activityCard);
-  await Promise.all([refreshHealth(), refreshDiagnostics(), refreshServices(), refreshActivity()]);
+  await Promise.all([refreshHealth(), refreshSftp(), refreshActivity()]);
   if (ctx.signal.aborted) return;
+  // Stream events re-read activity at once and health on a short debounce, so a
+  // job's burst of completion events triggers one health re-render, not one per
+  // event -- the same shape page-services.js uses for its own refresh.
+  let healthTimer = 0;
+  ctx.onLeave(() => clearTimeout(healthTimer));
   ctx.onLeave(onPanelEvent((event) => {
-    if (!ctx.signal.aborted && event.domain === domain) refreshActivity();
+    if (ctx.signal.aborted || event.domain !== domain) return;
+    refreshActivity();
+    clearTimeout(healthTimer);
+    healthTimer = setTimeout(() => { refreshHealth(); }, 300);
   }));
 }

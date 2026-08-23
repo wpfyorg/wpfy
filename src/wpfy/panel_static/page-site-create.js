@@ -1,12 +1,9 @@
-import { el, api, withBusy, pollJob, renderOneTime, stepText, registerPage } from "./panel.js";
+import { el, api, withBusy, pollJob, stepText, registerPage, recentOverview } from "./panel.js";
 
 const STORAGE_KEY = "wpfy.site-create";
 const WORDPRESS_FLAVORS = new Set(["wp", "wpfc", "wpredis", "wpsc", "wprocket", "wpce", "wpsubdir", "wpsubdomain"]);
 const FLAVORS = [
-  ["php", "PHP"], ["html", "Static HTML"], ["wp", "WordPress"], ["wpfc", "WordPress + FastCGI cache"],
-  ["wpredis", "WordPress + Redis"], ["wpsc", "WordPress + WP Super Cache"], ["wprocket", "WordPress + WP Rocket"],
-  ["wpce", "WordPress + Cache Enabler"], ["wpsubdir", "WordPress multisite (subdirectory)"],
-  ["wpsubdomain", "WordPress multisite (subdomain)"],
+  ["wp", "WordPress"], ["php", "PHP"], ["html", "Static HTML"],
 ];
 const PHP_VERSIONS = ["", "7.4", "8.0", "8.1", "8.2", "8.3", "8.4"];
 const PAGE_CACHES = [
@@ -24,6 +21,9 @@ const DEFAULT_STATE = {
   page_cache: "none",
   admin_user: "",
   admin_email: "",
+  admin_password: "",
+  wp_version: "",
+  multisite: "no",
 };
 
 function isWordPress(state) {
@@ -43,6 +43,9 @@ function restoredState() {
       dns_provider: stored.dns_provider === "cloudflare" ? "cloudflare" : DEFAULT_STATE.dns_provider,
       object_cache: ["none", "redis"].includes(stored.object_cache) ? stored.object_cache : DEFAULT_STATE.object_cache,
       page_cache: PAGE_CACHES.some(([value]) => value === stored.page_cache) ? stored.page_cache : DEFAULT_STATE.page_cache,
+      admin_password: typeof stored.admin_password === "string" ? stored.admin_password : "",
+      wp_version: typeof stored.wp_version === "string" ? stored.wp_version : "",
+      multisite: stored.multisite === "yes" ? "yes" : "no",
       enable_sftp: stored.enable_sftp === true,
     };
   } catch {
@@ -66,6 +69,123 @@ function domainError(value) {
 
 function emailError(value) {
   return value && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value) ? "Enter a valid admin email address." : "";
+}
+
+/* Client-side stand-in for the server's generated secret: filling the field
+   lets the operator see (and keep) what will be sent, while a blank field
+   still defers to the server-side generator. */
+function generatedPassword(length = 16) {
+  const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789";
+  const random = crypto.getRandomValues(new Uint32Array(length));
+  return Array.from(random, (value) => alphabet[value % alphabet.length]).join("");
+}
+
+/* panel.js keeps its clipboard helper private, so repeat the same
+   async-API-first fallback here: the panel may be served over plain HTTP on a
+   LAN address, where navigator.clipboard does not exist. */
+async function copyText(text) {
+  try {
+    await navigator.clipboard.writeText(text);
+    return;
+  } catch {
+    /* fall through to execCommand */
+  }
+  const area = el("textarea", { class: "visually-hidden", "aria-hidden": "true" });
+  area.value = text;
+  document.body.append(area);
+  area.focus();
+  area.select();
+  let copied = false;
+  try {
+    copied = document.execCommand("copy");
+  } finally {
+    area.remove();
+  }
+  if (!copied) throw new Error("Clipboard unavailable.");
+}
+
+function credentialValue(value) {
+  return value === undefined || value === null || value === "" ? "—" : String(value);
+}
+
+function credentialRow(label, value, href = null) {
+  const status = el("span", { class: "text-secondary small flex-shrink-0" });
+  const display = href
+    ? el("a", { class: "font-monospace text-break", href, target: "_blank", rel: "noopener noreferrer", text: value })
+    : el("span", { class: "font-monospace text-break", text: value });
+  const row = el("div", {
+    class: "list-group-item list-group-item-action d-flex justify-content-between align-items-center gap-3",
+    role: "button", tabindex: 0,
+  }, el("span", { class: "d-flex gap-2 flex-wrap" },
+    el("span", { class: "text-secondary", text: `${label}:` }), display), status);
+  const copy = async () => {
+    try {
+      await copyText(value);
+      status.textContent = "Copied";
+    } catch {
+      status.textContent = "Copy failed";
+    }
+    window.setTimeout(() => { status.textContent = ""; }, 2000);
+  };
+  row.addEventListener("click", (event) => {
+    if (event.target.closest("a")) return;
+    void copy();
+  });
+  row.addEventListener("keydown", (event) => {
+    if (event.key !== "Enter" && event.key !== " ") return;
+    event.preventDefault();
+    void copy();
+  });
+  return row;
+}
+
+/* The create job hands credentials back exactly once. Group them so the
+   operator can copy one value or take the whole block in a single click.
+   Payload keys arrive flat; anything the running backend does not send yet
+   renders as an em dash rather than "undefined". */
+function credentialsBlock(domain, oneTime, fallback, scheme = "https") {
+  const url = `${scheme}://${domain}`;
+  const sections = [
+    ["Site", [
+      ["URL", url, url],
+      ["SFTP host", credentialValue(oneTime.sftp_host || recentOverview()?.public_ip)],
+      ["SFTP port", credentialValue(oneTime.sftp_port)],
+      ["Site user", credentialValue(oneTime.sftp_user)],
+      ["Password", credentialValue(oneTime.sftp_password)],
+    ]],
+    ["Database", [
+      ["Host", credentialValue(oneTime.db_host)],
+      ["Port", credentialValue(oneTime.db_port)],
+      ["Name", credentialValue(oneTime.db_name)],
+      ["User", credentialValue(oneTime.db_user)],
+      ["Password", credentialValue(oneTime.db_password)],
+    ]],
+    ["WordPress", [
+      ["Admin email", credentialValue(oneTime.admin_email ?? fallback.adminEmail)],
+      ["Admin user", credentialValue(oneTime.admin_user ?? fallback.adminUser)],
+      ["Admin password", credentialValue(oneTime.wordpress_admin_password ?? fallback.adminPassword)],
+      ["wp-admin URL", `${url}/wp-admin`, `${url}/wp-admin`],
+    ]],
+  ];
+  const copyAllText = sections
+    .map(([title, rows]) => [title, ...rows.map(([label, value]) => `${label}: ${value}`)].join("\n"))
+    .join("\n\n");
+  const copyAll = el("button", { class: "btn btn-outline-primary btn-sm flex-shrink-0", type: "button", text: "Copy all" });
+  copyAll.addEventListener("click", async () => {
+    try {
+      await copyText(copyAllText);
+      copyAll.textContent = "Copied";
+    } catch {
+      copyAll.textContent = "Copy failed";
+    }
+    window.setTimeout(() => { copyAll.textContent = "Copy all"; }, 2000);
+  });
+  return el("div", { class: "mt-3" },
+    el("div", { class: "alert alert-warning d-flex justify-content-between align-items-center gap-3", role: "alert" },
+      el("span", { text: "These credentials are shown once. Copy them before continuing." }), copyAll),
+    sections.map(([title, rows]) => el("section", { class: "mb-3" },
+      el("h4", { class: "mb-2", text: title }),
+      el("div", { class: "list-group" }, rows.map(([label, value, href]) => credentialRow(label, value, href))))));
 }
 
 function inputField(label, input, errorNode = null) {
@@ -172,7 +292,7 @@ registerPage("site-create", (ctx) => {
         el("p", { class: "text-secondary", text: "Choose the domain and runtime for this site." }),
         el("div", { class: "row g-3" },
           inputField("Domain", domain, domainMessage),
-          inputField("Flavor", flavor),
+          inputField("Stack", flavor),
           inputField("PHP version", php))),
       footer(el("span"), next));
   }
@@ -204,6 +324,23 @@ registerPage("site-create", (ctx) => {
         value: state.admin_email, "aria-describedby": "site-create-admin-email-error",
       });
       const adminEmailMessage = el("div", { id: "site-create-admin-email-error", class: "invalid-feedback d-block", text: errors.admin_email || "" });
+      const adminPassword = el("input", {
+        id: "site-create-admin-password", class: "form-control", type: "password",
+        autocomplete: "new-password", value: state.admin_password,
+      });
+      const generate = el("button", { id: "site-create-generate-password", class: "btn btn-outline-secondary", type: "button", text: "Generate" });
+      const wpVersion = el("input", {
+        id: "site-create-wp-version", class: "form-control", type: "text", autocomplete: "off",
+        placeholder: "latest", value: state.wp_version,
+      });
+      const multisite = el("select", { id: "site-create-multisite", class: "form-select" }, selectOptions([["no", "No"], ["yes", "Yes"]], state.multisite));
+      generate.addEventListener("click", () => {
+        adminPassword.value = generatedPassword();
+        update("admin_password", adminPassword.value);
+      });
+      adminPassword.addEventListener("input", () => update("admin_password", adminPassword.value));
+      wpVersion.addEventListener("input", () => update("wp_version", wpVersion.value));
+      multisite.addEventListener("change", () => update("multisite", multisite.value));
       objectCache.addEventListener("change", () => update("object_cache", objectCache.value));
       pageCache.addEventListener("change", () => update("page_cache", pageCache.value));
       adminUser.addEventListener("input", () => update("admin_user", adminUser.value));
@@ -211,7 +348,20 @@ registerPage("site-create", (ctx) => {
         update("admin_email", adminEmail.value);
         liveError("admin_email", emailError(adminEmail.value.trim()), adminEmail, adminEmailMessage);
       });
-      fields.push(inputField("Object cache", objectCache), inputField("Page cache", pageCache), inputField("Admin username", adminUser), inputField("Admin email", adminEmail, adminEmailMessage));
+      fields.push(
+        inputField("Object cache", objectCache), inputField("Page cache", pageCache),
+        inputField("Admin username", adminUser),
+        el("div", { class: "col-md-6" },
+          el("label", { class: "form-label", for: adminPassword.id, text: "Admin password" }),
+          el("div", { class: "d-flex gap-2" }, adminPassword, generate),
+          el("div", { class: "form-text", text: "Leave blank to generate. Shown once after creation." })),
+        inputField("Admin email", adminEmail, adminEmailMessage),
+        el("div", { class: "col-md-6" },
+          el("label", { class: "form-label", for: wpVersion.id, text: "WordPress version" }), wpVersion,
+          el("div", { class: "form-text", text: "Blank downloads the latest release." })),
+        el("div", { class: "col-md-6" },
+          el("label", { class: "form-label", for: multisite.id, text: "Multisite" }), multisite,
+          el("div", { class: "form-text", text: "Network setup is not automated yet; selecting Yes creates a subdirectory single site." })));
     }
     const back = el("button", { class: "btn", type: "button", text: "Back" });
     const next = el("button", { class: "btn btn-primary", type: "button", text: "Review" });
@@ -246,6 +396,9 @@ registerPage("site-create", (ctx) => {
         ...(state.page_cache !== "none" ? { page_cache: state.page_cache } : {}),
         ...(state.admin_user.trim() ? { admin_user: state.admin_user.trim() } : {}),
         ...(state.admin_email.trim() ? { admin_email: state.admin_email.trim() } : {}),
+        ...(state.admin_password ? { admin_password: state.admin_password } : {}),
+        ...(state.wp_version.trim() ? { wp_version: state.wp_version.trim() } : {}),
+        multisite: state.multisite === "yes" ? "yes" : "no",
       } : {}),
     };
     return dryRun ? { ...body, dry_run: true } : body;
@@ -253,13 +406,15 @@ registerPage("site-create", (ctx) => {
 
   function reviewRows() {
     const entries = [
-      ["Domain", summaryValue(state.domain)], ["Flavor", FLAVORS.find(([value]) => value === state.flavor)?.[1] || state.flavor],
+      ["Domain", summaryValue(state.domain)], ["Stack", FLAVORS.find(([value]) => value === state.flavor)?.[1] || state.flavor],
       ["PHP version", summaryValue(state.php_version)], ["SSL", state.letsencrypt === "default" ? "Let's Encrypt" : state.letsencrypt === "wildcard" ? "Let's Encrypt wildcard" : "Off"],
       ["SFTP", state.enable_sftp ? "Enabled" : "Off"],
     ];
     if (state.letsencrypt === "wildcard") entries.push(["DNS provider", state.dns_provider]);
     if (isWordPress(state)) entries.push(
       ["Object cache", state.object_cache], ["Page cache", state.page_cache], ["Admin username", summaryValue(state.admin_user)], ["Admin email", summaryValue(state.admin_email)],
+      ["Admin password", state.admin_password ? "Provided" : "Generated on the server"],
+      ["WordPress version", summaryValue(state.wp_version, "latest")], ["Multisite", state.multisite === "yes" ? "Yes" : "No"],
     );
     return entries.flatMap(([label, value]) => [el("dt", { class: "col-sm-4 text-secondary", text: label }), el("dd", { class: "col-sm-8", text: value })]);
   }
@@ -361,13 +516,21 @@ registerPage("site-create", (ctx) => {
     ].filter(Boolean);
     const again = el("button", { class: "btn btn-outline-primary", type: "button", text: "Create another site" });
     again.addEventListener("click", () => { state = { ...DEFAULT_STATE }; errors = {}; step = 1; render(); });
-    card.replaceChildren(el("div", { class: "card-body" },
+    // Credentials are shown exactly once and belong on the success card itself.
+    const body = el("div", { class: "card-body" },
       el("div", { class: "alert alert-success", role: "status" }, el("strong", { text: "Site created. " }), el("span", { text: `${domain} is ready to manage.` })),
       el("h3", { class: "card-title", text: domain }),
       facts.length ? el("div", { class: "text-secondary mb-3" }, facts) : null,
       el("div", { class: "d-flex flex-wrap gap-2" },
-        el("a", { class: "btn btn-primary", href: `/site/${encodeURIComponent(domain)}/overview`, dataset: { route: "true" }, text: "Manage site" }), again)));
-    if (job.one_time) renderOneTime("Save these credentials now", job.one_time);
+        el("a", { class: "btn btn-primary", href: `/site/${encodeURIComponent(domain)}/overview`, dataset: { route: "true" }, text: "Manage site" }), again));
+    if (job.one_time) {
+      body.append(credentialsBlock(domain, job.one_time, {
+        adminUser: state.admin_user.trim() || "admin",
+        adminEmail: state.admin_email.trim() || `admin@${domain}`,
+        adminPassword: state.admin_password,
+      }, state.letsencrypt === "off" ? "http" : "https"));
+    }
+    card.replaceChildren(body);
   }
 
   function renderFailure(message) {

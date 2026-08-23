@@ -12,6 +12,7 @@ from .site_layout import (
     backup_site,
     bootstrap_site_files,
     ensure_site_scaffold,
+    generated_secret,
     provision_wordpress_site,
     remove_site_scaffold,
     site_info,
@@ -22,7 +23,13 @@ from .site_runtime import RuntimeResult, compose_command, start_site_runtime, st
 from .events import record_event
 from .certificate_lifecycle import preflight_ssl
 from .dns import DNSConfigError, load_cloudflare_config
-from .site_definition import DNS_PROVIDERS, LETSENCRYPT_MODES, LEGACY_CACHE_FLAVORS, MYSQL_FLAVORS, WORDPRESS_FLAVORS
+from .site_definition import (
+    DNS_PROVIDERS,
+    LETSENCRYPT_MODES,
+    LEGACY_CACHE_FLAVORS,
+    MYSQL_FLAVORS,
+    WORDPRESS_FLAVORS,
+)
 from .traefik import acme_email_problem
 
 
@@ -32,6 +39,32 @@ class WordPressCredentials:
     email: str
     password: str
     password_generated: bool = False
+
+
+def resolve_wp_admin_credentials(
+    user: str | None,
+    email: str | None,
+    password: str | None,
+    *,
+    domain: str,
+) -> WordPressCredentials:
+    """Shared CLI/panel credential resolution: blank means generate.
+
+    The panel must not import the CLI (ADR 0010), and both surfaces need the
+    same contract -- a caller-supplied password is used exactly as-is and never
+    shown again; only None or the empty string means "generate".
+    """
+    generated = False
+    resolved_password = password
+    if resolved_password is None or resolved_password == "":
+        resolved_password = generated_secret()
+        generated = True
+    return WordPressCredentials(
+        user=(user or "").strip() or "admin",
+        email=(email or "").strip() or f"admin@{domain}",
+        password=resolved_password,
+        password_generated=generated,
+    )
 
 
 @dataclass(frozen=True)
@@ -44,6 +77,11 @@ class CreateSiteRequest:
     letsencrypt: str | None = None
     dns_provider: str | None = None
     proxied_override: bool | None = None
+    wp_version: str | None = None
+    multisite: bool = False
+    # Carried for contract completeness; resolution stays at the caller via
+    # resolve_wp_admin_credentials so the value never needs repr/logging here.
+    admin_password: str | None = None
 
 
 @dataclass(frozen=True)
@@ -224,6 +262,21 @@ def create_site(
     preflight_message: str | None = None
     letsencrypt = None if request.letsencrypt == "off" else request.letsencrypt
 
+    # Multisite selection reuses the existing subdirectory flavor; actual
+    # network provisioning is not automated yet (see the TODO at the install
+    # call site in site_layout). Legacy cache flavors must collapse to their
+    # page/object-cache defaults BEFORE the remap, or wpredis+multisite would
+    # silently lose the Redis integration the operator picked.
+    flavor = request.flavor
+    page_cache = request.page_cache
+    object_cache = request.object_cache
+    if request.multisite and flavor in WORDPRESS_FLAVORS:
+        if flavor in LEGACY_CACHE_FLAVORS:
+            legacy_page_cache, legacy_object_cache = LEGACY_CACHE_FLAVORS[flavor]
+            page_cache = page_cache if page_cache != "none" else legacy_page_cache
+            object_cache = object_cache if object_cache != "none" else legacy_object_cache
+        flavor = "wpsubdir"
+
     if letsencrypt:
         report("preflight")
         _require_acme_email()
@@ -236,9 +289,9 @@ def create_site(
 
     spec = _site_spec(
         domain=request.domain,
-        flavor=request.flavor,
-        page_cache=request.page_cache,
-        object_cache=request.object_cache,
+        flavor=flavor,
+        page_cache=page_cache,
+        object_cache=object_cache,
         php_version=request.php_version,
         letsencrypt=letsencrypt,
         dns_provider=request.dns_provider,
@@ -307,6 +360,7 @@ def create_site(
                 admin.user,
                 admin.email,
                 admin.password,
+                wp_version=request.wp_version,
             )
             wordpress_message = provision.message
             exit_code = provision.exit_code

@@ -4,16 +4,24 @@ const TABS = [
   ["overview", "Overview"],
   ["settings", "Settings"],
   ["data", "Data"],
-  ["access", "Access"],
-  ["automation", "Automation"],
+  ["file-manager", "File Manager"],
+  ["cron", "Cron"],
+  ["logs", "Logs"],
+  ["diagnostics", "Diagnostics"],
+  ["services", "Services"],
+  ["wp-cli", "WP-CLI"],
 ];
 
 const TAB_MODULES = {
   overview: () => import("./site-tab-overview.js"),
   settings: () => import("./site-tab-settings.js"),
   data: () => import("./site-tab-data.js"),
-  access: () => import("./site-tab-access.js"),
-  automation: () => import("./site-tab-automation.js"),
+  "file-manager": () => import("./site-tab-file-manager.js"),
+  cron: () => import("./site-tab-cron.js"),
+  logs: () => import("./site-tab-logs.js"),
+  diagnostics: () => import("./site-tab-diagnostics.js"),
+  services: () => import("./site-tab-services.js"),
+  "wp-cli": () => import("./site-tab-wpcli.js"),
 };
 
 function card(title, message, action = null) {

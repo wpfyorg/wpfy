@@ -96,14 +96,14 @@ export async function render(ctx, domain, site) {
   acknowledge.addEventListener("change", syncActions);
 
   const configPhp = el("input", { class: "form-control", value: site.php_version || "", "aria-label": "PHP version" });
-  const configFlavor = el("input", { class: "form-control", value: site.flavor || "", "aria-label": "Flavor" });
+  const configFlavor = el("input", { class: "form-control", value: site.flavor || "", "aria-label": "Stack" });
   const configSsl = el("input", { class: "form-check-input", type: "checkbox", checked: site.ssl_enabled || site.letsencrypt === "default" || site.letsencrypt === "wildcard" });
   const sslStatus = el("div", { class: "mt-3" });
   const preflight = el("button", { class: "btn btn-outline-secondary btn-sm", type: "button", text: "Check SSL preflight" });
   const configCard = card("Config", el("div", {},
     el("div", { class: "row g-3" },
       el("div", { class: "col-md-4" }, el("label", { class: "form-label", text: "PHP version" }), configPhp),
-      el("div", { class: "col-md-4" }, el("label", { class: "form-label", text: "Flavor" }), configFlavor),
+      el("div", { class: "col-md-4" }, el("label", { class: "form-label", text: "Stack" }), configFlavor),
       el("div", { class: "col-md-4 d-flex align-items-end" }, el("label", { class: "form-check" }, configSsl,
         el("span", { class: "form-check-label", text: "Enable Let's Encrypt" })))),
     el("div", { class: "mt-3" }, preflight), sslStatus));

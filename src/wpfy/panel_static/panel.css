@@ -98,6 +98,17 @@
   height: auto;
 }
 
+/* Setup step rail: Tabler draws .steps with a left rule and inset that suit a
+   nested list, not the standalone counter rail above the setup card — drop
+   them and centre the rail under the card title. */
+.steps {
+  border-left: 0;
+  margin-left: 0;
+  padding-left: 0;
+  margin-bottom: 1.5rem;
+  justify-content: center;
+}
+
 /* Metric charts: the canvas is sized by its container, so it needs a height. */
 .chart-canvas {
   width: 100%;

@@ -29,6 +29,8 @@ def run_systemctl(command: list[str]) -> RuntimeResult:
 
 
 def install_units(units: Mapping[Path, str], timer_names: Sequence[str], success_message: str) -> RuntimeResult:
+    if os.environ.get("WPFY_SKIP_RUNTIME") == "1":
+        return RuntimeResult(0, "skipped by WPFY_SKIP_RUNTIME", skipped=True)
     try:
         systemd_dir().mkdir(parents=True, exist_ok=True)
         for path, content in units.items():

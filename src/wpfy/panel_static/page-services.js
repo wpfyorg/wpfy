@@ -111,7 +111,7 @@ registerPage("services", async (ctx) => {
     const summary = failed ? `${running} of ${services.length} running`
       : unknown ? `${services.length} service${services.length === 1 ? "" : "s"}, status unknown`
       : `${running} service${running === 1 ? "" : "s"} running`;
-    return el("div", { class: `card mb-3 ${failed ? "border-start border-danger border-4" : unknown ? "border-start border-warning border-4" : ""}` },
+    return el("div", { class: "card mb-3" },
       el("div", { class: "card-header d-block" },
         el("div", { class: "d-flex align-items-center gap-2" },
           failed

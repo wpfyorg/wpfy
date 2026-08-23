@@ -4,6 +4,7 @@ import ipaddress
 import os
 from pathlib import Path
 import re
+import stat
 import tempfile
 from urllib.parse import urlsplit
 
@@ -201,21 +202,43 @@ def _write_router(content: str) -> None:
         temporary.unlink(missing_ok=True)
 
 
-def _has_totp_user() -> bool:
-    return any(user.get("totp_enabled") is True for user in panel_auth.list_users())
+def _install_prerequisites(domain) -> list[str]:
+    """Best-effort host prerequisites for a publicly exposed panel.
+
+    ufw and fail2ban are installed (idempotently), and the wpfy cron timers are
+    put in place. Every step is recorded as an event and every failure is
+    returned as a WARN line instead of failing the exposure: a VPS without
+    network access to the apt mirrors must still be able to expose its panel.
+    """
+    from . import cron, events, firewall_ports
+    from .fail2ban_host import ensure_fail2ban_host
+
+    steps = (
+        ("ufw", "panel.expose.ufw", firewall_ports.install_ufw),
+        ("fail2ban", "panel.expose.fail2ban", ensure_fail2ban_host),
+        ("cron timers", "panel.expose.cron-timers", cron.install_timers),
+    )
+    warnings: list[str] = []
+    for label, action, step in steps:
+        try:
+            result = step()
+        except (OSError, RuntimeError, TypeError, ValueError) as exc:
+            outcome, detail = "failed", str(exc)
+        else:
+            outcome, detail = ("ok" if result.exit_code == 0 else "failed"), result.message
+        events.record_event(action, domain=domain, outcome=outcome, detail=detail)
+        if outcome != "ok":
+            warnings.append(f"WARN {label}: {detail}")
+    return warnings
 
 
-def expose(domain, *, confirm, port=DEFAULT_PANEL_PORT) -> RuntimeResult:
+def expose(domain, *, confirm, port=DEFAULT_PANEL_PORT, no_install=False) -> RuntimeResult:
     try:
         if not isinstance(domain, str):
             raise TypeError("panel domain must be a string")
         validate_domain(domain)
         if confirm != domain:
             return RuntimeResult(2, f"confirmation must exactly match {domain}")
-        if not panel_auth.login_required():
-            return RuntimeResult(2, "panel exposure requires named-user login; the run token is still active")
-        if not _has_totp_user():
-            return RuntimeResult(2, "panel exposure requires at least one TOTP-enabled user")
         preflight = certificate_lifecycle.preflight_ssl(domain)
         if not preflight.passed:
             return RuntimeResult(2, preflight.message)
@@ -227,6 +250,8 @@ def expose(domain, *, confirm, port=DEFAULT_PANEL_PORT) -> RuntimeResult:
         email_problem = traefik.acme_email_problem()
         if email_problem:
             return RuntimeResult(2, email_problem)
+
+        prerequisite_warnings = [] if no_install else _install_prerequisites(domain)
 
         if not traefik.runtime_skip_requested() and traefik.docker_available():
             pull_result = traefik._pull_traefik_image()
@@ -249,17 +274,32 @@ def expose(domain, *, confirm, port=DEFAULT_PANEL_PORT) -> RuntimeResult:
     except (OSError, RuntimeError, TypeError, ValueError) as exc:
         return RuntimeResult(2, str(exc))
     if service_path.exists():
-        return RuntimeResult(
-            0,
-            f"panel router and service configured for https://{domain}; verify the public URL",
-            ran=True,
-        )
-    state = "already configured" if unchanged else "configured"
-    return RuntimeResult(
-        0,
-        f"panel router {state} for https://{domain}; required next: wpfy panel service install",
-        ran=True,
-    )
+        lines = [f"panel router and service configured for https://{domain}; verify the public URL"]
+    else:
+        state = "already configured" if unchanged else "configured"
+        lines = [f"panel router {state} for https://{domain}; required next: wpfy panel service install"]
+    lines.extend(_setup_link_lines(domain))
+    lines.extend(prerequisite_warnings)
+    return RuntimeResult(0, "\n".join(lines), ran=True)
+
+
+def _setup_link_lines(domain) -> list[str]:
+    """The one-time setup grant for a panel with no account yet.
+
+    A fresh host has no panel user, so the exposed domain would print a sign-in
+    instruction that cannot be satisfied. Mirror the domainless mode: mint a
+    single-use setup secret and hand the operator its link. The secret lives
+    only in this returned message -- never in events or logs.
+    """
+    from . import panel_setup
+
+    if panel_auth.login_required():
+        return []
+    secret = panel_setup.issue_setup_secret()
+    return [
+        f"no panel account exists yet; open https://{domain}/#setup={secret} to create it "
+        f"(single-use, expires in {panel_setup.SETUP_SECRET_TTL_SECONDS // 60} minutes)",
+    ]
 
 
 def _router_details() -> dict | None:
@@ -342,8 +382,6 @@ def install_service(host, port) -> RuntimeResult:
         content = panel_service_content(host, port)
         if not exposure_status()["exposed"]:
             return RuntimeResult(2, "expose the panel router before installing the panel service")
-        if not panel_auth.login_required() or not _has_totp_user():
-            return RuntimeResult(2, "panel service requires named-user login and an enrolled TOTP factor")
     except (OSError, RuntimeError, TypeError, ValueError) as exc:
         return RuntimeResult(2, str(exc))
 
@@ -393,6 +431,15 @@ def disable() -> RuntimeResult:
 DOMAINLESS_PANEL_PORT = 3939
 
 
+def display_host(host: str) -> str:
+    """Bracket IPv6 addresses for use inside a URL; leave everything else."""
+    try:
+        address = ipaddress.ip_address(str(host))
+    except ValueError:
+        return str(host)
+    return f"[{address}]" if address.version == 6 else str(address)
+
+
 def public_bind_address() -> str:
     """The address a domainless panel should listen on.
 
@@ -429,7 +476,8 @@ def domainless_status() -> dict:
     }
 
 
-def expose_without_domain(*, confirm: object, port: int = DOMAINLESS_PANEL_PORT) -> RuntimeResult:
+def expose_without_domain(*, confirm: object, port: int = DOMAINLESS_PANEL_PORT,
+                          no_install: bool = False) -> RuntimeResult:
     """Prepare a public, self-signed, domainless panel.
 
     Returns the URL to open and the certificate fingerprint to check against the
@@ -449,12 +497,14 @@ def expose_without_domain(*, confirm: object, port: int = DOMAINLESS_PANEL_PORT)
     except RuntimeError as exc:
         return RuntimeResult(2, str(exc))
 
+    prerequisite_warnings = [] if no_install else _install_prerequisites(None)
+
     try:
         certificate = panel_tls.ensure_self_signed(host)
     except (OSError, RuntimeError, ValueError) as exc:
         return RuntimeResult(2, str(exc))
 
-    url = f"https://{host}:{port}/"
+    url = f"https://{display_host(host)}:{port}/"
     lines = [
         f"panel: {url}",
         f"certificate fingerprint (SHA-256): {certificate.fingerprint}",
@@ -487,6 +537,7 @@ def expose_without_domain(*, confirm: object, port: int = DOMAINLESS_PANEL_PORT)
 
     start = "wpfy panel --public" + (f" --port {port}" if port != DOMAINLESS_PANEL_PORT else "")
     lines.append(f"start the panel with: {start}")
+    lines.extend(prerequisite_warnings)
     return RuntimeResult(0, "\n".join(lines), ran=True)
 
 
@@ -527,6 +578,46 @@ def panel_basic_auth_status() -> dict:
     }
 
 
+def panel_basic_auth_enforcement() -> str:
+    """What actually gates the public domain right now?
+
+    enforced  a recognized router's basicAuth middleware carries exactly the
+              stored credential
+    staged    a credential is stored, and verifiably nothing enforces it --
+              no router file at all, or a recognized router without
+              basicAuth middleware
+    stale     a recognized router enforces a DIFFERENT credential than the
+              one stored here -- or enforces one while nothing is stored
+              (orphaned). The old prompt is still live either way; the
+              operator must rotate or disable to take over.
+    unknown   a router exists but wpfy cannot attribute it to itself
+              (unreadable, malformed, or unrecognized), so enforcement can
+              be verified neither way; an unmanaged router may be prompting
+    off       nothing stored and verifiably no middleware anywhere
+
+    Derived from the router's own rendered content, never from intent: the
+    UI must not claim the public domain is guarded -- or unguarded -- when
+    disk says otherwise.
+    """
+    stored_line = read_panel_basic_auth()
+    try:
+        text = panel_router_path().read_text(encoding="utf-8")
+    except FileNotFoundError:
+        text = None
+    except (OSError, UnicodeError):
+        return "unknown"
+    if text is None:
+        return "staged" if stored_line else "off"
+    if _router_details() is None:
+        return "unknown"
+    found = _BASIC_AUTH_USER_RE.search(text)
+    if found is None:
+        return "staged" if stored_line else "off"
+    if stored_line and found.group(1) == stored_line:
+        return "enforced"
+    return "stale"
+
+
 def set_panel_basic_auth(username: str, password: str) -> RuntimeResult:
     """Store a credential for the public router. The password is not kept."""
     # APR1, not the sha512crypt `_htpasswd_hash` the per-site gate uses. That
@@ -561,19 +652,59 @@ def set_panel_basic_auth(username: str, password: str) -> RuntimeResult:
 
 
 def clear_panel_basic_auth() -> RuntimeResult:
+    # Convergent disable: the credential file is removed only after its bytes
+    # and mode are captured, and a failed router rewrite restores both so disk
+    # state matches the still-enforced router. A retry where the file is
+    # already gone but the router is stale still rewrites the router -- the
+    # previous version returned "not configured" and never repaired it.
     path = panel_basic_auth_path()
     try:
-        path.unlink()
+        previous = path.read_bytes()
+        previous_mode = stat.S_IMODE(path.stat().st_mode)
     except FileNotFoundError:
-        return RuntimeResult(0, "panel basic auth was not configured", ran=False)
+        previous = None
+        previous_mode = None
     except OSError as exc:
         return RuntimeResult(1, str(exc))
+
+    if previous is not None:
+        try:
+            path.unlink()
+        except OSError as exc:
+            return RuntimeResult(1, str(exc))
 
     status = exposure_status()
     if status.get("exposed") and status.get("domain"):
         refreshed = _rewrite_router(status["domain"], status.get("target_host"), status.get("target_port"))
         if refreshed.exit_code != 0:
+            if previous is not None:
+                try:
+                    path.write_bytes(previous)
+                    os.chmod(path, previous_mode)
+                except OSError as exc:
+                    return RuntimeResult(
+                        refreshed.exit_code,
+                        f"{refreshed.message}; credential restore also failed ({exc}) -- run disable again to converge",
+                    )
             return refreshed
+    elif status.get("exposed") and not status.get("domain"):
+        # The panel is published but wpfy does not recognize the router that
+        # serves it, so basic auth may still be enforced out-of-band. Removing
+        # the credential here would report success while the prompt survives.
+        if previous is not None:
+            try:
+                path.write_bytes(previous)
+                os.chmod(path, previous_mode)
+            except OSError as exc:
+                return RuntimeResult(1, f"credential restore failed ({exc}) -- run disable again to converge")
+        return RuntimeResult(
+            1,
+            "panel is exposed but no managed router was recognized; "
+            "basic auth stays configured -- resolve the router manually, then disable again",
+        )
+    elif previous is None:
+        # Nothing was configured and there is no router to repair.
+        return RuntimeResult(0, "panel basic auth was not configured", ran=False)
     return RuntimeResult(0, "panel basic auth removed", ran=True)
 
 

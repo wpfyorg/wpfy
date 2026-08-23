@@ -4,10 +4,12 @@ The rest of the firewall surface (``fail2ban_host``/``fail2ban_docker``) reacts
 to behaviour: it bans an address that already got in and misbehaved. This module
 covers the other half -- which ports accept a connection at all.
 
-``ufw`` is not a dependency wpfy installs on its own. ``install.sh`` takes an
-opt-in ``--ufw`` flag; if the operator did not use it, every read here reports
-``installed=False`` and every mutation refuses with the exact command to run.
-Nothing is installed behind the operator's back.
+wpfy installs ``ufw`` itself rather than leaving it to the operator:
+:func:`install_ufw` runs during ``wpfy panel expose`` (unless the caller passes
+``--no-install``) and from ``wpfy stack install --ufw``. It is idempotent --
+when the binary is already present it reports a skipped success instead of
+reaching for apt. fail2ban is ensured by :mod:`wpfy.fail2ban_host` on the same
+paths.
 
 Lockout is the failure mode that matters. A rule set that drops SSH cannot be
 repaired from the panel, because the panel is reached over the connection the
@@ -125,6 +127,36 @@ def _skip_runtime() -> bool:
 
 def ufw_available() -> bool:
     return shutil.which(_ufw_binary()) is not None
+
+
+def _apt_install(package: str, *, timeout: int = 300) -> RuntimeResult:
+    """Install a Debian package. The caller decides whether that is wanted."""
+    try:
+        proc = subprocess.run(
+            ["apt-get", "-o", "DPkg::Lock::Timeout=300", "install", "-y", package],
+            check=False, capture_output=True, text=True, timeout=timeout,
+            env={**os.environ, "DEBIAN_FRONTEND": "noninteractive"},
+        )
+    except FileNotFoundError:
+        return RuntimeResult(127, "apt-get is not available on this host")
+    except subprocess.TimeoutExpired:
+        return RuntimeResult(1, f"apt-get did not respond within {timeout} seconds while installing {package}")
+    except (OSError, subprocess.SubprocessError) as exc:
+        return RuntimeResult(1, f"apt-get install {package} failed: {exc}")
+    output = (proc.stdout or "").strip()
+    error = (proc.stderr or "").strip()
+    if proc.returncode != 0:
+        return RuntimeResult(proc.returncode, error or output or f"apt-get install {package} failed")
+    return RuntimeResult(0, f"installed {package} via apt-get", ran=True)
+
+
+def install_ufw() -> RuntimeResult:
+    """Make sure the ``ufw`` package exists; succeed idempotently when it does."""
+    if ufw_available():
+        return RuntimeResult(0, "ufw is already installed", skipped=True)
+    if _skip_runtime():
+        return RuntimeResult(0, "skipped by WPFY_SKIP_RUNTIME", skipped=True)
+    return _apt_install("ufw")
 
 
 def _run(args: list[str]) -> tuple[int, str]:

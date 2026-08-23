@@ -1,5 +1,5 @@
 import { registerPage, el, api, formatBytes, formatTime, onPanelEvent, session,
-         isServiceHealthy, isServiceUnknown, emptyRow } from "./panel.js";
+         emptyRow, recentOverview } from "./panel.js";
 
 const METRIC_CHARTS = [
   { key: "cpu", title: "CPU", danger: 85, value: (sample) => sample.cpu_percent, format: (value) => `${value.toFixed(1)}%` },
@@ -7,6 +7,11 @@ const METRIC_CHARTS = [
   { key: "disk", title: "Disk", danger: 85, bounded: true, value: (sample) => sample.disk_total ? sample.disk_used / sample.disk_total * 100 : null, format: (value) => `${value.toFixed(1)}%` },
   { key: "load", title: "Load", value: (sample) => sample.load1, format: (value) => value.toFixed(2) },
 ];
+
+/* Mirrors metrics.RANGES server-side; shown before the first API response so
+   the range select renders populated. */
+const METRIC_RANGES = ["30m", "1h", "3h", "6h", "12h", "24h"];
+const DEFAULT_METRIC_RANGE = "1h";
 
 function timestamp(value) {
   return typeof value === "number" && value < 10_000_000_000 ? value * 1000 : value;
@@ -119,9 +124,11 @@ function renderMetricTable(samples) {
           el("td", { text: Number(sample.load1 || 0).toFixed(2) })))))));
 }
 
-function card(title, body) {
+function card(title, body, actions = null) {
   return el("div", { class: "card mb-3" },
-    el("div", { class: "card-header" }, el("h3", { class: "card-title", text: title })),
+    el("div", { class: "card-header" },
+      el("h3", { class: "card-title", text: title }),
+      actions ? el("div", { class: "card-actions" }, actions) : null),
     el("div", { class: "card-body" }, body));
 }
 
@@ -136,25 +143,12 @@ function statCard(label, value, detail = null) {
         detail)));
 }
 
-/**
- * `/api/overview` reports Traefik as a whole sentence, and a sentence in an
- * `h1` wraps to three lines and breaks the stat row. The card shows the state
- * as a word, and keeps the reason underneath — an operator who sees "Degraded"
- * with no explanation has to go hunting for it.
- */
-function traefikCard(status) {
-  /* One parsed container state, not the `docker compose ps` table this used to
-     receive — the card printed "NAME IMAGE COMMAND SE…" as its own subtext, and
-     the substring search for "error" ran across a whole table of container
-     names and could match one by accident. */
-  const text = String(status || "unknown");
-  const healthy = isServiceHealthy(text);
-  const unknown = isServiceUnknown(text);
-  return statCard("Traefik",
-    el("div", { class: "d-flex align-items-center gap-2" },
-      el("span", { class: `status-dot ${healthy ? "bg-green" : unknown ? "bg-secondary" : "bg-red"}` }),
-      el("span", { class: "h1 mb-0", text: healthy ? "Running" : unknown ? "Unknown" : "Degraded" })),
-    el("div", { class: "text-secondary text-truncate mt-1", title: text, text }));
+/** Overview reports RAM as raw bytes; the chip reads better as GiB. Null
+ *  guards before Number() because Number(null) is 0 — a false "0.0 GiB". */
+function formatGib(bytes) {
+  if (bytes == null) return "–";
+  const value = Number(bytes);
+  return Number.isFinite(value) ? `${(value / 1024 ** 3).toFixed(1)} GiB` : "–";
 }
 
 function tableError(message, columns) {
@@ -180,9 +174,8 @@ function activityRows(events) {
 }
 
 registerPage("dashboard", async (ctx) => {
-  // The dashboard is the root of the trail, so it is one entry, not a link to
-  // itself followed by itself.
-  ctx.header({ icon: "layout-dashboard", title: "Dashboard", subtitle: "Server and site activity", breadcrumb: [[null, "Dashboard"]] });
+  // The dashboard is the root of the trail: nothing above it, so no breadcrumb.
+  ctx.header({ icon: "layout-dashboard", title: "Dashboard", subtitle: "Server and site activity", breadcrumb: [] });
 
   const activityBody = el("div", { class: "table-responsive" });
   const activityTable = el("table", { class: "table table-vcenter" },
@@ -207,26 +200,36 @@ registerPage("dashboard", async (ctx) => {
   if (session.isAdmin) {
     const stats = el("div", { class: "row row-deck row-cards mb-3" });
     const metricsBody = el("div", {});
-    const range = el("select", { class: "form-select form-select-sm", "aria-label": "Metrics range", disabled: true });
-    const metricsCard = card("Host metrics", el("div", {},
-      el("div", { class: "d-flex justify-content-end mb-3" }, range), metricsBody));
+    // Populated and enabled on first paint so the control is never a dead
+    // grey dropdown while metrics load; the server's list replaces this on
+    // the first response.
+    const range = el("select", { class: "form-select form-select-sm w-auto", "aria-label": "Metrics range" },
+      METRIC_RANGES.map((value) => el("option", { value, text: value, selected: value === DEFAULT_METRIC_RANGE })));
+    const metricsCard = card("Host metrics", metricsBody, range);
     const backupBody = el("div", { class: "table-responsive" });
     const backupsCard = card("Recent backups", backupBody);
     ctx.mount.prepend(stats, metricsCard);
 
     async function loadOverview() {
-      try {
-        const overview = await api("/api/overview", { signal: ctx.signal });
-        if (ctx.signal.aborted) return;
-        stats.replaceChildren(
-          statCard("Sites", overview.site_count),
-          statCard("wpfy", overview.version),
-          statCard("Docker", overview.docker_version || "unavailable"),
-          traefikCard(overview.traefik));
-      } catch (error) {
-        if (ctx.signal.aborted) return;
-        stats.replaceChildren(el("div", { class: "col-12" }, el("div", { class: "alert alert-danger", role: "alert", text: `Unable to load overview: ${error.message}` })));
+      const [overviewResult, jobsResult] = await Promise.allSettled([
+        // The shell already fetched overview for the footer version chip at
+        // boot; reuse that payload and spend a request only when it failed.
+        recentOverview() ?? api("/api/overview", { signal: ctx.signal }),
+        api("/api/jobs", { signal: ctx.signal }),
+      ]);
+      if (ctx.signal.aborted) return;
+      if (overviewResult.status === "rejected") {
+        stats.replaceChildren(el("div", { class: "col-12" }, el("div", { class: "alert alert-danger", role: "alert", text: `Unable to load overview: ${overviewResult.reason.message}` })));
+        return;
       }
+      const overview = overviewResult.value;
+      const jobs = jobsResult.status === "fulfilled" ? jobsResult.value.jobs || [] : null;
+      stats.replaceChildren(
+        statCard("Sites", overview.site_count),
+        statCard("IP address", overview.public_ip ?? "–"),
+        statCard("Jobs", jobs === null ? "–" : jobs.length),
+        statCard("CPU cores", overview.cpu_count ?? "–"),
+        statCard("RAM", formatGib(overview.memory_total)));
     }
 
     let redrawMetrics = () => {};
@@ -244,7 +247,6 @@ registerPage("dashboard", async (ctx) => {
         const payload = await api(`/api/metrics?scope=host&range=${encodeURIComponent(selectedRange)}`, { signal: ctx.signal });
         if (ctx.signal.aborted) return;
         range.replaceChildren(...(payload.ranges || []).map((value) => el("option", { value, text: value, selected: value === payload.range })));
-        range.disabled = false;
         const samples = payload.samples || [];
         if (!samples.length) {
           redrawMetrics = () => {};

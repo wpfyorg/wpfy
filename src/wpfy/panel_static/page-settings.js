@@ -2,13 +2,20 @@
  *
  * Exposure publishes the control panel for this whole host to the public
  * internet, so it sits in its own card with its preconditions written out. The
- * server enforces all of them -- named-user login, a TOTP-enabled user, a
- * passing DNS preflight, a typed domain confirmation -- and refuses with a
- * message rather than a code. Those messages are rendered verbatim: the server
- * knows why it said no, and paraphrasing it here would only ever be wrong.
+ * server enforces all of them -- a passing DNS preflight and a typed domain
+ * confirmation -- and refuses with a message rather than a code. Those messages
+ * are rendered verbatim: the server knows why it said no, and paraphrasing it
+ * here would only ever be wrong.
+ *
+ * The panel-access card configures HTTP basic auth on the published route. It
+ * renders regardless of exposure state: the credential can be staged before
+ * publishing, and whether it is in force is a server answer, never a guess
+ * read off the exposure flag. Only the username comes back from the server;
+ * the password is write-only and no hash is ever displayed.
  */
 
 import { registerPage, el, api, toast, confirmAction, withBusy, formatTime } from "./panel.js";
+import { panelAccessViewModel, panelAccessSaveToast } from "./panel-access-state.js";
 
 function card(title, subtitle, ...body) {
   return el("div", { class: "card mb-3" },
@@ -28,13 +35,14 @@ function factRow(label, value) {
 registerPage("settings", async (ctx) => {
   ctx.header({ icon: "settings",
     title: "Settings",
-    subtitle: "Panel exposure and telemetry",
+    subtitle: "Panel exposure, access, and telemetry",
     breadcrumb: [["/dashboard", "Dashboard"], [null, "Settings"]],
   });
 
   const exposureMount = el("div", {});
+  const panelAccessMount = el("div", {});
   const telemetryMount = el("div", {});
-  ctx.mount.append(exposureMount, telemetryMount);
+  ctx.mount.append(exposureMount, panelAccessMount, telemetryMount);
 
   async function refresh() {
     try {
@@ -66,7 +74,7 @@ registerPage("settings", async (ctx) => {
       const typed = await confirmAction({
         title: exposed ? "Change the panel's public domain?" : "Publish this panel to the internet?",
         message: `The panel becomes reachable at https://${value}. Anyone who can resolve that name can reach the login form, and this host's whole control surface sits behind it.`,
-        detail: "The server refuses unless a named user is signed in, a TOTP-enabled user exists, and DNS for this domain already points here.",
+        detail: "The server refuses unless DNS for this domain already points here.",
         confirmLabel: exposed ? "Change it" : "Publish it",
         keyword: value,
       });
@@ -92,7 +100,7 @@ registerPage("settings", async (ctx) => {
     disable.addEventListener("click", async () => {
       const typed = await confirmAction({
         title: "Unpublish the panel?",
-        message: "The public route is removed. The panel stays reachable on loopback and over an SSH tunnel.",
+        message: "The public Traefik route is removed. The panel stays reachable through its direct bind (loopback, or the host's public address over plain HTTP).",
         confirmLabel: "Unpublish",
         keyword: "unpublish",
       });
@@ -111,11 +119,13 @@ registerPage("settings", async (ctx) => {
 
     exposureMount.replaceChildren(card(
       "Panel exposure",
-      exposed ? "This panel is reachable from the internet" : "This panel is reachable on loopback only",
+      exposed
+        ? "This panel is published through Traefik with a TLS certificate"
+        : "No Traefik route: the panel answers on its direct bind (HTTP unless self-signed TLS)",
       el("div", { class: "d-flex flex-wrap align-items-center gap-2 mb-3" },
         el("span", {
           class: `badge ${exposed ? "bg-yellow-lt text-yellow" : "bg-green-lt text-green"}`,
-          text: exposed ? "Published" : "Loopback only",
+          text: exposed ? "Published (TLS)" : "Direct bind",
         }),
         exposed && !exposure.recognised
           ? el("span", { class: "badge bg-red-lt text-red", text: "router not recognised" })
@@ -128,7 +138,7 @@ registerPage("settings", async (ctx) => {
         ...factRow("Target", exposure.target_host ? `${exposure.target_host}:${exposure.target_port}` : null),
         ...factRow("Router file", exposure.router_path),
         ...factRow("Systemd service", exposure.service_installed ? "installed" : "not installed")),
-      el("p", { class: "text-secondary small", text: "Publishing requires all of: a named user signed in (not the run token), at least one user with TOTP enabled, and DNS for the domain already resolving to this host. The panel checks each one and refuses with the reason if any fails." }),
+      el("p", { class: "text-secondary small", text: "Publishing gives the panel domain a TLS certificate from Let's Encrypt. An optional basic-auth credential can guard the public route on top (see the Basic auth page). DNS for the domain must already resolve to this host; the panel checks and refuses with the reason if it does not." }),
       el("div", { class: "row g-2 align-items-end" },
         el("div", { class: "col-md-6" },
           el("label", { class: "form-label", for: "settings-exposure-domain", text: "Public domain" }), domain),
@@ -173,5 +183,114 @@ registerPage("settings", async (ctx) => {
         : null));
   }
 
+  function renderPanelAccess(basic) {
+    // All state mapping lives in panel-access-state.js (pure, test-covered):
+    // badge, subtitle, footer, disable availability and its dialog copy are
+    // derived from the server's auth_state answer, never guessed here.
+    const vm = panelAccessViewModel(basic);
+    const enabled = vm.enabled;
+    const fail = (message) => el("div", { class: "text-danger", role: "alert", text: message });
+    const username = el("input", {
+      id: "settings-panel-access-username", class: "form-control", type: "text",
+      autocomplete: "off", value: basic.username || "",
+    });
+    // Write-only by contract: the server never echoes a password or its hash,
+    // so the field starts empty every render.
+    const password = el("input", {
+      id: "settings-panel-access-password", class: "form-control", type: "password",
+      autocomplete: "new-password", placeholder: "Leave blank when disabling",
+    });
+    const feedback = el("div", { class: "mt-3", "aria-live": "polite" });
+    const save = el("button", { class: "btn btn-primary", type: "button", text: enabled ? "Save" : "Enable" });
+
+    save.addEventListener("click", async () => {
+      feedback.replaceChildren();
+      const name = username.value.trim();
+      if (!name) {
+        feedback.replaceChildren(fail("A username is required."));
+        username.focus();
+        return;
+      }
+      if (!password.value) {
+        feedback.replaceChildren(fail(enabled
+          ? "Enter the password to set, or use Disable to turn basic auth off."
+          : "Enter a password to enable basic auth."));
+        password.focus();
+        return;
+      }
+      try {
+        await withBusy(save, async () => {
+          const payload = await api("/api/settings/basic-auth", {
+            method: "PUT", body: { username: name, password: password.value }, signal: ctx.signal,
+          });
+          if (ctx.signal.aborted) return;
+          password.value = "";
+          toast(payload.enabled === false
+            ? "Panel basic auth is off."
+            : panelAccessSaveToast(payload));
+          await refreshPanelAccess();
+        });
+      } catch (failed) {
+        if (!ctx.signal.aborted) feedback.replaceChildren(fail(failed.message));
+      }
+    });
+
+    const disable = el("button", { class: "btn btn-outline-danger", type: "button", text: "Disable" });
+    disable.addEventListener("click", async () => {
+      const confirmed = await confirmAction({
+        title: "Disable panel basic auth?",
+        message: vm.disableMessage,
+        confirmLabel: "Disable",
+      });
+      if (ctx.signal.aborted || !confirmed) return;
+      try {
+        await withBusy(disable, async () => {
+          await api("/api/settings/basic-auth", { method: "DELETE", signal: ctx.signal });
+          if (ctx.signal.aborted) return;
+          toast("Panel basic auth disabled.");
+          await refreshPanelAccess();
+        });
+      } catch (failed) {
+        if (!ctx.signal.aborted) feedback.replaceChildren(fail(failed.message));
+      }
+    });
+
+    // Unknown + stored: the backend guarantees a 409 for disable while the
+    // router is unattributable, so the action is hidden and the operator is
+    // pointed at the actual remedy instead.
+    const unknownHint = vm.gated && !vm.disableAvailable
+      ? el("p", { class: "text-warning small mb-0", text: "Disable is unavailable until the router is recognizable again. Repair or remove the unrecognized router, then retry." })
+      : null;
+
+    panelAccessMount.replaceChildren(card(
+      "Panel access",
+      vm.subtitle,
+      el("div", { class: "d-flex flex-wrap align-items-center gap-2 mb-3" },
+        el("span", { class: `badge ${vm.badge.class}`, text: vm.badge.text }),
+        vm.gated && basic.username ? el("span", { class: "text-secondary small", text: `User: ${basic.username}` }) : null),
+      el("div", { class: "row g-2 align-items-end" },
+        el("div", { class: "col-md-5" },
+          el("label", { class: "form-label", for: "settings-panel-access-username", text: "Username" }), username),
+        el("div", { class: "col-md-5" },
+          el("label", { class: "form-label", for: "settings-panel-access-password", text: "Password" }), password),
+        el("div", { class: "col-md-auto" }, el("div", { class: "d-flex gap-2" }, save, vm.disableAvailable ? disable : null))),
+      feedback,
+      unknownHint,
+      el("p", { class: "text-secondary small mt-3 mb-0", text: vm.footer })));
+  }
+
+  async function refreshPanelAccess() {
+    try {
+      const payload = await api("/api/settings/basic-auth", { signal: ctx.signal });
+      if (ctx.signal.aborted) return;
+      renderPanelAccess(payload);
+    } catch (error) {
+      if (ctx.signal.aborted) return;
+      panelAccessMount.replaceChildren(card("Panel access", "",
+        el("div", { class: "alert alert-danger mb-0", role: "alert", text: `Unable to read panel access: ${error.message}` })));
+    }
+  }
+
   await refresh();
+  await refreshPanelAccess();
 });

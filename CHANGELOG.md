@@ -17,6 +17,77 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   required and runtime/health panels report unavailable by design. Seeding still
   attempts the WordPress core download; without network access it fails and the
   sites stay at `needs-bootstrap`, which is the expected demo state.
+- Panel account pages for every signed-in user, admin and site manager alike:
+  profile editing (name, email), password change that requires the current
+  secret and revokes the account's other sessions while keeping the acting
+  one, TOTP enrollment with QR/secret setup and disable behind
+  reauthentication, and a session list with per-session revocation. The
+  routes are keyed to the session identity, so site managers get them
+  without gaining system-scoped access. A begun enrollment can be cancelled
+  (`DELETE /api/auth/totp/pending`), which discards the pending secret
+  server-side instead of leaving "already disclosed" until the TTL.
+- `/api/auth/me` now returns `first_name`, `last_name`, `email`, and
+  `totp_enabled` alongside username/role/sites/version, so the
+  session-scoped account pages can prefill and render TOTP state without
+  system-scoped overview access.
+- Settings page panel-access card: enable, rotate, and disable HTTP basic
+  auth on the public panel domain from the browser. The status payload
+  carries an `auth_state` derived from the router's own content:
+  `enforced` (a recognized router carries exactly the stored credential),
+  `staged` (stored but verifiably nothing enforces it), `stale` (a router
+  enforces a different credential than stored -- or enforces one while
+  nothing is stored; the old prompt is live either way), `unknown`
+  (exposed but the router cannot be attributed to wpfy), and `off`. The
+  card never claims the public domain is guarded -- or unguarded -- when
+  disk says otherwise.
+
+### Fixed
+
+- Disabling panel basic auth no longer reports success while an unmanaged
+  router may still be prompting. When the rewrite of a recognized router
+  fails, the credential file is restored (bytes and mode) so disk state
+  matches the still-enforced router and a retry converges. When the panel is
+  exposed but wpfy does not recognize the router at all, the disable refuses
+  with 409 naming the cause instead of silently dropping the credential.
+
+First validation run on an IPv6-capable host. Both fixes below are in code
+paths that only render when the host has global IPv6, so an IPv4-only host
+never reached either of them and the offline suite asserted the wrong thing.
+
+### Fixed
+
+- `wpfy stack install --nginx` no longer fails fail2ban configuration on an
+  IPv6-capable host. The `ip6tables` lines in the generated
+  `action.d/wpfy-docker-http.conf` sat at column 0 instead of continuing the
+  `actionstart` value, so fail2ban's configparser rejected the whole file and
+  `fail2ban-server --test` failed. wpfy restored the previous config and
+  reported `fail2ban: FAIL`, leaving the host with no Login Shield at all.
+- IPv6 addresses can now actually be banned. The generated `actionban` and
+  `actionunban` tested `[ "<family>" = "ipv6" ]`, but fail2ban expands
+  `<family>` to `inet6`. Every IPv6 ban therefore took the IPv4 branch and
+  died with `iptables: host/network not found`, while `fail2ban-client status`
+  went on listing the address as banned. Verified against fail2ban 1.0.2.
+
+### Changed
+
+- `wpfy security fail2ban status` no longer reports `IPv6 protection: active`.
+  It never could be: wpfy enables IPv6 on neither the Docker daemon nor any
+  Docker network, so inbound IPv6 to a published port is relayed by
+  `docker-proxy` in userland and never traverses `ip6tables FORWARD` /
+  `DOCKER-USER`. A correctly installed IPv6 ban rule sits at zero packets while
+  the IPv4 chain counts normally, and Traefik sees every IPv6 client as the
+  bridge gateway rather than the client. The status now reads `inactive` and
+  names that cause, because telling an operator with public IPv6 that half
+  their surface is covered, when none of it is, is worse than telling them
+  nothing.
+
+### Known issue
+
+- Actually enforcing IPv6 bans needs `"ipv6"` / `"ip6tables"` in the Docker
+  daemon config and `enable_ipv6` on the generated networks — host daemon
+  configuration plus a change to every compose file. That is an architecture
+  decision and gets its own ADR; the entry above is the honest interim
+  reporting fix, not the feature.
 
 ## [1.0.0-rc6] - 2026-08-21
 

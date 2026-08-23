@@ -4,6 +4,7 @@ import argparse
 from datetime import datetime
 import getpass
 import importlib.metadata
+import ipaddress
 import json
 import os
 import re
@@ -395,7 +396,6 @@ def _resolve_wp_admin_credentials(args: argparse.Namespace, domain: str) -> site
     user = getattr(args, "wp_user", None)
     email = getattr(args, "wp_email", None)
     password = getattr(args, "wp_password", None)
-    generated = False
 
     if sys.stdin.isatty():
         if not user:
@@ -404,21 +404,17 @@ def _resolve_wp_admin_credentials(args: argparse.Namespace, domain: str) -> site
             email = _prompt_or_default("WordPress admin email", default_email)
         if password is None:
             password = getpass.getpass("WordPress admin password [leave blank to generate]: ")
-            if not password:
-                password = generated_secret()
-                generated = True
     else:
         user = user or default_user
         email = email or default_email
-        if password is None:
-            password = generated_secret()
-            generated = True
 
-    return site_lifecycle.WordPressCredentials(
-        user=_normalize_wp_user(user),
-        email=email.strip(),
-        password=password,
-        password_generated=generated,
+    # Shared resolution with the panel: blank means generate a shown-once
+    # secret; a supplied password is used as-is and never echoed.
+    return site_lifecycle.resolve_wp_admin_credentials(
+        _normalize_wp_user(user),
+        email,
+        password,
+        domain=domain,
     )
 
 
@@ -2093,11 +2089,18 @@ def add_panel_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentPar
         "panel",
         help="Serve or administer the local browser control panel.",
         epilog=(
-            "The panel binds to a loopback address.\n"
-            "Remote access: ssh -L 8642:127.0.0.1:8642 <server>, then open the URL locally.\n"
+            "By default the panel binds to this host's public address over plain HTTP; "
+            "use `wpfy panel expose --domain <domain>` to serve it over TLS.\n"
+            "Pass --local to bind 127.0.0.1 instead; remote access over loopback: "
+            "ssh -L 8642:127.0.0.1:8642 <server>, then open the URL locally.\n"
         ),
     )
-    parser.add_argument("--host", default="127.0.0.1", help="loopback address to bind")
+    parser.add_argument("--host", default=None, help="bind address; defaults to this host's public address")
+    parser.add_argument(
+        "--local",
+        action="store_true",
+        help="bind 127.0.0.1 instead of the public address (loopback only)",
+    )
     parser.add_argument("--port", type=int, default=panel.DEFAULT_PANEL_PORT, help="port to listen on")
     parser.add_argument(
         "--token",
@@ -2136,6 +2139,11 @@ def add_panel_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentPar
              "asked for interactively when the host has none",
     )
     expose.add_argument("--port", type=int, default=panel.DEFAULT_PANEL_PORT)
+    expose.add_argument(
+        "--no-install",
+        action="store_true",
+        help="skip installing the host prerequisites (ufw, fail2ban, cron timers)",
+    )
     expose.set_defaults(handler=handle_panel_exposure)
 
     service = _add_parser(commands, "service", help="Manage the edge-bound panel systemd service.")
@@ -2293,6 +2301,7 @@ def handle_panel_exposure(args: argparse.Namespace) -> CommandResult:
                 result = panel_exposure.expose_without_domain(
                     confirm=confirmation,
                     port=args.port if args.port != panel.DEFAULT_PANEL_PORT else panel_exposure.DOMAINLESS_PANEL_PORT,
+                    no_install=getattr(args, "no_install", False),
                 )
             elif args.disable:
                 result = panel_exposure.disable()
@@ -2331,7 +2340,9 @@ def handle_panel_exposure(args: argparse.Namespace) -> CommandResult:
                         stack.traefik.set_acme_email(email)
                     except ValueError as exc:
                         return CommandResult(str(exc), exit_code=2)
-                result = panel_exposure.expose(domain, confirm=confirmation, port=args.port)
+                result = panel_exposure.expose(
+                    domain, confirm=confirmation, port=args.port,
+                    no_install=getattr(args, "no_install", False))
         elif args.panel_command == "service":
             if args.panel_service_command == "install":
                 result = panel_exposure.install_service(panel_exposure.edge_bind_address(), args.port)
@@ -2374,6 +2385,13 @@ def resolve_panel_token(
     return panel.generate_panel_token(), None
 
 
+def _is_loopback_host(host: str) -> bool:
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return host == "localhost"
+
+
 def handle_panel(args: argparse.Namespace) -> CommandResult:
     try:
         token, token_warning = resolve_panel_token(args)
@@ -2382,6 +2400,18 @@ def handle_panel(args: argparse.Namespace) -> CommandResult:
     if token_warning:
         print(token_warning, file=sys.stderr)
     host, port = args.host, args.port
+    if host is None and not args.public:
+        # No explicit bind: --local pins the loopback default the panel always
+        # had; otherwise the panel answers on this host's public address so a
+        # fresh VPS is reachable without an SSH tunnel. (--public re-derives
+        # the address itself below, against the certificate it was issued for.)
+        if getattr(args, "local", False):
+            host = "127.0.0.1"
+        else:
+            try:
+                host = panel_exposure.public_bind_address()
+            except RuntimeError as exc:
+                return CommandResult(str(exc), exit_code=2)
     if args.public:
         # `expose --no-domain` decided the address and issued the certificate for
         # it. Re-deriving it here rather than asking the operator to retype it
@@ -2403,15 +2433,20 @@ def handle_panel(args: argparse.Namespace) -> CommandResult:
     except ValueError as exc:
         return CommandResult(str(exc), exit_code=2)
     except OSError as exc:
-        return CommandResult(f"panel could not bind {args.host}:{args.port}: {exc}", exit_code=2)
+        return CommandResult(f"panel could not bind {host}:{args.port}: {exc}", exit_code=2)
 
     actual_port = server.server_address[1]
     if args.edge_service:
         domain = panel_exposure.exposure_status().get("domain") or "configured panel domain"
+        if panel_auth.login_required():
+            access = "sign in with a configured panel user; press Ctrl+C to stop"
+        else:
+            access = ("no account exists yet: open the one-time setup link printed by "
+                      "`wpfy panel expose --domain`; press Ctrl+C to stop")
         summary = [
-            f"listening: http://{args.host}:{actual_port}/",
+            f"listening: http://{panel_exposure.display_host(args.host)}:{actual_port}/",
             f"open: https://{domain}/",
-            "sign in with a configured panel user; press Ctrl+C to stop",
+            access,
         ]
     else:
         if panel_auth.login_required():
@@ -2422,7 +2457,8 @@ def handle_panel(args: argparse.Namespace) -> CommandResult:
         else:
             access = "the URL carries a one-time access token; press Ctrl+C to stop"
         summary = [
-            f"listening: {'https' if args.public else 'http'}://{host}:{actual_port}/",
+            f"listening: {'https' if args.public else 'http'}://"
+            f"{panel_exposure.display_host(host)}:{actual_port}/",
             f"open: {panel.panel_url(config, actual_port)}",
             access,
         ]
@@ -2431,6 +2467,13 @@ def handle_panel(args: argparse.Namespace) -> CommandResult:
 
             summary.insert(2, f"certificate fingerprint (SHA-256): "
                               f"{panel_tls.fingerprint_of(panel_tls.certificate_path())}")
+        elif not _is_loopback_host(host):
+            # Plain HTTP on a public address is a supported default, but the
+            # operator should know what they are running and how to upgrade it.
+            summary.append(
+                "WARNING: this panel is reachable on the network over unencrypted HTTP; "
+                "run `wpfy panel expose --domain <domain>` to serve it over TLS"
+            )
     print(_render_summary("wpfy panel", summary), flush=True)
     try:
         server.serve_forever()

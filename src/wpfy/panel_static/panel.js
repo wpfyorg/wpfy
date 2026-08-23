@@ -147,6 +147,7 @@ function clearSession() {
   token = "";
   principal = null;
   usingRunToken = false;
+  lastOverview = null;       // never serve the previous session's overview
   stopStream();
   // The operations poll re-arms itself while a job runs; left alone it keeps
   // polling after sign-out, 401s, and bounces the user out of the login form.
@@ -812,13 +813,29 @@ async function refreshJobsChip() {
   }
 }
 
+/* The boot's /api/overview payload, kept so the dashboard renders its stat
+ * cards from it instead of issuing a second identical GET. Null when the
+ * fetch failed or has not run — the dashboard then fetches its own. */
+let lastOverview = null;
+
+/** Most recent /api/overview payload, or null. */
+export function recentOverview() {
+  return lastOverview;
+}
+
 async function refreshVersionChip() {
-  if (!session.isAdmin) return;
+  // Site managers get 403 from system-scoped /api/overview, so the identity
+  // payload (/api/auth/me) carries the version for them; the overview fetch
+  // stays for everyone because the dashboard reuses its payload.
+  const identityVersion = principal?.version || "";
+  if (identityVersion) $("chip-version").textContent = `wpfy ${identityVersion}`;
   try {
     const data = await api("/api/overview");
-    $("chip-version").textContent = `wpfy ${data.version}`;
+    lastOverview = data;
+    if (!identityVersion) $("chip-version").textContent = `wpfy ${data.version}`;
   } catch (error) {
-    $("chip-version").textContent = "wpfy";
+    lastOverview = null;
+    if (!identityVersion) $("chip-version").textContent = "wpfy";
   }
 }
 
@@ -857,6 +874,11 @@ const PAGE_MODULES = {
   firewall: "./page-firewall.js",
   notifications: "./page-mail.js",
   "basic-auth": "./page-basic-auth.js",
+  // Account pages. The routes (/account/settings, /account/security) and the
+  // "/account/" client-route prefix shipped earlier; these are their modules.
+  // Note the settings route's page key is "account", not "account-settings".
+  account: "./page-account.js",
+  "account-security": "./page-account-security.js",
 };
 
 async function loadPage(name) {
@@ -873,18 +895,21 @@ async function loadPage(name) {
 }
 
 /**
- * The five-tab site IA. Every pre-rebuild tab path maps onto one of them so
+ * The nine-tab site IA. Every pre-rebuild tab path maps onto one of them so
  * existing bookmarks and the links in `wpfy-docs/docs/commands/panel.md` keep
  * working; the redirect table goes away one release after the rebuild ships.
  */
-const SITE_TABS = ["overview", "settings", "data", "access", "automation"];
+const SITE_TABS = [
+  "overview", "settings", "data", "file-manager", "cron",
+  "logs", "diagnostics", "services", "wp-cli",
+];
 const SITE_TAB_REDIRECTS = {
-  logs: "overview", activity: "overview", metrics: "overview", runtime: "overview", ssl: "overview",
+  logs: "logs", activity: "overview", metrics: "overview", runtime: "overview", ssl: "overview",
   config: "settings", php: "settings", cache: "settings", vhost: "settings", security: "settings",
   danger: "settings",
   databases: "data", backups: "data",
-  sftp: "access", files: "access", wp: "access", "wp-cli": "access",
-  cron: "automation",
+  access: "file-manager", sftp: "overview", files: "file-manager", wp: "wp-cli", "wp-cli": "wp-cli",
+  automation: "cron",
 };
 
 const ROUTES = [
@@ -1055,6 +1080,32 @@ function wireRouter() {
 }
 
 /* ---- setup, sign-in, sign-out ---- */
+
+/**
+ * Clipboard write with the async API first and the legacy `execCommand` path
+ * as fallback — the panel may be served over plain HTTP from a LAN address,
+ * where `navigator.clipboard` does not exist. No new dependency.
+ */
+export async function copyText(text) {
+  try {
+    await navigator.clipboard.writeText(text);
+    return;
+  } catch (error) {
+    /* fall through to execCommand */
+  }
+  const area = el("textarea", { class: "visually-hidden", "aria-hidden": "true" });
+  area.value = text;
+  document.body.append(area);
+  area.focus();
+  area.select();
+  let copied = false;
+  try {
+    copied = document.execCommand("copy");
+  } finally {
+    area.remove();
+  }
+  if (!copied) throw new Error("Clipboard unavailable.");
+}
 
 async function loadPrincipal() {
   const response = await fetch("/api/auth/me", { headers: { Authorization: `Bearer ${token}` } });
@@ -1227,6 +1278,16 @@ function wireShell() {
       event.preventDefault();
       $("btn-setup-totp-verify").click();
     }
+  });
+  $("btn-setup-totp-copy")?.addEventListener("click", async () => {
+    const button = $("btn-setup-totp-copy");
+    try {
+      await copyText($("setup-totp-secret")?.value || "");
+      button.textContent = "Copied";
+    } catch (error) {
+      button.textContent = "Copy failed";
+    }
+    setTimeout(() => { button.textContent = "Copy secret"; }, 2000);
   });
 
   $("login-form")?.addEventListener("submit", signIn);

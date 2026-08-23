@@ -244,10 +244,35 @@ registerPage("firewall", async (ctx) => {
 
   function renderPorts(ports) {
     if (!ports.installed) {
+      const installResult = el("div", { class: "mt-3" });
+      const install = el("button", { class: "btn btn-primary", type: "button", icon: "flame", text: "Install ufw" });
+      install.addEventListener("click", async () => {
+        try {
+          await withBusy(install, async () => {
+            const started = await api("/api/firewall/install-ufw", { method: "POST", body: {}, signal: ctx.signal });
+            if (ctx.signal.aborted) return;
+            const job = await pollJob(started.job_id, { signal: ctx.signal });
+            if (ctx.signal.aborted) return;
+            if (job.state === "succeeded") {
+              toast("ufw installed.");
+              installResult.replaceChildren(alert(job.result?.message || "ufw installed.", "success"));
+            } else {
+              installResult.replaceChildren(alert(job.result?.error || "The ufw install failed.", "danger"));
+            }
+            await refresh();
+          });
+        } catch (error) {
+          if (!ctx.signal.aborted) {
+            installResult.replaceChildren(alert(error.message, "danger"));
+            toast(error.message, true);
+          }
+        }
+      });
       portsMount.replaceChildren(card("Ports", "Host firewall (ufw)",
         alert(ports.message || "ufw is not installed on this host.", "warning"),
-        el("p", { class: "text-secondary mt-3 mb-1", text: "wpfy does not install it for you. To add it:" }),
-        el("pre", { class: "log-output mb-0", text: "apt-get install -y ufw" })));
+        el("p", { class: "text-secondary mt-3 mb-2", text: "wpfy can install it for you; the button runs apt-get on this host." }),
+        install,
+        installResult));
       return;
     }
 
@@ -292,7 +317,7 @@ registerPage("firewall", async (ctx) => {
       const steps = el("ul", { class: "list-group list-group-flush mt-3" });
       try {
         await withBusy(install, async () => {
-          const started = await api("/api/firewall/install", { method: "POST", body: {}, signal: ctx.signal });
+          const started = await api("/api/firewall/install-fail2ban", { method: "POST", body: {}, signal: ctx.signal });
           if (ctx.signal.aborted) return;
           f2bMount.append(steps);
           const job = await pollJob(started.job_id, {
