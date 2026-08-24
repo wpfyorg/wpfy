@@ -54,11 +54,12 @@ SOCKET_PROXY_CONTAINER = "wpfy-socket-proxy"
 TRAEFIK_PROJECT = "wpfy-traefik"
 _COMPOSE_TIMEOUT_SECONDS = 120
 _HEALTH_TIMEOUT_SECONDS = 180
+_NETWORK_FACTS_TIMEOUT_SECONDS = 15
 _transaction_state = threading.local()
 
 _PANEL_EDGE_BRIDGE_OPTION = "com.docker.network.bridge.name"
 _DOCKER_NETWORK_ID_RE = re.compile(r"^[0-9a-fA-F]{12,64}$")
-_LINUX_INTERFACE_RE = re.compile(r"^[A-Za-z0-9_.-]{1,15}$")
+_LINUX_INTERFACE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,14}$")
 _RFC1918_NETWORKS: tuple[ipaddress.IPv4Network, ...] = (
     cast(ipaddress.IPv4Network, ipaddress.ip_network("10.0.0.0/8")),
     cast(ipaddress.IPv4Network, ipaddress.ip_network("172.16.0.0/12")),
@@ -375,15 +376,20 @@ def _docker_network_payload(network_name: str) -> dict[str, object]:
             check=False,
             capture_output=True,
             text=True,
+            timeout=_NETWORK_FACTS_TIMEOUT_SECONDS,
         )
-    except (OSError, subprocess.SubprocessError) as exc:
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(f"cannot determine {network_name} facts: Docker inspect timed out") from exc
+    except subprocess.SubprocessError as exc:
+        raise RuntimeError(f"cannot determine {network_name} facts: Docker inspect failed: {exc}") from exc
+    except OSError as exc:
         raise RuntimeError(f"cannot determine {network_name} facts: Docker inspect failed: {exc}") from exc
     if proc.returncode != 0:
         detail = proc.stderr.strip() or proc.stdout.strip() or "network inspect failed"
         raise RuntimeError(f"cannot determine {network_name} facts: {detail}")
     try:
         raw = json.loads(proc.stdout.strip())
-    except json.JSONDecodeError as exc:
+    except (TypeError, json.JSONDecodeError) as exc:
         raise RuntimeError(f"cannot determine {network_name} facts: invalid Docker inspect output") from exc
 
     payload: object = raw
@@ -396,7 +402,7 @@ def _docker_network_payload(network_name: str) -> dict[str, object]:
     if not isinstance(payload, dict):
         raise RuntimeError(f"cannot determine {network_name} facts: Docker reported no network")
     reported_name = payload.get("Name")
-    if reported_name is not None and reported_name != network_name:
+    if reported_name != network_name:
         raise RuntimeError(
             f"cannot determine {network_name} facts: Docker returned network {reported_name!r}"
         )
@@ -448,8 +454,17 @@ def _validate_host_bridge_address(
             check=False,
             capture_output=True,
             text=True,
+            timeout=_NETWORK_FACTS_TIMEOUT_SECONDS,
         )
-    except (OSError, subprocess.SubprocessError) as exc:
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(
+            f"cannot determine {network_name} facts: host bridge interface {bridge!r} address inspection timed out"
+        ) from exc
+    except subprocess.SubprocessError as exc:
+        raise RuntimeError(
+            f"cannot determine {network_name} facts: host bridge interface {bridge!r} cannot be inspected: {exc}"
+        ) from exc
+    except OSError as exc:
         raise RuntimeError(
             f"cannot determine {network_name} facts: host bridge interface {bridge!r} cannot be inspected: {exc}"
         ) from exc
@@ -460,7 +475,7 @@ def _validate_host_bridge_address(
         )
     try:
         raw = json.loads(proc.stdout.strip())
-    except json.JSONDecodeError as exc:
+    except (TypeError, json.JSONDecodeError) as exc:
         raise RuntimeError(f"cannot determine {network_name} facts: invalid host address output") from exc
     entries = raw if isinstance(raw, list) else [raw]
     found_interface = False
@@ -471,13 +486,6 @@ def _validate_host_bridge_address(
         if ifname != bridge:
             continue
         found_interface = True
-        link_info = entry.get("linkinfo")
-        if isinstance(link_info, dict):
-            kind = link_info.get("info_kind")
-            if kind is not None and kind != "bridge":
-                raise RuntimeError(
-                    f"cannot determine {network_name} facts: {bridge!r} is not a Linux bridge interface"
-                )
         addresses = entry.get("addr_info")
         if not isinstance(addresses, list):
             continue
@@ -510,6 +518,52 @@ def _validate_host_bridge_address(
     )
 
 
+def _validate_host_bridge_link(bridge: str, *, network_name: str) -> None:
+    try:
+        proc = subprocess.run(
+            ["ip", "-d", "-j", "link", "show", "dev", bridge],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=_NETWORK_FACTS_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(
+            f"cannot determine {network_name} facts: host bridge interface {bridge!r} link inspection timed out"
+        ) from exc
+    except subprocess.SubprocessError as exc:
+        raise RuntimeError(
+            f"cannot determine {network_name} facts: host bridge interface {bridge!r} cannot be inspected: {exc}"
+        ) from exc
+    except OSError as exc:
+        raise RuntimeError(
+            f"cannot determine {network_name} facts: host bridge interface {bridge!r} cannot be inspected: {exc}"
+        ) from exc
+    if proc.returncode != 0:
+        detail = proc.stderr.strip() or proc.stdout.strip() or "ip link inspection failed"
+        raise RuntimeError(
+            f"cannot determine {network_name} facts: host bridge interface {bridge!r} is unavailable: {detail}"
+        )
+    try:
+        raw = json.loads(proc.stdout.strip())
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"cannot determine {network_name} facts: invalid host link output") from exc
+
+    entries = raw if isinstance(raw, list) else [raw]
+    for entry in entries:
+        if not isinstance(entry, dict) or entry.get("ifname") != bridge:
+            continue
+        link_info = entry.get("linkinfo")
+        if not isinstance(link_info, dict) or link_info.get("info_kind") != "bridge":
+            raise RuntimeError(
+                f"cannot determine {network_name} facts: {bridge!r} is not a Linux bridge interface"
+            )
+        return
+    raise RuntimeError(
+        f"cannot determine {network_name} facts: host bridge interface {bridge!r} was not found"
+    )
+
+
 def panel_edge_network_facts(network_name: str = PANEL_EDGE_NETWORK) -> PanelEdgeNetworkFacts:
     """Discover and validate the live Docker and host facts for panel edge.
 
@@ -531,6 +585,7 @@ def panel_edge_network_facts(network_name: str = PANEL_EDGE_NETWORK) -> PanelEdg
         raise RuntimeError(f"cannot determine {network_name} facts: unsupported Docker driver {driver!r}")
     subnet, gateway = _panel_edge_ipam(payload, network_name=network_name)
     bridge = _panel_edge_bridge_name(payload, network_name=network_name)
+    _validate_host_bridge_link(bridge, network_name=network_name)
     _validate_host_bridge_address(bridge, subnet, gateway, network_name=network_name)
     return PanelEdgeNetworkFacts(
         network_name=network_name,

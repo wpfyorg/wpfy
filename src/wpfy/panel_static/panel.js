@@ -191,6 +191,21 @@ function resetLoginStep() {
   showLoginStep("credentials");
 }
 
+function abandonLoginChallenge() {
+  const challenge = loginChallenge;
+  resetLoginStep();
+  if (!challenge) return;
+  // A 429 leaves challenge live on server so operator can retry after
+  // cooldown. Back/network failure must still discard it, otherwise repeated
+  // back navigation can fill server's bounded pending-challenge table.
+  fetch("/api/auth/login/totp", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ challenge, cancel: true }),
+    keepalive: true,
+  }).catch(() => {});
+}
+
 function showApp() {
   show($("setup"), false);
   show($("gate"), false);
@@ -1245,13 +1260,14 @@ async function signIn(event) {
           }),
         });
     if (!response.ok) {
-      if (onTotpStep && response.status === 401) {
-        // The challenge is single-use: a rejected code has burned it, so
-        // retrying on the code field would only loop on a dead challenge.
-        // Send the operator back through step one to re-authenticate.
-        resetLoginStep();
+      if (onTotpStep && (response.status === 401 || response.status === 429)) {
+        // 401 burns challenge; 429 preserves it for server-side retry. Both
+        // must clear UI state and cancel server state before restarting.
+        abandonLoginChallenge();
         $("login-status").textContent = "";
-        $("login-error").textContent = "The code was not accepted, or the sign-in attempt expired. Sign in again.";
+        $("login-error").textContent = response.status === 429
+          ? "This client is rate limited. Sign in again after waiting."
+          : "The code was not accepted, or the sign-in attempt expired. Sign in again.";
         show($("login-error"), true);
         $("login-username").focus();
         return;
@@ -1283,6 +1299,7 @@ async function signIn(event) {
     $("login-status").textContent = "";
     await boot();
   } catch (error) {
+    if (onTotpStep) abandonLoginChallenge();
     $("login-status").textContent = "";
     $("login-error").textContent = "The panel is unreachable. Check that it is still running.";
     show($("login-error"), true);
@@ -1341,7 +1358,7 @@ function wireShell() {
 
   $("login-form")?.addEventListener("submit", signIn);
   $("btn-login-back")?.addEventListener("click", () => {
-    resetLoginStep();
+    abandonLoginChallenge();
     show($("login-error"), false);
     $("login-username").focus();
   });

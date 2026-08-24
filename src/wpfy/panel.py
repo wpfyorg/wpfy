@@ -144,7 +144,11 @@ _TRUSTED_EDGE_LOCK = threading.Lock()
 # to the shared bucket for one request instead of pinning that degradation for
 # the panel's lifetime.
 _TRUSTED_EDGE_TTL_SECONDS = 30
+_TRUSTED_EDGE_GRACE_SECONDS = 60
+_TRUSTED_EDGE_REFRESH_INTERVAL_SECONDS = 10
 _TRUSTED_EDGE_CACHE: tuple[tuple[str, ...], float] | None = None
+_TRUSTED_EDGE_STALE: tuple[str, ...] = ()
+_TRUSTED_EDGE_GRACE_UNTIL = 0.0
 # Sentinel for a client address that cannot be determined (trusted edge with
 # no usable forwarded chain). The trusted proxy endpoints themselves are in
 # the never-ban set: recording the proxy's own IP as a client would let a
@@ -187,6 +191,15 @@ def resolve_client_address(peer: str, forwarded: object, trusted: tuple[str, ...
     unknown sentinel: the proxy's own address is never emitted as a client.
     """
     if not _address_in_networks(peer, trusted):
+        # An expired trust snapshot must never turn a previously trusted
+        # Traefik peer into a bannable identity. Trust is withdrawn after the
+        # bounded grace period, but stale known edge addresses remain mapped to
+        # the non-bannable sentinel for fail2ban safety.
+        with _TRUSTED_EDGE_LOCK:
+            cache_exists = _TRUSTED_EDGE_CACHE is not None
+            stale = _TRUSTED_EDGE_STALE
+        if cache_exists and _address_in_networks(peer, stale):
+            return _UNKNOWN_CLIENT
         return peer
     if not isinstance(forwarded, str):
         return _UNKNOWN_CLIENT
@@ -262,7 +275,7 @@ def trusted_edge_networks() -> tuple[str, ...]:
     then degrades to the shared bucket for one request instead of pinning that
     degradation for the panel's lifetime, and the next request re-discovers.
     """
-    global _TRUSTED_EDGE_CACHE
+    global _TRUSTED_EDGE_CACHE, _TRUSTED_EDGE_STALE, _TRUSTED_EDGE_GRACE_UNTIL
     now = time.monotonic()
     with _TRUSTED_EDGE_LOCK:
         cached = _TRUSTED_EDGE_CACHE
@@ -271,9 +284,14 @@ def trusted_edge_networks() -> tuple[str, ...]:
     try:
         discovered = tuple(traefik.traefik_network_cidrs(panel_exposure.PANEL_EDGE_NETWORK))
     except (RuntimeError, OSError, ValueError, subprocess.SubprocessError):
-        return ()
+        return cached_trusted_edge_networks()
+    expires_at = time.monotonic() + _TRUSTED_EDGE_TTL_SECONDS
     with _TRUSTED_EDGE_LOCK:
-        _TRUSTED_EDGE_CACHE = (discovered, time.monotonic() + _TRUSTED_EDGE_TTL_SECONDS)
+        # Replace immutable snapshot atomically. Requests see one complete
+        # topology, never a set being mutated during refresh.
+        _TRUSTED_EDGE_CACHE = (discovered, expires_at)
+        _TRUSTED_EDGE_STALE = discovered
+        _TRUSTED_EDGE_GRACE_UNTIL = expires_at + _TRUSTED_EDGE_GRACE_SECONDS
     return discovered
 
 
@@ -288,19 +306,34 @@ def cached_trusted_edge_networks() -> tuple[str, ...]:
         cached = _TRUSTED_EDGE_CACHE
         if cached is not None and cached[1] > now:
             return cached[0]
+        # Failed periodic refreshes keep identity stable for bounded grace.
+        # After grace, return no trust set; resolve_client_address separately
+        # maps a known stale edge peer to the unknown sentinel, never itself.
+        if cached is not None and _TRUSTED_EDGE_GRACE_UNTIL > now:
+            return _TRUSTED_EDGE_STALE
     return ()
 
 
 def refresh_trusted_edge_networks() -> tuple[str, ...]:
     """Refresh edge trust outside request handling, failing closed on errors."""
-    global _TRUSTED_EDGE_CACHE
+    global _TRUSTED_EDGE_CACHE, _TRUSTED_EDGE_STALE, _TRUSTED_EDGE_GRACE_UNTIL
     discovered = trusted_edge_networks()
     # Keep this assignment as well as the normal discoverer's assignment: it
     # makes the boundary explicit and keeps test/deployment adapters that
     # provide an in-memory discovery function equivalent.
+    # Keep adapter/test discovery contracts compatible: callers may replace
+    # `trusted_edge_networks` with a configured snapshot provider that returns
+    # trusted CIDRs without mutating this module's cache. Only seed an empty
+    # cache; never reset an expired cache on a failed refresh, which would
+    # extend stale trust indefinitely.
     if discovered:
+        now = time.monotonic()
         with _TRUSTED_EDGE_LOCK:
-            _TRUSTED_EDGE_CACHE = (tuple(discovered), time.monotonic() + _TRUSTED_EDGE_TTL_SECONDS)
+            if _TRUSTED_EDGE_CACHE is None:
+                expires_at = now + _TRUSTED_EDGE_TTL_SECONDS
+                _TRUSTED_EDGE_CACHE = (tuple(discovered), expires_at)
+                _TRUSTED_EDGE_STALE = tuple(discovered)
+                _TRUSTED_EDGE_GRACE_UNTIL = expires_at + _TRUSTED_EDGE_GRACE_SECONDS
     return discovered
 
 
@@ -435,6 +468,21 @@ def _idle_reap_loop(stop_event: threading.Event) -> None:
         except Exception:  # noqa: BLE001, BROAD_EXCEPT_OK
             _LOGGER.exception("file-manager idle reaper tick failed")
         stop_event.wait(30)
+
+
+def _trusted_edge_refresh_loop(stop_event: threading.Event) -> None:
+    """Refresh edge identity before its request-side TTL expires.
+
+    Refresh runs outside request handlers. A failed tick leaves each module's
+    immutable last-known-good snapshot available through its bounded grace
+    window; it never clears trust into a proxy-IP fallback.
+    """
+    while not stop_event.wait(_TRUSTED_EDGE_REFRESH_INTERVAL_SECONDS):
+        try:
+            refresh_trusted_edge_networks()
+            panel_auth.refresh_never_ban_edge_cidrs()
+        except Exception:  # noqa: BLE001, BROAD_EXCEPT_OK
+            _LOGGER.exception("trusted edge refresh failed")
 
 
 def _rediscover_file_managers() -> None:
@@ -2042,6 +2090,9 @@ def _post_auth_login_totp(principal, match, query, body):
     # generic 401 the combined form returns, so the endpoint leaks nothing
     # about challenge state to a caller probing it.
     client = body.get("_socket_client")
+    if body.get("cancel") is True:
+        panel_auth.cancel_login(body.get("challenge"), client=client)
+        return 200, {"ok": True}
     result = panel_auth.complete_login(body.get("challenge"), body.get("code"), client=client)
     if result is None:
         if panel_auth.client_throttled(client):
@@ -2506,10 +2557,22 @@ def _delete_firewall_port(principal, match, query, body):
 
 def _post_firewall_enable(principal, match, query, body):
     exposure = panel_exposure.exposure_status()
-    if exposure.get("exposed") and exposure.get("domain"):
-        port = exposure.get("target_port") or panel_exposure.DEFAULT_PANEL_PORT
+    router_present = exposure.get("router_present", exposure.get("exposed", False))
+    if router_present:
+        recognised = exposure.get("recognised", exposure.get("recognized", True))
+        domain = exposure.get("domain")
+        port = exposure.get("target_port")
+        try:
+            validate_domain(domain)
+            normalized_port = firewall_ports.validate_port(port)
+            if ":" in normalized_port:
+                raise ValueError("panel exposure target port must be a single port")
+        except (TypeError, ValueError) as exc:
+            raise PanelError(400, f"refusing to enable firewall: panel router is unrecognized or malformed ({exc})") from None
+        if not recognised:
+            raise PanelError(400, "refusing to enable firewall: panel router is unrecognized or malformed")
         edge_firewall = panel_exposure.ensure_panel_edge_firewall(
-            port, domain=exposure.get("domain"),
+            int(normalized_port), domain=domain,
         )
         result = edge_firewall if edge_firewall.exit_code != 0 else firewall_ports.enable()
     else:
@@ -3963,6 +4026,12 @@ def make_panel_server(config: PanelConfig) -> ThreadingHTTPServer:
         target=_idle_reap_loop,
         args=(server._reaper_stop,),
         name="wpfy-fm-reaper",
+        daemon=True,
+    ).start()
+    threading.Thread(
+        target=_trusted_edge_refresh_loop,
+        args=(server._reaper_stop,),
+        name="wpfy-edge-refresh",
         daemon=True,
     ).start()
     return server

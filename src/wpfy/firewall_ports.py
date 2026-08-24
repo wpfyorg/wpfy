@@ -47,7 +47,7 @@ _PROTOCOLS = ("tcp", "udp")
 _ACTIONS = ("allow", "deny", "reject")
 PANEL_EDGE_RULE_COMMENT = "wpfy panel edge ingress"
 PANEL_EDGE_RULE_MARKER = PANEL_EDGE_RULE_COMMENT
-_LINUX_INTERFACE_RE = re.compile(r"^[A-Za-z0-9_.-]{1,15}$")
+_LINUX_INTERFACE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,14}$")
 _RFC1918_NETWORKS: tuple[ipaddress.IPv4Network, ...] = (
     cast(ipaddress.IPv4Network, ipaddress.ip_network("10.0.0.0/8")),
     cast(ipaddress.IPv4Network, ipaddress.ip_network("172.16.0.0/12")),
@@ -558,7 +558,28 @@ class _AddedPanelEdgeRule:
 
 
 def _panel_edge_marker(comment: str) -> bool:
-    return comment.startswith(PANEL_EDGE_RULE_MARKER)
+    return comment == PANEL_EDGE_RULE_MARKER
+
+
+def _line_has_exact_panel_edge_marker(line: str) -> bool:
+    """Find an exact marker candidate without trusting shell parsing.
+
+    This deliberately recognizes an unterminated quoted marker too. Such a
+    line is evidence of a managed rule that cannot be safely removed, not
+    evidence that no managed rule exists.
+    """
+    marker = re.escape(PANEL_EDGE_RULE_MARKER)
+    return re.search(
+        rf"(?i:\bcomment)\s+(?:['\"]{marker}(?=['\"]|$)|{marker}(?=['\"]|$))",
+        line,
+    ) is not None
+
+
+def _panel_edge_parse_failure(line: str, reason: str) -> RuntimeResult:
+    return RuntimeResult(
+        1,
+        f"refusing to change panel edge ingress: exact managed marker rule has {reason}: {line.strip()!r}",
+    )
 
 
 def _normalise_added_source(value: str) -> str | None:
@@ -639,6 +660,36 @@ def _panel_edge_added_rules(output: str) -> tuple[_AddedPanelEdgeRule, ...]:
     )
 
 
+def _parse_panel_edge_added(output: str) -> tuple[_AddedPanelEdgeRule, ...] | RuntimeResult:
+    """Parse managed rules, failing closed on every exact-marker candidate."""
+    for line in output.splitlines():
+        if not _line_has_exact_panel_edge_marker(line):
+            continue
+        try:
+            tokens = shlex.split(line.strip())
+        except ValueError:
+            return _panel_edge_parse_failure(line, "malformed quoting")
+
+        if tokens[1:2] != ["allow"]:
+            if tokens[1:2] and tokens[1].lower() == "allow":
+                return _panel_edge_parse_failure(line, "uppercase action")
+            return _panel_edge_parse_failure(line, "unsupported grammar")
+        if len(tokens) < 15:
+            try:
+                comment_index = tokens.index("comment", 2)
+            except ValueError:
+                return _panel_edge_parse_failure(line, "unsupported grammar")
+            rule = tokens[1:comment_index]
+            expected_prefix = ["allow", "in", "on"]
+            if rule[:len(expected_prefix)] == expected_prefix:
+                return _panel_edge_parse_failure(line, "truncated output")
+            return _panel_edge_parse_failure(line, "unsupported grammar")
+        if _parse_panel_edge_added_line(line) is None:
+            return _panel_edge_parse_failure(line, "unsupported grammar")
+
+    return _panel_edge_added_rules(output)
+
+
 def _panel_edge_added() -> tuple[_AddedPanelEdgeRule, ...] | RuntimeResult:
     if not ufw_available():
         return RuntimeResult(1, "ufw is not installed on this host; install it with: apt-get install -y ufw")
@@ -647,7 +698,7 @@ def _panel_edge_added() -> tuple[_AddedPanelEdgeRule, ...] | RuntimeResult:
     code, output = _run(["show", "added"])
     if code != 0:
         return RuntimeResult(code, output)
-    return _panel_edge_added_rules(output)
+    return _parse_panel_edge_added(output)
 
 
 def ensure_panel_edge_rule(
@@ -680,8 +731,6 @@ def ensure_panel_edge_rule(
     desired_seen = False
     stale: list[_AddedPanelEdgeRule] = []
     for rule in current:
-        if rule.port != spec.port:
-            continue
         if rule.matches(spec) and not desired_seen:
             desired_seen = True
         else:

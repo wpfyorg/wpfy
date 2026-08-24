@@ -126,7 +126,10 @@ _NEVER_BAN_STATIC_CIDRS = ("0.0.0.0/32", "127.0.0.0/8", "::1/128", "172.17.0.0/1
 # A discovery failure is deliberately not cached.
 _NEVER_BAN_EDGE_LOCK = threading.Lock()
 _NEVER_BAN_EDGE_TTL_SECONDS = 30
+_NEVER_BAN_EDGE_GRACE_SECONDS = 60
 _NEVER_BAN_EDGE_CACHE: tuple[tuple[str, ...], float] | None = None
+_NEVER_BAN_EDGE_STALE: tuple[str, ...] = ()
+_NEVER_BAN_EDGE_GRACE_UNTIL = 0.0
 _NEVER_BAN_EDGE_REQUEST_SAFE = False
 
 _PANEL_AUTH_LOG_MAX_BYTES = int(
@@ -279,7 +282,7 @@ def _discover_never_ban_edge_cidrs() -> tuple[str, ...]:
     not on the network) is not cached so a transient outage re-attempts on the
     next record. Same contract as ``panel.trusted_edge_networks``.
     """
-    global _NEVER_BAN_EDGE_CACHE
+    global _NEVER_BAN_EDGE_CACHE, _NEVER_BAN_EDGE_STALE, _NEVER_BAN_EDGE_GRACE_UNTIL
     now = time.monotonic()
     with _NEVER_BAN_EDGE_LOCK:
         cached = _NEVER_BAN_EDGE_CACHE
@@ -312,10 +315,19 @@ def _discover_never_ban_edge_cidrs() -> tuple[str, ...]:
         # Docker outage must not pin the empty set for the cache TTL; the
         # next record re-attempts discovery (same contract as
         # `panel.trusted_edge_networks`).
+        now = time.monotonic()
+        with _NEVER_BAN_EDGE_LOCK:
+            if _NEVER_BAN_EDGE_CACHE is not None and _NEVER_BAN_EDGE_GRACE_UNTIL > now:
+                return _NEVER_BAN_EDGE_STALE
         return ()
     result = tuple(sorted(set(discovered)))
+    expires_at = time.monotonic() + _NEVER_BAN_EDGE_TTL_SECONDS
     with _NEVER_BAN_EDGE_LOCK:
-        _NEVER_BAN_EDGE_CACHE = (result, time.monotonic() + _NEVER_BAN_EDGE_TTL_SECONDS)
+        # Immutable snapshot replacement: readers see old or new topology,
+        # never a partially refreshed set.
+        _NEVER_BAN_EDGE_CACHE = (result, expires_at)
+        _NEVER_BAN_EDGE_STALE = result
+        _NEVER_BAN_EDGE_GRACE_UNTIL = expires_at + _NEVER_BAN_EDGE_GRACE_SECONDS
     return result
 
 
@@ -331,7 +343,14 @@ def _client_ip_is_never_ban(value: str) -> bool:
         return True
     if cloudflare_ranges.is_cloudflare_ip(value):
         return True
-    return _address_in_networks(value, cached_never_ban_edge_cidrs())
+    if _address_in_networks(value, cached_never_ban_edge_cidrs()):
+        return True
+    # Once grace ends, stop trusting stale topology for forwarded-client
+    # resolution, but keep the last observed proxy identities fail2ban-safe.
+    # Otherwise an expired cache could emit the Traefik peer as bannable.
+    with _NEVER_BAN_EDGE_LOCK:
+        stale = _NEVER_BAN_EDGE_STALE
+    return _address_in_networks(value, stale)
 
 
 def cached_never_ban_edge_cidrs() -> tuple[str, ...]:
@@ -346,17 +365,19 @@ def cached_never_ban_edge_cidrs() -> tuple[str, ...]:
         cached = _NEVER_BAN_EDGE_CACHE
         if cached is not None and cached[1] > now:
             return cached[0]
+        # Failed refreshes retain last-known-good infrastructure identities for
+        # bounded grace. This protects fail2ban from banning a trusted proxy
+        # while Docker is unavailable, without trusting stale topology forever.
+        if cached is not None and _NEVER_BAN_EDGE_GRACE_UNTIL > now:
+            return _NEVER_BAN_EDGE_STALE
     return ()
 
 
 def refresh_never_ban_edge_cidrs() -> tuple[str, ...]:
     """Refresh edge exclusions outside request handling."""
-    global _NEVER_BAN_EDGE_CACHE, _NEVER_BAN_EDGE_REQUEST_SAFE
+    global _NEVER_BAN_EDGE_REQUEST_SAFE
     discovered = _discover_never_ban_edge_cidrs()
     _NEVER_BAN_EDGE_REQUEST_SAFE = True
-    if discovered:
-        with _NEVER_BAN_EDGE_LOCK:
-            _NEVER_BAN_EDGE_CACHE = (tuple(discovered), time.monotonic() + _NEVER_BAN_EDGE_TTL_SECONDS)
     return discovered
 
 
@@ -1367,6 +1388,7 @@ def login(
     username_key = username if isinstance(username, str) and _USERNAME.fullmatch(username) else ""
     client_key = _client_key(client)
     now = time.time()
+    challenge_now = time.monotonic()
     if client_throttled(client_key):
         _append_panel_auth_failure("password", client, username_key, "throttled")
         return None
@@ -1374,7 +1396,7 @@ def login(
         with _STATE_LOCK:
             # Any auth-state touch prunes expired pending challenges, so
             # the table drains even when no new challenge is created.
-            _prune_pending_logins(now)
+            _prune_pending_logins(challenge_now)
             failure = _LOGIN_FAILURES.get(username_key)
             locked = failure is not None and failure.locked_until > now
             if failure is not None and failure.locked_until and failure.locked_until <= now:
@@ -1457,6 +1479,7 @@ def login_password(username: object, password: object, *, client=None) -> Passwo
     username_key = username if isinstance(username, str) and _USERNAME.fullmatch(username) else ""
     client_key = _client_key(client)
     now = time.time()
+    challenge_now = time.monotonic()
     if client_throttled(client_key):
         _append_panel_auth_failure("password", client, username_key, "throttled")
         return None
@@ -1506,7 +1529,7 @@ def login_password(username: object, password: object, *, client=None) -> Passwo
                 # the only handle: random, single-use, client-bound, short-lived.
                 # Failure counters are deliberately left alone -- the login has
                 # not succeeded yet, and step 2 keeps counting against both.
-                _prune_pending_logins(now)
+                _prune_pending_logins(challenge_now)
                 if len(_PENDING_LOGINS) >= MAX_PENDING_LOGINS or sum(
                     1 for p in _PENDING_LOGINS.values() if p.username == username_key
                 ) >= MAX_PENDING_LOGINS_PER_USER:
@@ -1523,7 +1546,7 @@ def login_password(username: object, password: object, *, client=None) -> Passwo
                     username=username_key,
                     credential_fingerprint=credential_fingerprint,
                     client=client_key,
-                    expires_at=now + PENDING_LOGIN_TTL_SECONDS,
+                    expires_at=challenge_now + PENDING_LOGIN_TTL_SECONDS,
                 )
                 return PasswordLoginOutcome(challenge=challenge)
             _LOGIN_FAILURES.pop(username_key, None)
@@ -1554,6 +1577,7 @@ def complete_login(challenge: object, code: object, *, client=None) -> tuple[str
     """
     client_key = _client_key(client)
     now = time.time()
+    challenge_now = time.monotonic()
     if client_throttled(client_key):
         # Consulted before consuming the challenge: a throttled client may
         # still hold a valid challenge when its cooldown expires.
@@ -1562,7 +1586,7 @@ def complete_login(challenge: object, code: object, *, client=None) -> tuple[str
     pending = None
     if isinstance(challenge, str) and challenge:
         with _STATE_LOCK:
-            _prune_pending_logins(now)
+            _prune_pending_logins(challenge_now)
             pending = _PENDING_LOGINS.pop(challenge, None)
     if (
         pending is None
@@ -1583,7 +1607,7 @@ def complete_login(challenge: object, code: object, *, client=None) -> tuple[str
             _register_client_failure(client_key, now)
         _append_panel_auth_failure("password", client, pending.username, "invalid_credentials")
         return None
-    if pending.expires_at <= now:
+    if pending.expires_at <= challenge_now:
         with _STATE_LOCK:
             _register_client_failure(client_key, now)
         _append_panel_auth_failure("password", client, pending.username, "invalid_credentials")
@@ -1599,6 +1623,15 @@ def complete_login(challenge: object, code: object, *, client=None) -> tuple[str
         return None
 
     with _STATE_LOCK, _store_lock():
+        # Lock acquisition can consume the whole challenge lifetime. Re-read
+        # monotonic time inside final issuance transaction; expiry is rejected
+        # at the boundary (`expires_at <= now`) even if pre-check passed.
+        now = time.time()
+        challenge_now = time.monotonic()
+        if pending.expires_at <= challenge_now:
+            _register_client_failure(client_key, now)
+            _append_panel_auth_failure("password", client, username_key, "invalid_credentials")
+            return None
         _prune_sessions(now)
         # Recheck lockout and client throttle atomically with issuance. The
         # checks above ran before the challenge was consumed; a lockout or
@@ -1647,6 +1680,23 @@ def complete_login(challenge: object, code: object, *, client=None) -> tuple[str
         _prune_user_sessions(username_key)
         _prune_sessions(now)
     return token, _public_user(user)
+
+
+def cancel_login(challenge: object, *, client=None) -> None:
+    """Discard an abandoned two-step challenge without counting a failure.
+
+    Browsing back from the code step must not leave unauthenticated pending
+    entries filling the bounded challenge table. Cancellation grants no auth
+    capability, so a missing, malformed, or foreign challenge is a harmless
+    no-op.
+    """
+    if not isinstance(challenge, str) or not challenge:
+        return
+    client_key = _client_key(client)
+    with _STATE_LOCK:
+        pending = _PENDING_LOGINS.get(challenge)
+        if pending is not None and pending.client == client_key:
+            _PENDING_LOGINS.pop(challenge, None)
 
 
 def authenticate_session(token: object) -> dict | None:
@@ -1759,7 +1809,8 @@ def revoke_session_by_id(username: str, token_id: object) -> bool:
 
 
 def reset_state() -> None:
-    global _NEVER_BAN_EDGE_CACHE, _NEVER_BAN_EDGE_REQUEST_SAFE
+    global _NEVER_BAN_EDGE_CACHE, _NEVER_BAN_EDGE_STALE, _NEVER_BAN_EDGE_GRACE_UNTIL
+    global _NEVER_BAN_EDGE_REQUEST_SAFE
     with _STATE_LOCK:
         _SESSIONS.clear()
         _LOGIN_FAILURES.clear()
@@ -1772,4 +1823,6 @@ def reset_state() -> None:
         _LOGIN_KDF_CLIENTS.clear()
     with _NEVER_BAN_EDGE_LOCK:
         _NEVER_BAN_EDGE_CACHE = None
+        _NEVER_BAN_EDGE_STALE = ()
+        _NEVER_BAN_EDGE_GRACE_UNTIL = 0.0
     _NEVER_BAN_EDGE_REQUEST_SAFE = False
