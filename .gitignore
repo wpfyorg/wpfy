@@ -49,3 +49,8 @@ codedebrief-out/codedebrief.toml
 
 # Sandbox created by scripts/panel-demo.sh
 .panel-demo/
+_bmad/
+.agent/
+.claude/
+.playwright/
+.agents/
