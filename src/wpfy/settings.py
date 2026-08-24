@@ -24,6 +24,39 @@ class WpfyPaths:
         return os.path.join(self.state_dir, "tmp")
 
     @property
+    def updater_dir(self) -> str:
+        """Private, durable updater state (downloads, lock, and state file)."""
+        return os.environ.get("WPFY_UPDATER_DIR", os.path.join(self.state_dir, "updates"))
+
+    @property
+    def update_dir(self) -> str:
+        return self.updater_dir
+
+    @property
+    def releases_dir(self) -> str:
+        return os.path.join(self.install_root, "releases")
+
+    @property
+    def release_dir(self) -> str:
+        return self.releases_dir
+
+    @property
+    def current_link(self) -> str:
+        return os.path.join(self.install_root, "current")
+
+    @property
+    def update_lock_path(self) -> str:
+        return os.path.join(self.updater_dir, "update.lock")
+
+    @property
+    def update_state_path(self) -> str:
+        return os.path.join(self.updater_dir, "state.json")
+
+    @property
+    def update_keyring_path(self) -> str:
+        return os.environ.get("WPFY_UPDATE_KEYRING", os.path.join(self.config_dir, "update_trust.gpg"))
+
+    @property
     def traefik_dir(self) -> str:
         return os.environ.get("WPFY_TRAEFIK_DIR", os.path.join(self.install_root, "traefik"))
 

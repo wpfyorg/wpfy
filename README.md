@@ -73,6 +73,23 @@ sudo WPFY_REF=v1.0.0-rc7 \
 
 Take the checksum from the [v1.0.0-rc7 release](https://github.com/wpfyorg/wpfy/releases/tag/v1.0.0-rc7) — it is the official source-archive SHA-256 for that tag, and pasting one from an earlier release will correctly abort the install. The installer logs to `/var/log/wpfy/install.log`; `--dry-run`, `--verbose`, and `--no-color` are available when needed.
 
+The installer also places the updater's public trust anchor at
+`/etc/wpfy/update_trust.gpg` with root ownership. Updater release manifests and
+wheels are accepted only from the signed GitHub release lane; no PyPI or branch
+updates are used. Inspect local state without network access, then explicitly
+check or apply:
+
+```bash
+wpfy update
+wpfy update --check
+wpfy update --apply --yes
+wpfy update --rollback
+```
+
+RC checks require an explicit channel endpoint through
+`WPFY_UPDATE_RC_MANIFEST_URL`; `--force` remains only a deprecated alias for
+`--apply --yes`.
+
 ### Create, secure, and verify a site
 
 ```bash

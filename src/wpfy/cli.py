@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 from datetime import datetime
 import getpass
-import importlib.metadata
 import ipaddress
 import json
 import os
@@ -19,8 +18,6 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Final, Iterable
-from urllib.error import URLError
-from urllib.request import Request, urlopen
 
 from . import __version__
 from . import backup_schedule
@@ -46,6 +43,7 @@ from . import site_lifecycle
 from . import stack
 from . import telemetry
 from . import operational_inspection
+from . import update_lifecycle
 from .php_runtime import DEFAULT_PHP_VERSION, SUPPORTED_PHP_VERSIONS
 from .certificate_lifecycle import cert_expiry_days, force_renew_cert, get_cert_info, preflight_ssl
 from .site_definition import DNS_PROVIDERS, LETSENCRYPT_MODES, PAGE_CACHE_OPTIONS, SiteDefinition
@@ -774,80 +772,152 @@ def add_update_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentPa
         help="Check for and install new wpfy releases.",
     )
     actions = parser.add_mutually_exclusive_group()
-    actions.add_argument("--check", action="store_true", help="check published version metadata (PyPI)")
-    actions.add_argument("--force", action="store_true", help="force upgrade wpfy via pip")
+    actions.add_argument("--check", action="store_true", help="verify the remote release manifest")
+    actions.add_argument("--apply", action="store_true", help="stage and activate verified release")
+    actions.add_argument("--rollback", action="store_true", help="activate the retained local release")
+    actions.add_argument(
+        "--force", action="store_true",
+        help="deprecated alias for --apply --yes",
+    )
+    parser.add_argument("--dry-run", action="store_true", help="verify an apply without changing local state")
+    parser.add_argument("--channel", choices=("stable", "rc"), default="stable")
+    parser.add_argument("--yes", action="store_true", help="confirm transactional apply")
+    parser.add_argument("--json", action="store_true", help="emit structured updater output")
     parser.set_defaults(handler=handle_update)
 
 
+def _update_state_payload(state: update_lifecycle.UpdateState) -> dict[str, object]:
+    return {
+        "active_version": state.active_version,
+        "active_sequence": state.active_sequence,
+        "active_channel": state.active_channel,
+        "last_outcome": state.last_outcome,
+        "updated_at": state.updated_at,
+    }
+
+
+def _update_manifest_payload(manifest: update_lifecycle.ReleaseManifest | None) -> dict[str, object] | None:
+    if manifest is None:
+        return None
+    return {
+        "version": manifest.version,
+        "channel": manifest.channel,
+        "sequence": manifest.sequence,
+        "platform": manifest.platform,
+        "wheel_size": manifest.wheel_size,
+    }
+
+
+def _update_json(payload: dict[str, object]) -> CommandResult:
+    value = payload.get("exit_code", 0)
+    code = value if isinstance(value, int) else 0
+    return CommandResult(json.dumps(payload, sort_keys=True), raw_output=True, exit_code=code)
+
+
+def _update_failure_message(exit_code: int, action: str) -> str:
+    messages = {
+        int(update_lifecycle.UpdateExitCode.BUSY): "updater busy; retry after current operation finishes",
+        int(update_lifecycle.UpdateExitCode.INVALID): "release manifest or updater request rejected",
+        int(update_lifecycle.UpdateExitCode.SIGNATURE): "release signature verification failed",
+        int(update_lifecycle.UpdateExitCode.INTEGRITY): "release integrity verification failed",
+        int(update_lifecycle.UpdateExitCode.DOWNLOAD): "release download failed; active release unchanged",
+        int(update_lifecycle.UpdateExitCode.STAGING): "release staging failed; active release unchanged",
+        int(update_lifecycle.UpdateExitCode.ACTIVATION): "activation failed; previous release restored",
+        int(update_lifecycle.UpdateExitCode.ROLLBACK): "local rollback failed; active release unchanged",
+    }
+    return messages.get(exit_code, f"updater {action} failed")
+
+
+def _update_error_result(args: argparse.Namespace, action: str, error: update_lifecycle.UpdaterError) -> CommandResult:
+    code = int(getattr(error, "exit_code", update_lifecycle.UpdateExitCode.ERROR))
+    message = _update_failure_message(code, action)
+    if getattr(args, "json", False):
+        return _update_json({"action": action, "exit_code": code, "status": "failed", "message": message})
+    return CommandResult(_render_summary("wpfy update", [f"action: {action}", f"FAIL {message}"]), exit_code=code)
+
+
 def handle_update(args: argparse.Namespace) -> CommandResult:
-    check: bool = getattr(args, "check", False)
-    force: bool = getattr(args, "force", False)
+    check = bool(getattr(args, "check", False))
+    apply = bool(getattr(args, "apply", False))
+    rollback = bool(getattr(args, "rollback", False))
+    force = bool(getattr(args, "force", False))
+    dry_run = bool(getattr(args, "dry_run", False))
+    channel = str(getattr(args, "channel", "stable"))
+    json_output = bool(getattr(args, "json", False))
+    yes = bool(getattr(args, "yes", False)) or force
 
-    current_version: str
+    action = "apply" if force else ("check" if check else "apply" if apply else "rollback" if rollback else "status")
+    if dry_run and action != "apply":
+        message = "--dry-run requires --apply"
+        if json_output:
+            return _update_json({"action": action, "exit_code": int(update_lifecycle.UpdateExitCode.INVALID), "status": "failed", "message": message})
+        return CommandResult(_render_summary("wpfy update", [f"FAIL {message}"]), exit_code=int(update_lifecycle.UpdateExitCode.INVALID))
+    if apply and not yes and not dry_run:
+        message = "apply requires confirmation; rerun with --apply --yes"
+        if json_output:
+            return _update_json({"action": "apply", "exit_code": int(update_lifecycle.UpdateExitCode.INVALID), "status": "failed", "message": message})
+        return CommandResult(_render_summary("wpfy update", [f"FAIL {message}"]), exit_code=int(update_lifecycle.UpdateExitCode.INVALID))
+
     try:
-        current_version = importlib.metadata.version("wpfy")
-    except importlib.metadata.PackageNotFoundError:
-        current_version = __version__
+        updater = update_lifecycle.Updater()
+        if action == "status":
+            state = updater.status()
+            payload = {"action": "status", "exit_code": 0, "status": "ok", **_update_state_payload(state)}
+            if json_output:
+                return _update_json(payload)
+            version = state.active_version or __version__
+            return CommandResult(_render_summary("wpfy update", [f"active: {version}", f"sequence: {state.active_sequence}", "status: local state only"]))
 
-    if not check and not force:
-        return CommandResult(
-            _render_summary(
-                "wpfy update",
-                [
-                    f"version: {current_version}",
-                    "hint: use --check to see available updates or --force to upgrade",
-                ],
-            )
-        )
+        if action == "check" or dry_run:
+            result = updater.check(channel=channel)
+            if result.manifest is None:
+                code = int(result.exit_code or update_lifecycle.UpdateExitCode.INVALID)
+                message = _update_failure_message(code, "check")
+                if json_output:
+                    return _update_json({"action": "check", "channel": channel, "exit_code": code, "status": "failed", "message": message})
+                return CommandResult(_render_summary("wpfy update", [f"FAIL {message}"]), exit_code=code)
+            payload = {
+                "action": "apply" if dry_run else "check", "channel": channel, "exit_code": 0,
+                "status": "update-available" if result.update_available else "current",
+                "update_available": result.update_available, "manifest": _update_manifest_payload(result.manifest),
+                "rolled_back": False,
+                **_update_state_payload(result.state),
+            }
+            if json_output:
+                return _update_json(payload)
+            lines = [f"channel: {channel}", f"available: {'yes' if result.update_available else 'no'}", f"candidate: {result.manifest.version}"]
+            if dry_run:
+                lines.append("dry-run: no changes made")
+            return CommandResult(_render_summary("wpfy update", lines))
 
-    try:
-        req = Request(
-            "https://pypi.org/pypi/wpfy/json",
-            headers={"Accept": "application/json"},
-        )
-        with urlopen(req, timeout=10) as resp:
-            pypi_data = json.loads(resp.read().decode())
-        latest = pypi_data["info"]["version"]
-        if not isinstance(latest, str) or not latest.strip():
-            raise ValueError("PyPI version is missing or invalid")
-    except (URLError, json.JSONDecodeError, KeyError, TypeError, ValueError, OSError) as e:
-        if force:
-            return CommandResult(_render_summary("wpfy update", [f"version: {current_version}", f"FAIL cannot fetch latest version from PyPI: {e}"]), exit_code=2)
-        return CommandResult(_render_summary("wpfy update", [f"version: {current_version}", f"PyPI check unavailable: {e}"]))
+        if action == "apply":
+            result = updater.apply(channel=channel)
+            if not result.ok:
+                message = _update_failure_message(result.exit_code, "apply")
+                if json_output:
+                    return _update_json({"action": "apply", "channel": channel, "exit_code": result.exit_code, "status": "failed", "message": message, "rolled_back": result.rolled_back})
+                return CommandResult(_render_summary("wpfy update", [f"channel: {channel}", f"FAIL {message}"]), exit_code=result.exit_code)
+            payload = {"action": "apply", "channel": channel, "exit_code": 0, "status": "activated", "version": result.version, "changed": result.changed, "rolled_back": result.rolled_back}
+            if json_output:
+                return _update_json(payload)
+            return CommandResult(_render_summary("wpfy update", [f"channel: {channel}", f"activated: {result.version}", "status: update complete"]))
 
-    if check:
-        if current_version == latest:
-            return CommandResult(_render_summary("wpfy update", [f"installed: {current_version}", "status: up-to-date"]))
-        return CommandResult(_render_summary(
-            "wpfy update",
-            [
-                f"installed: {current_version}",
-                f"latest published: {latest}",
-                "status: installed and published versions differ",
-                "hint: use --force to run pip upgrade",
-            ],
-        ))
-
-    if force:
-        if current_version == latest:
-            return CommandResult(_render_summary("wpfy update", [f"installed: {current_version}", "status: already latest"]))
-        proc = subprocess.run(
-            [sys.executable, "-m", "pip", "install", "--upgrade", "wpfy"],
-            check=False, capture_output=True, text=True,
-        )
-        if proc.returncode != 0:
-            err = proc.stderr.strip() or proc.stdout.strip() or "pip install failed"
-            return CommandResult(_render_summary("wpfy update", [f"version: {current_version}", f"FAIL upgrade failed: {err}"]), exit_code=proc.returncode)
-        return CommandResult(_render_summary(
-            "wpfy update",
-            [
-                f"installed before command: {current_version}",
-                f"latest published: {latest}",
-                "status: pip upgrade command completed",
-            ],
-        ))
-
-    return CommandResult(_render_summary("wpfy update", [f"version: {current_version}"]))
+        result = updater.rollback()
+        if not result.ok:
+            message = _update_failure_message(result.exit_code, "rollback")
+            if json_output:
+                return _update_json({"action": "rollback", "exit_code": result.exit_code, "status": "failed", "message": message})
+            return CommandResult(_render_summary("wpfy update", [f"FAIL {message}"]), exit_code=result.exit_code)
+        if json_output:
+            return _update_json({"action": "rollback", "exit_code": 0, "status": "rolled-back", "version": result.version, "changed": result.changed, "rolled_back": True})
+        return CommandResult(_render_summary("wpfy update", [f"rolled back to: {result.version}", "status: rollback complete"]))
+    except update_lifecycle.UpdaterError as error:
+        return _update_error_result(args, action, error)
+    except Exception:
+        message = "updater operation failed; inspect local updater status and retry"
+        if json_output:
+            return _update_json({"action": action, "exit_code": int(update_lifecycle.UpdateExitCode.ERROR), "status": "failed", "message": message})
+        return CommandResult(_render_summary("wpfy update", [f"FAIL {message}"]), exit_code=int(update_lifecycle.UpdateExitCode.ERROR))
 
 
 def _add_site_create_arguments(parser: argparse.ArgumentParser) -> None:

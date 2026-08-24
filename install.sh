@@ -7,6 +7,9 @@ REF="${WPFY_REF:-main}"
 SOURCE_ARCHIVE="${WPFY_SOURCE_ARCHIVE:-https://github.com/${REPO_OWNER}/${REPO_NAME}/archive/${REF}.tar.gz}"
 SOURCE_SHA256="${WPFY_SOURCE_SHA256:-}"
 LOG_FILE="${WPFY_INSTALL_LOG:-/var/log/wpfy/install.log}"
+INSTALL_ROOT="${WPFY_INSTALL_ROOT:-/opt/wpfy}"
+CONFIG_DIR="${WPFY_CONFIG_DIR:-/etc/wpfy}"
+BIN_PATH="/usr/local/bin/wpfy"
 DRY_RUN="${WPFY_DRY_RUN:-0}"
 VERBOSE="${WPFY_VERBOSE:-0}"
 NO_COLOR_REQUESTED="${WPFY_NO_COLOR:-0}"
@@ -17,6 +20,8 @@ CURRENT_STEP=0
 CURRENT_STEP_LABEL=""
 CURRENT_STEP_COMMAND=""
 CURRENT_STEP_LOG=""
+WRAPPER_TEMP=""
+TRUST_TEMP=""
 STEP_STATUS="OK"
 USE_TTY=0
 
@@ -217,6 +222,8 @@ on_interrupt() {
 cleanup() {
     restore_terminal
     [[ -n "$TMP_ROOT" ]] && rm -rf "$TMP_ROOT"
+    [[ -n "$WRAPPER_TEMP" ]] && rm -f -- "$WRAPPER_TEMP"
+    [[ -n "$TRUST_TEMP" ]] && rm -f -- "$TRUST_TEMP"
 }
 
 download_archive() {
@@ -270,6 +277,107 @@ validate_source_bundle() {
     printf '%s\n' "$source_dir" >"$TMP_ROOT/source-dir"
 }
 
+install_stable_wrapper() {
+    local wrapper_dir
+    wrapper_dir="$(dirname "$BIN_PATH")"
+    [[ ! -L "$wrapper_dir" ]] || die "refusing wrapper directory symlink"
+    mkdir -p "$wrapper_dir"
+    local temporary
+    temporary="$(mktemp "$wrapper_dir/.wpfy-wrapper.XXXXXX")"
+    WRAPPER_TEMP="$temporary"
+    {
+        printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail' '' "VENV_BIN=$(printf '%q' "$INSTALL_ROOT/current/venv/bin/wpfy")"
+        cat <<'EOF'
+if [[ "$(id -u)" -eq 0 || -n "${WPFY_NO_SELF_ELEVATE:-}" ]]; then
+    exec "$VENV_BIN" "$@"
+fi
+if ! command -v sudo >/dev/null 2>&1; then
+    printf '%s\n' 'wpfy: root privileges required and sudo is not available' >&2
+    exit 1
+fi
+exec sudo -- "$VENV_BIN" "$@"
+EOF
+    } >"$temporary"
+    chmod 755 "$temporary"
+    chown root:root "$temporary"
+    mv -f -- "$temporary" "$BIN_PATH"
+    WRAPPER_TEMP=""
+    python3 - "$wrapper_dir" <<'PY'
+import os
+import sys
+
+fd = os.open(sys.argv[1], os.O_RDONLY)
+try:
+    os.fsync(fd)
+finally:
+    os.close(fd)
+PY
+}
+
+install_update_trust() {
+    [[ "$DRY_RUN" == "1" ]] && return 0
+    local source_dir="$1"
+    local source_key="$source_dir/src/wpfy/update_trust.gpg"
+    local destination="$CONFIG_DIR/update_trust.gpg"
+    [[ -f "$source_key" && ! -L "$source_key" ]] || die "bundled updater trust anchor is missing"
+    [[ ! -L "$CONFIG_DIR" ]] || die "refusing updater config symlink"
+    mkdir -p "$CONFIG_DIR"
+    chmod 750 "$CONFIG_DIR"
+    chown root:root "$CONFIG_DIR"
+    local temporary
+    temporary="$(mktemp "$CONFIG_DIR/.update_trust.gpg.XXXXXX")"
+    TRUST_TEMP="$temporary"
+    chmod 644 "$temporary"
+    cp -- "$source_key" "$temporary"
+    chown root:root "$temporary"
+    mv -f -- "$temporary" "$destination"
+    TRUST_TEMP=""
+    chmod 644 "$destination"
+    python3 - "$CONFIG_DIR" <<'PY'
+import os
+import sys
+
+fd = os.open(sys.argv[1], os.O_RDONLY)
+try:
+    os.fsync(fd)
+finally:
+    os.close(fd)
+PY
+}
+
+ensure_versioned_layout() {
+    [[ "$DRY_RUN" == "1" ]] && return 0
+    local releases current app venv release stamp
+    releases="$INSTALL_ROOT/releases"
+    current="$INSTALL_ROOT/current"
+    app="$INSTALL_ROOT/app"
+    venv="$INSTALL_ROOT/venv"
+    mkdir -p "$INSTALL_ROOT" "$releases"
+
+    if [[ -L "$current" ]]; then
+        install_stable_wrapper
+        return 0
+    fi
+    [[ ! -e "$current" ]] || die "refusing to replace non-symlink $current"
+    if [[ ! -e "$app" && ! -e "$venv" ]]; then
+        install_stable_wrapper
+        return 0
+    fi
+
+    stamp="$(date -u +%Y%m%d%H%M%S)-$$"
+    release="$releases/legacy-$stamp"
+    mkdir "$release"
+    [[ ! -L "$app" ]] || die "legacy app path is unexpectedly a symlink"
+    [[ ! -L "$venv" ]] || die "legacy venv path is unexpectedly a symlink"
+    [[ ! -e "$app" ]] || mv "$app" "$release/app"
+    [[ ! -e "$venv" ]] || mv "$venv" "$release/venv"
+    ln -s "releases/$(basename "$release")" "$current"
+    [[ ! -e "$app" ]] && ln -s "current/app" "$app"
+    [[ ! -e "$venv" ]] && ln -s "current/venv" "$venv"
+    chmod 750 "$release"
+    install_stable_wrapper
+}
+
 main() {
     local installer_args=()
     while [[ $# -gt 0 ]]; do
@@ -307,6 +415,8 @@ main() {
     WPFY_VERBOSE="$VERBOSE" \
     WPFY_NO_COLOR="$NO_COLOR_REQUESTED" \
         bash "$source_dir/wpfy" --skip-wpfy-install "${installer_args[@]}"
+    install_update_trust "$source_dir"
+    ensure_versioned_layout
 }
 
 main "$@"
