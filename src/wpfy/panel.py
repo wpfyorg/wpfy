@@ -1968,20 +1968,81 @@ def _post_setup_totp(principal, match, query, body):
     raise PanelError(400, "setup TOTP action must be begin, verify, or skip")
 
 
+def _login_throttle_or_unauthorized(client: object) -> PanelError:
+    """Map a failed login attempt to its response: 429 when the client just
+    crossed (or is serving) a cooldown, else the generic 401."""
+    if panel_auth.client_throttled(client):
+        retry_after = panel_auth.client_retry_after(client)
+        headers = {"Retry-After": str(retry_after)} if retry_after > 0 else {}
+        return PanelError(429, "too many failed login attempts; try again later", headers)
+    return PanelError(401, "invalid credentials")
+
+
 def _post_auth_login(principal, match, query, body):
     client = body.get("_socket_client")
+    if "totp" not in body:
+        # Two-step contract: no code field at all means step 1. A TOTP
+        # account gets {"mfa_required": true, challenge} and no session;
+        # everyone else is logged in exactly as before. Presence, not
+        # value: {"totp": null} is the preserved single-call form and
+        # fails like the combined path always did.
+        try:
+            step = panel_auth.login_password(body.get("username"), body.get("password"), client=client)
+        except panel_auth.LoginAdmissionError as exc:
+            panel_auth.register_client_failure(client)
+            panel_auth._append_panel_auth_failure(
+                "password", client,
+                body.get("username") if isinstance(body.get("username"), str) else "", "throttled",
+            )
+            raise PanelError(
+                429,
+                "login verification capacity is temporarily busy; try again later",
+                {"Retry-After": str(exc.retry_after)},
+            ) from None
+        if step is None:
+            raise _login_throttle_or_unauthorized(client)
+        if step.mfa_required:
+            return 200, {"mfa_required": True, "challenge": step.challenge}
+        user = step.user
+        return 200, {
+            "token": step.token,
+            "username": user["username"],
+            "role": user["role"],
+            "sites": user["sites"],
+        }
+    # Backward-compatible single-call form: a supplied code verifies inline for
+    # enrolled accounts and is ignored for the rest.
     try:
         result = panel_auth.login(body.get("username"), body.get("password"), body.get("totp"), client=client)
     except panel_auth.LoginAdmissionError as exc:
         panel_auth.register_client_failure(client)
         panel_auth._append_panel_auth_failure(
-            "password", client, body.get("username") if isinstance(body.get("username"), str) else "", "throttled",
+            "password", client,
+            body.get("username") if isinstance(body.get("username"), str) else "", "throttled",
         )
         raise PanelError(
             429,
             "login verification capacity is temporarily busy; try again later",
             {"Retry-After": str(exc.retry_after)},
         ) from None
+    if result is None:
+        raise _login_throttle_or_unauthorized(client)
+    token, user = result
+    return 200, {
+        "token": token,
+        "username": user["username"],
+        "role": user["role"],
+        "sites": user["sites"],
+    }
+
+
+def _post_auth_login_totp(principal, match, query, body):
+    # Step 2 of the two-step login. The challenge is an opaque single-use id
+    # issued only after a verified password; every refusal below is the same
+    # generic 401 the combined form returns, so the endpoint leaks nothing
+    # about challenge state to a caller probing it.
+    client = body.get("_socket_client")
+    result = panel_auth.complete_login(body.get("challenge"), body.get("code"), client=client)
     if result is None:
         if panel_auth.client_throttled(client):
             retry_after = panel_auth.client_retry_after(client)
@@ -2444,7 +2505,15 @@ def _delete_firewall_port(principal, match, query, body):
 
 
 def _post_firewall_enable(principal, match, query, body):
-    result = firewall_ports.enable()
+    exposure = panel_exposure.exposure_status()
+    if exposure.get("exposed") and exposure.get("domain"):
+        port = exposure.get("target_port") or panel_exposure.DEFAULT_PANEL_PORT
+        edge_firewall = panel_exposure.ensure_panel_edge_firewall(
+            port, domain=exposure.get("domain"),
+        )
+        result = edge_firewall if edge_firewall.exit_code != 0 else firewall_ports.enable()
+    else:
+        result = firewall_ports.enable()
     payload = _runtime_payload(result)
     payload["ports"] = _firewall_ports_payload()
     return _operation_status(result), payload
@@ -3193,6 +3262,10 @@ _ROUTES = (
         "POST", re.compile(r"^/api/auth/login$"), _post_auth_login,
         RouteMeta("auth.login", "public", True, max_body=8 * 1024),
     ),
+    Route(
+        "POST", re.compile(r"^/api/auth/login/totp$"), _post_auth_login_totp,
+        RouteMeta("auth.login.totp", "public", True, max_body=4 * 1024),
+    ),
     Route("GET", re.compile(r"^/api/auth/me$"), _get_auth_me, RouteMeta("auth.me", "session")),
     Route(
         "PUT", re.compile(r"^/api/auth/profile$"),
@@ -3658,7 +3731,7 @@ def make_panel_handler(config: PanelConfig, *, allow_remote_run_token: bool = Fa
                     body = self._read_body(route.meta.max_body)
                 else:
                     body = {}
-                if route.meta.action in {"auth.login", "setup.create", "setup.totp"}:
+                if route.meta.action in {"auth.login", "auth.login.totp", "setup.create", "setup.totp"}:
                     body["_socket_client"] = resolve_client_address(
                         self.client_address[0],
                         self.headers.get("X-Forwarded-For"),

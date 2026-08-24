@@ -107,6 +107,9 @@ const tabler = () => window.tabler;
 
 let token = "";
 let principal = null;
+// Single-use second-factor challenge handed out by POST /api/auth/login when
+// the account has TOTP. Held only between the two sign-in steps.
+let loginChallenge = "";
 let usingRunToken = false;
 let signingOut = false;
 
@@ -159,11 +162,33 @@ function showGate(rejected, rateLimited = false) {
   show($("setup"), false);
   show($("app"), false);
   show($("gate"), true);
+  resetLoginStep();
   show($("login-error"), rejected);
   $("login-status").textContent = rateLimited
     ? "This client is rate limited. Wait before trying again."
     : "";
   $("login-username")?.focus();
+}
+
+/* The sign-in card has two steps: credentials, then — only when the server
+ * asks for a second factor — the authenticator code. */
+function showLoginStep(step) {
+  const totp = step === "totp";
+  show($("login-credentials"), !totp);
+  show($("login-totp-group"), totp);
+  // Constraint validation does not skip display:none controls, so a static
+  // required on the code field would block step one; the attribute tracks
+  // visibility instead.
+  $("login-totp")?.toggleAttribute("required", totp);
+}
+
+function resetLoginStep() {
+  loginChallenge = "";
+  // A rejected code stays rejected: leaving it in the field invites resubmitting
+  // a stale value against a fresh challenge and burning it.
+  const code = $("login-totp");
+  if (code) code.value = "";
+  showLoginStep("credentials");
 }
 
 function showApp() {
@@ -1200,20 +1225,37 @@ async function verifySetupTotp() {
 async function signIn(event) {
   event.preventDefault();
   const button = event.currentTarget.querySelector('button[type="submit"]');
+  const onTotpStep = !$("login-totp-group").classList.contains("d-none");
   show($("login-error"), false);
   $("login-status").textContent = "Signing in…";
   button.disabled = true;
   try {
-    const response = await fetch("/api/auth/login", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        username: $("login-username").value.trim(),
-        password: $("login-password").value,
-        totp: $("login-totp").value.trim(),
-      }),
-    });
+    const response = onTotpStep
+      ? await fetch("/api/auth/login/totp", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ challenge: loginChallenge, code: $("login-totp").value.trim() }),
+        })
+      : await fetch("/api/auth/login", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            username: $("login-username").value.trim(),
+            password: $("login-password").value,
+          }),
+        });
     if (!response.ok) {
+      if (onTotpStep && response.status === 401) {
+        // The challenge is single-use: a rejected code has burned it, so
+        // retrying on the code field would only loop on a dead challenge.
+        // Send the operator back through step one to re-authenticate.
+        resetLoginStep();
+        $("login-status").textContent = "";
+        $("login-error").textContent = "The code was not accepted, or the sign-in attempt expired. Sign in again.";
+        show($("login-error"), true);
+        $("login-username").focus();
+        return;
+      }
       // A network failure and a rejected password are different problems, and
       // telling the operator the wrong one sends them to reset a good password.
       $("login-status").textContent = response.status === 429
@@ -1226,11 +1268,18 @@ async function signIn(event) {
       return;
     }
     const data = await response.json();
+    if (data.mfa_required) {
+      loginChallenge = String(data.challenge || "");
+      $("login-status").textContent = "";
+      showLoginStep("totp");
+      $("login-totp").focus();
+      return;
+    }
     token = data.token;
     usingRunToken = false;
     sessionStorage.setItem("wpfy-panel-token", token);
     $("login-password").value = "";
-    $("login-totp").value = "";
+    resetLoginStep();
     $("login-status").textContent = "";
     await boot();
   } catch (error) {
@@ -1291,6 +1340,11 @@ function wireShell() {
   });
 
   $("login-form")?.addEventListener("submit", signIn);
+  $("btn-login-back")?.addEventListener("click", () => {
+    resetLoginStep();
+    show($("login-error"), false);
+    $("login-username").focus();
+  });
   $("btn-lock")?.addEventListener("click", () => logout());
 
   $("btn-one-time-dismiss")?.addEventListener("click", dismissOneTime);

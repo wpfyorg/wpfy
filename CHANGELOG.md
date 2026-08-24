@@ -8,6 +8,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- Panel sign-in is now two steps. The password step verifies credentials
+  first; only then, and only for accounts with TOTP enabled, does the panel
+  ask for a code, backed by a single-use challenge that expires in 120
+  seconds and is bound to the requesting client. Accounts without TOTP sign
+  in directly as before, and the combined username/password/code form keeps
+  working.
 - `scripts/panel-demo.sh` — spins up a throwaway control panel for auditing the
   UI without touching a real install. It seeds a sandbox (`./.panel-demo` by
   default) with its own install root, config, state and log dirs, five demo
@@ -88,6 +94,33 @@ never reached either of them and the offline suite asserted the wrong thing.
   configuration plus a change to every compose file. That is an architecture
   decision and gets its own ADR; the entry above is the honest interim
   reporting fix, not the feature.
+
+## [1.0.0-rc7] - 2026-08-24
+
+Adds two-step panel sign-in and managed panel-edge firewall ingress.
+
+### Added
+
+- Panel sign-in now verifies username and password first, then requests a
+  single-use, time-limited TOTP challenge only for accounts with TOTP enabled.
+  Accounts without TOTP continue to sign in directly, and the combined form
+  remains supported.
+- Panel exposure now discovers the live Docker `wpfy-panel-edge` bridge and
+  stages one exact, WPFY-owned UFW rule scoped to that bridge, its private
+  subnet, gateway, and configured panel port. Reconfiguration removes stale
+  managed variants; disabling exposure removes managed panel-edge rules.
+
+### Security
+
+- The managed rule permits panel-edge ingress only. It does not open the host's
+  public panel port, so public port `8642` remains closed.
+
+### Validation
+
+- Oracle security review: **APPROVE**.
+- Focused 324-test suite passed.
+- Full local suite was not completed because of its duration; it is not claimed
+  as passed.
 
 ## [1.0.0-rc6] - 2026-08-21
 

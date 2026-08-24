@@ -122,9 +122,18 @@
       <div class="card-body">
         <h1 class="card-title text-center mb-2">Sign in</h1>
         <p class="text-secondary text-center">Use the account configured on this server.</p>
-        <div class="mb-3"><label class="form-label" for="login-username">Username</label><input id="login-username" class="form-control" type="text" autocomplete="username" required></div>
-        <div class="mb-3"><label class="form-label" for="login-password">Password</label><input id="login-password" class="form-control" type="password" autocomplete="current-password" required></div>
-        <div class="mb-3"><label class="form-label" for="login-totp">TOTP code</label><input id="login-totp" class="form-control" type="text" inputmode="numeric" autocomplete="one-time-code" maxlength="8"></div>
+        <div id="login-credentials">
+          <div class="mb-3"><label class="form-label" for="login-username">Username</label><input id="login-username" class="form-control" type="text" autocomplete="username" required></div>
+          <div class="mb-3"><label class="form-label" for="login-password">Password</label><input id="login-password" class="form-control" type="password" autocomplete="current-password" required></div>
+        </div>
+        <!-- Second factor, hidden until the server answers the first step with
+             mfa_required and a single-use challenge. A rejected code burns that
+             challenge, so the client sends the operator back to step one
+             instead of retrying a dead one. -->
+        <div id="login-totp-group" class="d-none">
+          <div class="mb-3"><label class="form-label" for="login-totp">TOTP code</label><input id="login-totp" class="form-control" type="text" inputmode="numeric" autocomplete="one-time-code" maxlength="6" pattern="[0-9]{6}"></div>
+          <div class="mb-3"><button class="btn btn-link px-0" id="btn-login-back" type="button">Back</button></div>
+        </div>
         <div class="form-footer"><button type="submit" class="btn btn-primary w-100">Sign in</button></div>
         <p id="login-status" class="text-secondary mt-3 mb-0" role="status"></p>
         <p id="login-error" class="text-danger mt-2 mb-0 d-none" role="alert">Sign-in failed. Check your details and try again.</p>

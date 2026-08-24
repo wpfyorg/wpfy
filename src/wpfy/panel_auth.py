@@ -48,6 +48,15 @@ CLIENT_COOLDOWN_SECONDS = 60
 TOTP_STEP_SECONDS = 30
 TOTP_SKEW_STEPS = 1
 TOTP_ENROLLMENT_TTL_SECONDS = 10 * 60
+# Two-step login: how long a password-verified challenge may wait for its TOTP
+# code. Short by design -- it is a single second factor prompt, not a session.
+PENDING_LOGIN_TTL_SECONDS = 120
+# Pending challenges are unauthenticated state keyed by an opaque id, so their
+# count is bounded: globally, and per username so one account cannot be used
+# to fill the table. Creation refuses (generic failure) once a cap is hit;
+# entries expire in PENDING_LOGIN_TTL_SECONDS regardless.
+MAX_PENDING_LOGINS = 256
+MAX_PENDING_LOGINS_PER_USER = 8
 
 _LEGACY_SCRYPT_N = 2**14
 _LEGACY_SCRYPT_R = 8
@@ -135,6 +144,35 @@ class Session:
     credential_fingerprint: tuple[object, object, object] | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class PendingLogin:
+    """A password-verified login waiting for its TOTP code.
+
+    Keyed by an opaque random challenge id -- never by, and never containing,
+    a session token. The credential fingerprint captured at the password step
+    is re-checked against disk before the session is issued, so a password or
+    TOTP change between the steps kills the pending login.
+    """
+
+    username: str
+    credential_fingerprint: tuple[object, object, object] | None
+    client: str
+    expires_at: float
+
+
+@dataclass(frozen=True, slots=True)
+class PasswordLoginOutcome:
+    """Result of login step 1: either a challenge to verify, or a session."""
+
+    challenge: str | None = None
+    token: str | None = None
+    user: dict | None = None
+
+    @property
+    def mfa_required(self) -> bool:
+        return self.challenge is not None
+
+
 class ClientThrottleError(ValueError):
     pass
 
@@ -168,6 +206,9 @@ _LAST_TOTP_STEPS: dict[str, int] = {}
 _PENDING_TOTP: dict[str, str] = {}
 _PENDING_TOTP_DISCLOSED: set[str] = set()
 _PENDING_TOTP_EXPIRES: dict[str, float] = {}
+# Two-step login challenges, keyed by the opaque challenge id handed to the
+# client after a successful password verification.
+_PENDING_LOGINS: dict[str, PendingLogin] = {}
 
 
 class UserStoreError(ValueError):
@@ -1331,6 +1372,9 @@ def login(
         return None
     with _login_kdf_admission(client_key):
         with _STATE_LOCK:
+            # Any auth-state touch prunes expired pending challenges, so
+            # the table drains even when no new challenge is created.
+            _prune_pending_logins(now)
             failure = _LOGIN_FAILURES.get(username_key)
             locked = failure is not None and failure.locked_until > now
             if failure is not None and failure.locked_until and failure.locked_until <= now:
@@ -1388,6 +1432,221 @@ def login(
             _prune_user_sessions(username_key)
             _prune_sessions(now)
         return token, _public_user(user)
+
+
+def _prune_pending_logins(now: float) -> None:
+    for challenge, pending in tuple(_PENDING_LOGINS.items()):
+        if pending.expires_at <= now:
+            _PENDING_LOGINS.pop(challenge, None)
+
+
+def login_password(username: object, password: object, *, client=None) -> PasswordLoginOutcome | None:
+    """Step 1 of the two-step login: verify the password only.
+
+    Mirrors ``login`` gate for gate -- payload sanity before admission, client
+    throttle and per-user lockout before any KDF, the composite dummy KDF for
+    unknown or malformed records, and a CAS fingerprint re-check against disk
+    inside the store lock -- so the two entry points stay indistinguishable to
+    an attacker. The branch point is TOTP enrollment: an enrolled account gets
+    an opaque single-use challenge and no session; everyone else gets the same
+    session ``login`` would have issued. Failure accounting (client failures,
+    per-user lockout, auth-log records) runs exactly as in the combined path.
+    """
+    if not _login_payload_is_possible(username, password, None):
+        return None
+    username_key = username if isinstance(username, str) and _USERNAME.fullmatch(username) else ""
+    client_key = _client_key(client)
+    now = time.time()
+    if client_throttled(client_key):
+        _append_panel_auth_failure("password", client, username_key, "throttled")
+        return None
+    with _login_kdf_admission(client_key):
+        with _STATE_LOCK:
+            failure = _LOGIN_FAILURES.get(username_key)
+            locked = failure is not None and failure.locked_until > now
+            if failure is not None and failure.locked_until and failure.locked_until <= now:
+                _LOGIN_FAILURES.pop(username_key, None)
+        if locked:
+            _dummy_password_work(password)
+            with _STATE_LOCK:
+                _register_client_failure(client_key, now)
+            _append_panel_auth_failure("password", client, username_key, "locked")
+            return None
+
+        password_ok, credential_fingerprint = _verify_password_with_fingerprint(username_key, password)
+        try:
+            user = _find_user(_read_users(), username_key)
+        except UserStoreError:
+            user = None
+        credentials_ok = password_ok and user is not None
+
+        with _STATE_LOCK, _store_lock():
+            _prune_sessions(now)
+            if credentials_ok:
+                try:
+                    current_user = _find_user(_read_users(), username_key)
+                except UserStoreError:
+                    current_user = None
+                if (
+                    current_user is None
+                    or credential_fingerprint is None
+                    or _auth_fingerprint(current_user) != credential_fingerprint
+                ):
+                    credentials_ok = False
+                else:
+                    user = current_user
+            if not credentials_ok:
+                _register_client_failure(client_key, now)
+                if user is not None:
+                    _register_failure(username_key, now)
+                _append_panel_auth_failure("password", client, username_key, "invalid_credentials")
+                return None
+            if user.get("totp_secret"):
+                # Password verified, second factor outstanding. The challenge is
+                # the only handle: random, single-use, client-bound, short-lived.
+                # Failure counters are deliberately left alone -- the login has
+                # not succeeded yet, and step 2 keeps counting against both.
+                _prune_pending_logins(now)
+                if len(_PENDING_LOGINS) >= MAX_PENDING_LOGINS or sum(
+                    1 for p in _PENDING_LOGINS.values() if p.username == username_key
+                ) >= MAX_PENDING_LOGINS_PER_USER:
+                    # Capacity refusal: challenge creation is unauthenticated
+                    # work, so flooding it counts against the requesting
+                    # client like any other login failure.
+                    _register_client_failure(client_key, now)
+                    _append_panel_auth_failure("password", client, username_key, "throttled")
+                    return None
+                challenge = secrets.token_urlsafe(32)
+                while challenge in _PENDING_LOGINS:
+                    challenge = secrets.token_urlsafe(32)
+                _PENDING_LOGINS[challenge] = PendingLogin(
+                    username=username_key,
+                    credential_fingerprint=credential_fingerprint,
+                    client=client_key,
+                    expires_at=now + PENDING_LOGIN_TTL_SECONDS,
+                )
+                return PasswordLoginOutcome(challenge=challenge)
+            _LOGIN_FAILURES.pop(username_key, None)
+            _CLIENT_FAILURES.pop(client_key, None)
+            token = secrets.token_urlsafe(32)
+            while token in _SESSIONS:
+                token = secrets.token_urlsafe(32)
+            _SESSIONS[token] = Session(
+                username_key, now, now, credential_fingerprint=credential_fingerprint,
+            )
+            _prune_user_sessions(username_key)
+            _prune_sessions(now)
+        return PasswordLoginOutcome(token=token, user=_public_user(user))
+
+
+def complete_login(challenge: object, code: object, *, client=None) -> tuple[str, dict] | None:
+    """Step 2 of the two-step login: trade a pending challenge plus TOTP code
+    for a session.
+
+    The challenge is consumed under the state lock before anything else is
+    checked, so a wrong code, an expired window, and a successful verify all
+    burn it exactly once. Every refusal below returns the same generic failure
+    the combined path returns; nothing here distinguishes an unknown challenge
+    from a wrong code to the caller. Failures flow through the same accounting
+    surfaces as ``login`` -- client failures, per-user lockout, and auth-log
+    records whose reason classes ("invalid_credentials" / "totp_failed") the
+    fail2ban jail already parses.
+    """
+    client_key = _client_key(client)
+    now = time.time()
+    if client_throttled(client_key):
+        # Consulted before consuming the challenge: a throttled client may
+        # still hold a valid challenge when its cooldown expires.
+        _append_panel_auth_failure("password", client, "", "throttled")
+        return None
+    pending = None
+    if isinstance(challenge, str) and challenge:
+        with _STATE_LOCK:
+            _prune_pending_logins(now)
+            pending = _PENDING_LOGINS.pop(challenge, None)
+    if (
+        pending is None
+        or not isinstance(code, str)
+        or not code
+        or len(code) > MAX_LOGIN_TOTP_LENGTH
+    ):
+        with _STATE_LOCK:
+            _register_client_failure(client_key, now)
+        _append_panel_auth_failure(
+            "password", client, pending.username if pending is not None else "", "invalid_credentials",
+        )
+        return None
+    if pending.client != client_key:
+        # A challenge speaks only for the client identity that earned it;
+        # replaying it from elsewhere is an attack, not a retry.
+        with _STATE_LOCK:
+            _register_client_failure(client_key, now)
+        _append_panel_auth_failure("password", client, pending.username, "invalid_credentials")
+        return None
+    if pending.expires_at <= now:
+        with _STATE_LOCK:
+            _register_client_failure(client_key, now)
+        _append_panel_auth_failure("password", client, pending.username, "invalid_credentials")
+        return None
+    username_key = pending.username
+    with _STATE_LOCK:
+        failure = _LOGIN_FAILURES.get(username_key)
+        locked = failure is not None and failure.locked_until > now
+    if locked:
+        with _STATE_LOCK:
+            _register_client_failure(client_key, now)
+        _append_panel_auth_failure("password", client, username_key, "locked")
+        return None
+
+    with _STATE_LOCK, _store_lock():
+        _prune_sessions(now)
+        # Recheck lockout and client throttle atomically with issuance. The
+        # checks above ran before the challenge was consumed; a lockout or
+        # cooldown established between then and now must still stop this
+        # redemption, including when several pre-issued challenges race.
+        failure = _LOGIN_FAILURES.get(username_key)
+        if failure is not None and failure.locked_until > now:
+            _register_client_failure(client_key, now)
+            _append_panel_auth_failure("password", client, username_key, "locked")
+            return None
+        client_failure = _CLIENT_FAILURES.get(client_key)
+        if client_failure is not None and client_failure.cooldown_until > now:
+            _append_panel_auth_failure("password", client, username_key, "throttled")
+            return None
+        try:
+            user = _find_user(_read_users(), username_key)
+        except UserStoreError:
+            user = None
+        credentials_ok = (
+            user is not None
+            and pending.credential_fingerprint is not None
+            and _auth_fingerprint(user) == pending.credential_fingerprint
+        )
+        matched_step = _matching_totp_step(user, code, now) if credentials_ok else None
+        credentials_ok = credentials_ok and matched_step is not None
+        if credentials_ok and matched_step:
+            if matched_step <= _LAST_TOTP_STEPS.get(username_key, -1):
+                credentials_ok = False
+            else:
+                _LAST_TOTP_STEPS[username_key] = matched_step
+        if not credentials_ok:
+            _register_client_failure(client_key, now)
+            if user is not None:
+                _register_failure(username_key, now)
+            reason = "totp_failed" if user is not None else "invalid_credentials"
+            _append_panel_auth_failure("password", client, username_key, reason)
+            return None
+        _LOGIN_FAILURES.pop(username_key, None)
+        _CLIENT_FAILURES.pop(client_key, None)
+        token = secrets.token_urlsafe(32)
+        while token in _SESSIONS:
+            token = secrets.token_urlsafe(32)
+        _SESSIONS[token] = Session(
+            username_key, now, now, credential_fingerprint=pending.credential_fingerprint,
+        )
+        _prune_user_sessions(username_key)
+        _prune_sessions(now)
+    return token, _public_user(user)
 
 
 def authenticate_session(token: object) -> dict | None:
@@ -1509,6 +1768,7 @@ def reset_state() -> None:
         _PENDING_TOTP.clear()
         _PENDING_TOTP_EXPIRES.clear()
         _PENDING_TOTP_DISCLOSED.clear()
+        _PENDING_LOGINS.clear()
         _LOGIN_KDF_CLIENTS.clear()
     with _NEVER_BAN_EDGE_LOCK:
         _NEVER_BAN_EDGE_CACHE = None

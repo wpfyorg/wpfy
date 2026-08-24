@@ -12,6 +12,7 @@ import shutil
 import subprocess
 import threading
 import time
+from typing import cast
 import uuid
 from pathlib import Path
 
@@ -55,11 +56,70 @@ _COMPOSE_TIMEOUT_SECONDS = 120
 _HEALTH_TIMEOUT_SECONDS = 180
 _transaction_state = threading.local()
 
+_PANEL_EDGE_BRIDGE_OPTION = "com.docker.network.bridge.name"
+_DOCKER_NETWORK_ID_RE = re.compile(r"^[0-9a-fA-F]{12,64}$")
+_LINUX_INTERFACE_RE = re.compile(r"^[A-Za-z0-9_.-]{1,15}$")
+_RFC1918_NETWORKS: tuple[ipaddress.IPv4Network, ...] = (
+    cast(ipaddress.IPv4Network, ipaddress.ip_network("10.0.0.0/8")),
+    cast(ipaddress.IPv4Network, ipaddress.ip_network("172.16.0.0/12")),
+    cast(ipaddress.IPv4Network, ipaddress.ip_network("192.168.0.0/16")),
+)
+_ULA_NETWORK: ipaddress.IPv6Network = cast(ipaddress.IPv6Network, ipaddress.ip_network("fc00::/7"))
+
 
 @dataclass(frozen=True, slots=True)
 class AcmeEmailResolution:
     email: str
     source: str
+
+
+@dataclass(frozen=True, slots=True)
+class PanelEdgeNetworkFacts:
+    """Validated host-facing facts for the Docker panel-edge bridge.
+
+    Docker chooses the IPAM range and, unless an explicit bridge-name option is
+    present, derives the host bridge name from the network ID.  Keeping those
+    values together prevents callers from mixing a gateway from one network
+    with a subnet or interface from another.
+    """
+
+    network_name: str
+    driver: str
+    subnet: str
+    gateway: str
+    bridge: str
+
+    @property
+    def network(self) -> str:
+        return self.network_name
+
+    @property
+    def private_subnet(self) -> str:
+        return self.subnet
+
+    @property
+    def bind_address(self) -> str:
+        return self.gateway
+
+    @property
+    def gateway_address(self) -> str:
+        return self.gateway
+
+    @property
+    def bridge_name(self) -> str:
+        return self.bridge
+
+    @property
+    def bridge_interface(self) -> str:
+        return self.bridge
+
+    @property
+    def host_bridge(self) -> str:
+        return self.bridge
+
+    @property
+    def interface(self) -> str:
+        return self.bridge
 
 
 def traefik_dir() -> Path:
@@ -260,6 +320,227 @@ def ensure_panel_edge_network() -> RuntimeResult:
     return _ensure_bridge_network(PANEL_EDGE_NETWORK)
 
 
+def _private_network(value: object, *, network_name: str) -> ipaddress.IPv4Network | ipaddress.IPv6Network:
+    if not isinstance(value, str) or not value.strip():
+        raise RuntimeError(f"cannot determine {network_name} facts: Docker reported no subnet")
+    try:
+        network = ipaddress.ip_network(value.strip(), strict=False)
+    except ValueError as exc:
+        raise RuntimeError(f"cannot determine {network_name} facts: invalid subnet {value!r}") from exc
+    if network.version == 4:
+        private = any(cast(ipaddress.IPv4Network, network).subnet_of(candidate) for candidate in _RFC1918_NETWORKS)
+    else:
+        private = cast(ipaddress.IPv6Network, network).subnet_of(_ULA_NETWORK)
+    if not private:
+        raise RuntimeError(f"cannot determine {network_name} facts: subnet {network} is not private")
+    return network
+
+
+def _private_gateway(
+    value: object,
+    network: ipaddress.IPv4Network | ipaddress.IPv6Network,
+    *,
+    network_name: str,
+) -> ipaddress.IPv4Address | ipaddress.IPv6Address:
+    if not isinstance(value, str) or not value.strip():
+        raise RuntimeError(f"cannot determine {network_name} facts: Docker reported no gateway")
+    try:
+        gateway = ipaddress.ip_address(value.strip())
+    except ValueError as exc:
+        raise RuntimeError(f"cannot determine {network_name} facts: invalid gateway {value!r}") from exc
+    if gateway.version != network.version or gateway.is_unspecified:
+        raise RuntimeError(f"cannot determine {network_name} facts: gateway {value!r} is invalid")
+    if gateway not in network:
+        raise RuntimeError(f"cannot determine {network_name} facts: gateway {gateway} is outside {network}")
+    if gateway == network.network_address:
+        raise RuntimeError(f"cannot determine {network_name} facts: gateway {gateway} is the network address")
+    if network.version == 4 and network.prefixlen < 31 and gateway == network.broadcast_address:
+        raise RuntimeError(f"cannot determine {network_name} facts: gateway {gateway} is the broadcast address")
+    return gateway
+
+
+def _bridge_interface_name(value: object, *, network_name: str) -> str:
+    if not isinstance(value, str):
+        raise RuntimeError(f"cannot determine {network_name} facts: bridge interface is invalid")
+    bridge = value.strip()
+    if not _LINUX_INTERFACE_RE.fullmatch(bridge) or bridge.lower() in {"any", "all"}:
+        raise RuntimeError(f"cannot determine {network_name} facts: bridge interface {value!r} is invalid")
+    return bridge
+
+
+def _docker_network_payload(network_name: str) -> dict[str, object]:
+    try:
+        proc = subprocess.run(
+            ["docker", "network", "inspect", "--format", "{{json .}}", network_name],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise RuntimeError(f"cannot determine {network_name} facts: Docker inspect failed: {exc}") from exc
+    if proc.returncode != 0:
+        detail = proc.stderr.strip() or proc.stdout.strip() or "network inspect failed"
+        raise RuntimeError(f"cannot determine {network_name} facts: {detail}")
+    try:
+        raw = json.loads(proc.stdout.strip())
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"cannot determine {network_name} facts: invalid Docker inspect output") from exc
+
+    payload: object = raw
+    if isinstance(raw, list):
+        matching = [item for item in raw if isinstance(item, dict) and item.get("Name") == network_name]
+        if len(matching) == 1:
+            payload = matching[0]
+        elif len(raw) == 1:
+            payload = raw[0]
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"cannot determine {network_name} facts: Docker reported no network")
+    reported_name = payload.get("Name")
+    if reported_name is not None and reported_name != network_name:
+        raise RuntimeError(
+            f"cannot determine {network_name} facts: Docker returned network {reported_name!r}"
+        )
+    return payload
+
+
+def _panel_edge_bridge_name(payload: dict[str, object], *, network_name: str) -> str:
+    options = payload.get("Options")
+    if options is not None and not isinstance(options, dict):
+        raise RuntimeError(f"cannot determine {network_name} facts: Docker bridge options are invalid")
+    if isinstance(options, dict) and _PANEL_EDGE_BRIDGE_OPTION in options:
+        return _bridge_interface_name(options[_PANEL_EDGE_BRIDGE_OPTION], network_name=network_name)
+
+    network_id = payload.get("Id")
+    if not isinstance(network_id, str) or not _DOCKER_NETWORK_ID_RE.fullmatch(network_id):
+        raise RuntimeError(f"cannot determine {network_name} facts: Docker network ID is invalid")
+    return _bridge_interface_name(f"br-{network_id[:12].lower()}", network_name=network_name)
+
+
+def _panel_edge_ipam(
+    payload: dict[str, object], *, network_name: str
+) -> tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ipaddress.IPv4Address | ipaddress.IPv6Address]:
+    ipam = payload.get("IPAM")
+    configs = ipam.get("Config") if isinstance(ipam, dict) else None
+    if not isinstance(configs, list) or not configs:
+        raise RuntimeError(f"cannot determine {network_name} facts: Docker reported no IPAM config")
+    if len(configs) != 1:
+        raise RuntimeError(
+            f"cannot determine {network_name} facts: expected one private subnet, got {len(configs)}"
+        )
+    config = configs[0]
+    if not isinstance(config, dict):
+        raise RuntimeError(f"cannot determine {network_name} facts: Docker IPAM config is invalid")
+    subnet = _private_network(config.get("Subnet"), network_name=network_name)
+    gateway = _private_gateway(config.get("Gateway"), subnet, network_name=network_name)
+    return subnet, gateway
+
+
+def _validate_host_bridge_address(
+    bridge: str,
+    subnet: ipaddress.IPv4Network | ipaddress.IPv6Network,
+    gateway: ipaddress.IPv4Address | ipaddress.IPv6Address,
+    *,
+    network_name: str,
+) -> None:
+    try:
+        proc = subprocess.run(
+            ["ip", "-j", "addr", "show", "dev", bridge],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise RuntimeError(
+            f"cannot determine {network_name} facts: host bridge interface {bridge!r} cannot be inspected: {exc}"
+        ) from exc
+    if proc.returncode != 0:
+        detail = proc.stderr.strip() or proc.stdout.strip() or "ip address inspection failed"
+        raise RuntimeError(
+            f"cannot determine {network_name} facts: host bridge interface {bridge!r} is unavailable: {detail}"
+        )
+    try:
+        raw = json.loads(proc.stdout.strip())
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"cannot determine {network_name} facts: invalid host address output") from exc
+    entries = raw if isinstance(raw, list) else [raw]
+    found_interface = False
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        ifname = entry.get("ifname")
+        if ifname != bridge:
+            continue
+        found_interface = True
+        link_info = entry.get("linkinfo")
+        if isinstance(link_info, dict):
+            kind = link_info.get("info_kind")
+            if kind is not None and kind != "bridge":
+                raise RuntimeError(
+                    f"cannot determine {network_name} facts: {bridge!r} is not a Linux bridge interface"
+                )
+        addresses = entry.get("addr_info")
+        if not isinstance(addresses, list):
+            continue
+        for address in addresses:
+            if not isinstance(address, dict):
+                continue
+            local = address.get("local", address.get("address"))
+            prefixlen = address.get("prefixlen")
+            if not isinstance(local, str):
+                continue
+            try:
+                local_address, separator, local_prefix = local.partition("/")
+                parsed = ipaddress.ip_address(local_address)
+                if isinstance(prefixlen, (int, str)):
+                    prefix = int(prefixlen)
+                elif separator:
+                    prefix = int(local_prefix)
+                else:
+                    prefix = -1
+            except (TypeError, ValueError):
+                continue
+            if parsed == gateway and prefix == subnet.prefixlen:
+                return
+    if not found_interface:
+        raise RuntimeError(
+            f"cannot determine {network_name} facts: host bridge interface {bridge!r} was not found"
+        )
+    raise RuntimeError(
+        f"cannot determine {network_name} facts: host bridge {bridge!r} does not own {gateway}/{subnet.prefixlen}"
+    )
+
+
+def panel_edge_network_facts(network_name: str = PANEL_EDGE_NETWORK) -> PanelEdgeNetworkFacts:
+    """Discover and validate the live Docker and host facts for panel edge.
+
+    The function deliberately performs no fallback to a remembered subnet or a
+    guessed gateway.  Callers that need a host bind or firewall rule must use
+    facts from the network that exists now.
+    """
+    if not isinstance(network_name, str) or not network_name.strip():
+        raise ValueError("panel edge network name must be a non-empty string")
+    network_name = network_name.strip()
+    if runtime_skip_requested():
+        raise RuntimeError(f"cannot determine {network_name} facts: skipped by WPFY_SKIP_RUNTIME=1")
+    if not docker_available():
+        raise RuntimeError(f"cannot determine {network_name} facts: Docker is unavailable")
+
+    payload = _docker_network_payload(network_name)
+    driver = payload.get("Driver")
+    if not isinstance(driver, str) or driver.strip().lower() != "bridge":
+        raise RuntimeError(f"cannot determine {network_name} facts: unsupported Docker driver {driver!r}")
+    subnet, gateway = _panel_edge_ipam(payload, network_name=network_name)
+    bridge = _panel_edge_bridge_name(payload, network_name=network_name)
+    _validate_host_bridge_address(bridge, subnet, gateway, network_name=network_name)
+    return PanelEdgeNetworkFacts(
+        network_name=network_name,
+        driver="bridge",
+        subnet=str(subnet),
+        gateway=str(gateway),
+        bridge=bridge,
+    )
+
+
 def _test_cidr_override() -> tuple[str, ...] | None:
     """Parse the offline CIDR override hook, or None when it is unset."""
     override = os.environ.get("WPFY_TEST_TRAEFIK_NETWORK_CIDRS")
@@ -369,6 +650,11 @@ def traefik_network_subnets(network_name: str = PANEL_EDGE_NETWORK) -> tuple[str
 
 def _network_gateway(network_name: str = TRAEFIK_NETWORK) -> str | None:
     """Return the gateway IP of a Docker network, or None if unavailable."""
+    if network_name == PANEL_EDGE_NETWORK:
+        try:
+            return panel_edge_network_facts().gateway
+        except (OSError, RuntimeError, ValueError, subprocess.SubprocessError):
+            return None
     if not docker_available():
         return None
     proc = subprocess.run(

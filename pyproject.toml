@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "wpfy"
-version = "1.0.0rc5"
+version = "1.0.0rc7"
 description = "Docker-first CLI for WordPress server administration"
 readme = "README.md"
 requires-python = ">=3.10"

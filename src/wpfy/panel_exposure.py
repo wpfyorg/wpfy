@@ -166,6 +166,54 @@ def edge_bind_address() -> str:
     raise RuntimeError(f"cannot determine a gateway address for {PANEL_EDGE_NETWORK}")
 
 
+def ensure_panel_edge_firewall(port: int, *, domain: str | None = None) -> RuntimeResult:
+    """Ensure managed panel-edge ingress after the Docker edge exists.
+
+    Runtime skip is deliberately handled before discovery: offline tests and
+    dry operational paths have no live bridge to inspect and must not turn a
+    skipped runtime into a fabricated firewall rule.
+    """
+    from . import events, firewall_ports
+
+    try:
+        if traefik.runtime_skip_requested():
+            result = RuntimeResult(0, "panel edge firewall skipped by WPFY_SKIP_RUNTIME=1", skipped=True)
+        else:
+            facts = traefik.panel_edge_network_facts()
+            result = firewall_ports.ensure_panel_edge_rule(port, facts)
+    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+        result = RuntimeResult(2, str(exc))
+    events.record_event(
+        "panel.expose.ufw-panel-edge",
+        domain=domain,
+        outcome="ok" if result.exit_code == 0 else "failed",
+        detail=result.message,
+    )
+    return result
+
+
+def remove_panel_edge_firewall(port: int | None = None, *, domain: str | None = None) -> RuntimeResult:
+    """Remove WPFY-owned panel-edge ingress, optionally limited to ``port``."""
+    from . import events, firewall_ports
+
+    try:
+        if traefik.runtime_skip_requested():
+            result = RuntimeResult(0, "panel edge firewall removal skipped by WPFY_SKIP_RUNTIME=1", skipped=True)
+        elif port is None:
+            result = firewall_ports.remove_all_panel_edge_rules()
+        else:
+            result = firewall_ports.remove_panel_edge_rule(port)
+    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+        result = RuntimeResult(2, str(exc))
+    events.record_event(
+        "panel.expose.ufw-panel-edge",
+        domain=domain,
+        outcome="ok" if result.exit_code == 0 else "failed",
+        detail=result.message,
+    )
+    return result
+
+
 def _target_url(host: str, port: int) -> str:
     if not isinstance(port, int) or isinstance(port, bool) or not 1 <= port <= 65535:
         raise ValueError("panel port must be between 1 and 65535")
@@ -262,6 +310,9 @@ def expose(domain, *, confirm, port=DEFAULT_PANEL_PORT, no_install=False) -> Run
             start_result = traefik._start_traefik_locked()
         if start_result.exit_code != 0:
             return start_result
+        edge_firewall = ensure_panel_edge_firewall(port, domain=domain)
+        if edge_firewall.exit_code != 0:
+            return edge_firewall
         host = edge_bind_address()
         content = render_router_config(domain, _target_url(host, port))
         service_path = panel_service_path()
@@ -380,8 +431,12 @@ def panel_service_content(host, port) -> str:
 def install_service(host, port) -> RuntimeResult:
     try:
         content = panel_service_content(host, port)
-        if not exposure_status()["exposed"]:
+        status = exposure_status()
+        if not status["exposed"]:
             return RuntimeResult(2, "expose the panel router before installing the panel service")
+        edge_firewall = ensure_panel_edge_firewall(port, domain=status.get("domain"))
+        if edge_firewall.exit_code != 0:
+            return edge_firewall
     except (OSError, RuntimeError, TypeError, ValueError) as exc:
         return RuntimeResult(2, str(exc))
 
@@ -401,6 +456,7 @@ def remove_service() -> RuntimeResult:
 
 def disable() -> RuntimeResult:
     errors: list[str] = []
+    status = exposure_status()
     try:
         panel_router_path().unlink(missing_ok=True)
     except OSError as exc:
@@ -408,6 +464,9 @@ def disable() -> RuntimeResult:
     service_result = remove_service()
     if service_result.exit_code != 0:
         errors.append(service_result.message)
+    edge_firewall = remove_panel_edge_firewall(None, domain=status.get("domain"))
+    if edge_firewall.exit_code != 0:
+        errors.append(edge_firewall.message)
     if errors:
         return RuntimeResult(1, "; ".join(errors))
     return RuntimeResult(0, "panel exposure disabled", ran=True)

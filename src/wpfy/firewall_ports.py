@@ -32,16 +32,28 @@ import ipaddress
 import os
 from pathlib import Path
 import re
+import shlex
 import shutil
 import subprocess
+from typing import cast
 
 from .site_runtime import RuntimeResult
+from .traefik import PANEL_EDGE_NETWORK, PanelEdgeNetworkFacts
 
 DEFAULT_SSH_PORT = 22
 _PORT_RANGE = re.compile(r"^(\d{1,5})(?::(\d{1,5}))?$")
 _COMMENT_ALLOWED = re.compile(r"^[A-Za-z0-9 ._-]{1,64}$")
 _PROTOCOLS = ("tcp", "udp")
 _ACTIONS = ("allow", "deny", "reject")
+PANEL_EDGE_RULE_COMMENT = "wpfy panel edge ingress"
+PANEL_EDGE_RULE_MARKER = PANEL_EDGE_RULE_COMMENT
+_LINUX_INTERFACE_RE = re.compile(r"^[A-Za-z0-9_.-]{1,15}$")
+_RFC1918_NETWORKS: tuple[ipaddress.IPv4Network, ...] = (
+    cast(ipaddress.IPv4Network, ipaddress.ip_network("10.0.0.0/8")),
+    cast(ipaddress.IPv4Network, ipaddress.ip_network("172.16.0.0/12")),
+    cast(ipaddress.IPv4Network, ipaddress.ip_network("192.168.0.0/16")),
+)
+_ULA_NETWORK = cast(ipaddress.IPv6Network, ipaddress.ip_network("fc00::/7"))
 
 # `To` column of `ufw status`: "22/tcp", "22", "2200:2210/udp", with an
 # optional " (v6)" suffix on the IPv6 twin of a rule.
@@ -79,6 +91,18 @@ class PortRule:
     #: `source` it becomes a source the panel renders and then sends back on
     #: delete, where it is rejected as an address -- so it is split out here.
     comment: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class PanelEdgeRuleSpec:
+    """One fully scoped, WPFY-owned ingress rule for the panel edge."""
+
+    port: str
+    bridge: str
+    subnet: str
+    gateway: str
+    protocol: str = "tcp"
+    comment: str = PANEL_EDGE_RULE_COMMENT
 
 
 @dataclass(frozen=True, slots=True)
@@ -433,6 +457,329 @@ def _mutate(args: list[str], success: str) -> RuntimeResult:
     if code != 0:
         return RuntimeResult(code, output)
     return RuntimeResult(0, success, ran=True)
+
+
+def _private_panel_edge_subnet(value: object) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("panel edge subnet must be a private CIDR")
+    try:
+        network = ipaddress.ip_network(value.strip(), strict=False)
+    except ValueError as exc:
+        raise ValueError(f"invalid panel edge subnet: {value!r}") from exc
+    if network.version == 4:
+        private = any(cast(ipaddress.IPv4Network, network).subnet_of(candidate) for candidate in _RFC1918_NETWORKS)
+    else:
+        private = cast(ipaddress.IPv6Network, network).subnet_of(_ULA_NETWORK)
+    if not private:
+        raise ValueError(f"panel edge subnet must be RFC1918 or ULA, got {network}")
+    return str(network)
+
+
+def _panel_edge_gateway(value: object, subnet: str) -> str:
+    try:
+        network = ipaddress.ip_network(subnet, strict=False)
+        gateway = ipaddress.ip_address(str(value).strip())
+    except (AttributeError, ValueError) as exc:
+        raise ValueError(f"invalid panel edge gateway: {value!r}") from exc
+    if gateway.version != network.version or gateway.is_unspecified or gateway not in network:
+        raise ValueError(f"panel edge gateway {value!r} is outside private subnet {subnet}")
+    if gateway == network.network_address:
+        raise ValueError(f"panel edge gateway {gateway} cannot be the network address")
+    if network.version == 4 and network.prefixlen < 31 and gateway == network.broadcast_address:
+        raise ValueError(f"panel edge gateway {gateway} cannot be the broadcast address")
+    return str(gateway)
+
+
+def _panel_edge_bridge(value: object) -> str:
+    if not isinstance(value, str):
+        raise ValueError("panel edge bridge interface must be a Linux interface name")
+    bridge = value.strip()
+    if not _LINUX_INTERFACE_RE.fullmatch(bridge) or bridge.lower() in {"any", "all"}:
+        raise ValueError(f"invalid panel edge bridge interface: {value!r}")
+    return bridge
+
+
+def _panel_edge_spec(
+    port: str | int,
+    facts: PanelEdgeNetworkFacts | None = None,
+    *,
+    network_facts: PanelEdgeNetworkFacts | None = None,
+    bridge: str | None = None,
+    subnet: str | None = None,
+    gateway: str | None = None,
+) -> PanelEdgeRuleSpec:
+    if facts is not None and network_facts is not None:
+        raise ValueError("provide panel edge network facts once")
+    facts = facts if facts is not None else network_facts
+    if facts is not None:
+        if not isinstance(facts, PanelEdgeNetworkFacts):
+            raise ValueError("panel edge facts must be PanelEdgeNetworkFacts")
+        if any(value is not None for value in (bridge, subnet, gateway)):
+            raise ValueError("do not mix panel edge facts with explicit network fields")
+        if facts.network_name != PANEL_EDGE_NETWORK:
+            raise ValueError(f"panel edge facts must describe {PANEL_EDGE_NETWORK}")
+        if not isinstance(facts.driver, str) or facts.driver.strip().lower() != "bridge":
+            raise ValueError(f"unsupported panel edge driver: {facts.driver!r}")
+        bridge, subnet, gateway = facts.bridge, facts.subnet, facts.gateway
+    elif bridge is None or subnet is None or gateway is None:
+        raise ValueError("panel edge network facts or bridge, subnet, and gateway are required")
+
+    validated_port = validate_port(str(port))
+    validated_bridge = _panel_edge_bridge(bridge)
+    validated_subnet = _private_panel_edge_subnet(subnet)
+    validated_gateway = _panel_edge_gateway(gateway, validated_subnet)
+    return PanelEdgeRuleSpec(
+        port=validated_port,
+        bridge=validated_bridge,
+        subnet=validated_subnet,
+        gateway=validated_gateway,
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class _AddedPanelEdgeRule:
+    port: str
+    bridge: str
+    source: str
+    destination: str
+    protocol: str
+    comment: str
+    rule_argv: tuple[str, ...]
+
+    def matches(self, spec: PanelEdgeRuleSpec) -> bool:
+        return (
+            self.port == spec.port
+            and self.bridge == spec.bridge
+            and self.source == spec.subnet
+            and self.destination == spec.gateway
+            and self.protocol == spec.protocol
+            and self.comment == spec.comment
+        )
+
+
+def _panel_edge_marker(comment: str) -> bool:
+    return comment.startswith(PANEL_EDGE_RULE_MARKER)
+
+
+def _normalise_added_source(value: str) -> str | None:
+    if value.lower() == "any":
+        return "any"
+    try:
+        return str(ipaddress.ip_network(value, strict=False))
+    except ValueError:
+        return None
+
+
+def _normalise_added_destination(value: str) -> str | None:
+    if value.lower() == "any":
+        return "any"
+    try:
+        return str(ipaddress.ip_address(value))
+    except ValueError:
+        try:
+            network = ipaddress.ip_network(value, strict=False)
+        except ValueError:
+            return None
+        if network.prefixlen != network.max_prefixlen:
+            return None
+        return str(network.network_address)
+
+
+def _parse_panel_edge_added_line(line: str) -> _AddedPanelEdgeRule | None:
+    try:
+        tokens = shlex.split(line.strip())
+    except ValueError:
+        return None
+    if len(tokens) < 15 or tokens[1:2] != ["allow"]:
+        return None
+    # ``ufw show added`` prints the literal command name even when WPFY_UFW_BIN
+    # points at an absolute path.  Accept both forms for offline/test wrappers.
+    command_name = Path(_ufw_binary()).name
+    if tokens[0] not in {"ufw", command_name}:
+        return None
+    try:
+        comment_index = tokens.index("comment", 2)
+    except ValueError:
+        return None
+    if comment_index != len(tokens) - 2 or not _panel_edge_marker(tokens[-1]):
+        return None
+    rule = tokens[1:comment_index]
+    if len(rule) != 12 or rule[0:3] != ["allow", "in", "on"]:
+        return None
+    if rule[4] != "from" or rule[6] != "to" or rule[8] != "port" or rule[10] != "proto":
+        return None
+    try:
+        port = validate_port(rule[9])
+    except ValueError:
+        return None
+    bridge = rule[3]
+    if not _LINUX_INTERFACE_RE.fullmatch(bridge) or bridge.lower() in {"any", "all"}:
+        return None
+    source = _normalise_added_source(rule[5])
+    destination = _normalise_added_destination(rule[7])
+    protocol = rule[11].lower()
+    if source is None or destination is None or protocol not in {"tcp", "udp", "any"}:
+        return None
+    return _AddedPanelEdgeRule(
+        port=port,
+        bridge=bridge,
+        source=source,
+        destination=destination,
+        protocol=protocol,
+        comment=tokens[-1],
+        rule_argv=tuple(rule + ["comment", tokens[-1]]),
+    )
+
+
+def _panel_edge_added_rules(output: str) -> tuple[_AddedPanelEdgeRule, ...]:
+    return tuple(
+        parsed
+        for line in output.splitlines()
+        if (parsed := _parse_panel_edge_added_line(line)) is not None
+    )
+
+
+def _panel_edge_added() -> tuple[_AddedPanelEdgeRule, ...] | RuntimeResult:
+    if not ufw_available():
+        return RuntimeResult(1, "ufw is not installed on this host; install it with: apt-get install -y ufw")
+    if _skip_runtime():
+        return RuntimeResult(0, "skipped by WPFY_SKIP_RUNTIME", skipped=True)
+    code, output = _run(["show", "added"])
+    if code != 0:
+        return RuntimeResult(code, output)
+    return _panel_edge_added_rules(output)
+
+
+def ensure_panel_edge_rule(
+    port: str | int,
+    facts: PanelEdgeNetworkFacts | None = None,
+    *,
+    network_facts: PanelEdgeNetworkFacts | None = None,
+    bridge: str | None = None,
+    subnet: str | None = None,
+    gateway: str | None = None,
+) -> RuntimeResult:
+    """Stage one exact, WPFY-owned panel-edge ingress rule.
+
+    The rule is persisted even while UFW is inactive; this function never
+    enables UFW.  Existing marker variants are removed only after the desired
+    rule is present, so a failed add cannot erase the last known-good rule.
+    """
+    spec = _panel_edge_spec(
+        port,
+        facts,
+        network_facts=network_facts,
+        bridge=bridge,
+        subnet=subnet,
+        gateway=gateway,
+    )
+    current = _panel_edge_added()
+    if isinstance(current, RuntimeResult):
+        return current
+
+    desired_seen = False
+    stale: list[_AddedPanelEdgeRule] = []
+    for rule in current:
+        if rule.port != spec.port:
+            continue
+        if rule.matches(spec) and not desired_seen:
+            desired_seen = True
+        else:
+            stale.append(rule)
+
+    if not desired_seen:
+        added = _mutate(
+            [
+                "allow",
+                "in",
+                "on",
+                spec.bridge,
+                "from",
+                spec.subnet,
+                "to",
+                spec.gateway,
+                "port",
+                spec.port,
+                "proto",
+                spec.protocol,
+                "comment",
+                spec.comment,
+            ],
+            f"staged panel edge ingress for {spec.port}/{spec.protocol}",
+        )
+        if added.exit_code != 0:
+            return added
+
+    for rule in stale:
+        removed = _mutate(
+            ["delete", *rule.rule_argv],
+            f"removed stale panel edge ingress for {rule.port}/{rule.protocol}",
+        )
+        if removed.exit_code != 0:
+            return removed
+
+    if desired_seen and not stale:
+        return RuntimeResult(0, f"panel edge ingress already staged for {spec.port}/{spec.protocol}", ran=True)
+    if stale:
+        return RuntimeResult(0, f"panel edge ingress staged for {spec.port}/{spec.protocol}; stale rules removed", ran=True)
+    return RuntimeResult(0, f"panel edge ingress staged for {spec.port}/{spec.protocol}", ran=True)
+
+
+def _remove_panel_edge_rules(port: str | None) -> RuntimeResult:
+    current = _panel_edge_added()
+    if isinstance(current, RuntimeResult):
+        return current
+
+    managed = [rule for rule in current if port is None or rule.port == port]
+    for rule in managed:
+        removed = _mutate(
+            ["delete", *rule.rule_argv],
+            f"removed panel edge ingress for {rule.port}/{rule.protocol}",
+        )
+        if removed.exit_code != 0:
+            return removed
+    if not managed:
+        if port is None:
+            return RuntimeResult(0, "no managed panel edge ingress rules", ran=True)
+        return RuntimeResult(0, f"no managed panel edge ingress for {port}", ran=True)
+    return RuntimeResult(0, f"removed {len(managed)} panel edge ingress rule(s)", ran=True)
+
+
+def remove_panel_edge_rule(
+    port: str | int,
+    facts: PanelEdgeNetworkFacts | None = None,
+    *,
+    network_facts: PanelEdgeNetworkFacts | None = None,
+    bridge: str | None = None,
+    subnet: str | None = None,
+    gateway: str | None = None,
+) -> RuntimeResult:
+    """Remove only marker-tagged panel-edge rules for explicit ``port``."""
+    validated_port = validate_port(str(port))
+    if any(value is not None for value in (facts, network_facts, bridge, subnet, gateway)):
+        _panel_edge_spec(
+            validated_port,
+            facts,
+            network_facts=network_facts,
+            bridge=bridge,
+            subnet=subnet,
+            gateway=gateway,
+        )
+    return _remove_panel_edge_rules(validated_port)
+
+
+def remove_all_panel_edge_rules() -> RuntimeResult:
+    """Remove every marker-tagged panel-edge rule, regardless of port."""
+    return _remove_panel_edge_rules(None)
+
+
+# Descriptive aliases for callers that use ingress vocabulary.
+ensure_panel_edge_ingress = ensure_panel_edge_rule
+remove_panel_edge_ingress = remove_panel_edge_rule
+ensure_panel_edge_ingress_rule = ensure_panel_edge_rule
+remove_panel_edge_ingress_rule = remove_panel_edge_rule
+remove_all_panel_edge_ingress = remove_all_panel_edge_rules
+remove_panel_edge_rules = remove_all_panel_edge_rules
 
 
 def allow_port(port: str, protocol: str, *, source: str | None = None, comment: str | None = None) -> RuntimeResult:
