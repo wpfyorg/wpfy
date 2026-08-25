@@ -221,9 +221,16 @@ on_interrupt() {
 
 cleanup() {
     restore_terminal
-    [[ -n "$TMP_ROOT" ]] && rm -rf "$TMP_ROOT"
-    [[ -n "$WRAPPER_TEMP" ]] && rm -f -- "$WRAPPER_TEMP"
-    [[ -n "$TRUST_TEMP" ]] && rm -f -- "$TRUST_TEMP"
+    if [[ -n "$TMP_ROOT" ]]; then
+        rm -rf "$TMP_ROOT"
+    fi
+    if [[ -n "$WRAPPER_TEMP" ]]; then
+        rm -f -- "$WRAPPER_TEMP"
+    fi
+    if [[ -n "$TRUST_TEMP" ]]; then
+        rm -f -- "$TRUST_TEMP"
+    fi
+    return 0
 }
 
 download_archive() {
@@ -231,13 +238,19 @@ download_archive() {
     case "$SOURCE_ARCHIVE" in
         http://*|https://*)
             command -v curl >/dev/null 2>&1 || die "curl is required"
-            curl -fsSL "$SOURCE_ARCHIVE" -o "$destination" || die "failed to download source archive: $SOURCE_ARCHIVE"
+            # The archive URL may carry private tokens or signed query
+            # parameters, so neither the URL nor curl's diagnostics may reach
+            # the console or LOG_FILE.
+            curl -fsSL "$SOURCE_ARCHIVE" -o "$destination" 2>/dev/null \
+                || die "failed to download source archive"
             ;;
         file://*)
-            cp "${SOURCE_ARCHIVE#file://}" "$destination" || die "failed to copy source archive: $SOURCE_ARCHIVE"
+            cp "${SOURCE_ARCHIVE#file://}" "$destination" 2>/dev/null \
+                || die "failed to copy source archive"
             ;;
         *)
-            cp "$SOURCE_ARCHIVE" "$destination" || die "failed to copy source archive: $SOURCE_ARCHIVE"
+            cp "$SOURCE_ARCHIVE" "$destination" 2>/dev/null \
+                || die "failed to copy source archive"
             ;;
     esac
 }
@@ -345,6 +358,162 @@ finally:
 PY
 }
 
+_rollback_staged_release() {
+    local release="$1" app="$2" venv="$3" repair_app="${4:-}"
+    # Drop any staged-app symlink created during activation before restoring
+    # the canonical root links, otherwise the link would dangle once the
+    # partial release is deleted below.
+    if [[ -L "$app" ]]; then
+        rm -f -- "$app"
+    fi
+    [[ -e "$app" ]] || ln -s "current/app" "$app"
+    # A rollback after the editable reinstall ran against a venv shared with
+    # the previous release leaves that venv's metadata pointing at the staged
+    # tree. Repoint it at the previous release's own app first; the staged
+    # release is deleted only once this repair succeeds, because deleting it
+    # earlier would strand the still-active release's interpreter on a
+    # missing source tree. If the repair fails, the staged release is kept:
+    # it holds the only source tree the shared venv still resolves to.
+    if [[ -n "$repair_app" && -L "$release/venv" ]]; then
+        local repair_venv repair_python repair_log repair_status
+        if [[ ! -d "$repair_app" ]]; then
+            printf 'wpfy install: rollback could not restore the previous release: %s is missing\n' "$repair_app" >&2
+            printf 'wpfy install: the staged release was kept at %s for manual recovery\n' "$release" >&2
+            return 1
+        fi
+        # Resolve the shared venv symlink to its target separately. A dangling
+        # symlink must yield an empty candidate that is rejected below; the
+        # previous single-expression construction fell back to /bin/python,
+        # risking host Python mutation and a falsely successful rollback.
+        repair_python=""
+        if repair_venv="$(cd "$release/venv" 2>/dev/null && pwd -P)"; then
+            repair_python="$repair_venv/bin/python"
+        fi
+        if [[ -z "$repair_python" || ! -x "$repair_python" ]]; then
+            printf 'wpfy install: rollback could not restore the previous release: no usable interpreter behind %s\n' "$release/venv" >&2
+            printf 'wpfy install: the staged release was kept at %s for manual recovery\n' "$release" >&2
+            return 1
+        fi
+        repair_log="$TMP_ROOT/rollback-editable-repair.log"
+        [[ -n "$TMP_ROOT" ]] || repair_log="/dev/null"
+        : >"$repair_log"
+        repair_status=0
+        "$repair_python" -m pip install -e "$repair_app" >"$repair_log" 2>&1 || repair_status=$?
+        if [[ "$repair_status" -ne 0 ]]; then
+            printf 'wpfy install: rollback could not restore the previous release editable install\n' >&2
+            if [[ -s "$repair_log" ]]; then
+                tail -n 15 "$repair_log" >&2
+            fi
+            printf 'wpfy install: the staged release was kept at %s for manual recovery\n' "$release" >&2
+            printf 'wpfy install: the active release venv still resolves wpfy into the staged tree\n' >&2
+            printf 'wpfy install: to finish the rollback manually, run:\n' >&2
+            printf '  %s -m pip install -e %s\n' "$repair_python" "$repair_app" >&2
+            printf 'wpfy install: then delete %s and rerun the installer\n' "$release" >&2
+            return 1
+        fi
+    fi
+    rm -rf "$release"
+    [[ -e "$venv" ]] || ln -s "current/venv" "$venv"
+    return 0
+}
+
+activate_staged_release() {
+    [[ "$DRY_RUN" == "1" ]] && return 0
+    local releases current app venv release stamp previous expected imported pip_log repair_app
+    releases="$INSTALL_ROOT/releases"
+    current="$INSTALL_ROOT/current"
+    app="$INSTALL_ROOT/app"
+    venv="$INSTALL_ROOT/venv"
+
+    # Only applies when a versioned layout is already active and the bundled
+    # installer staged a fresh physical app tree at the root path. The normal
+    # symlinked layout (app -> current/app) is left untouched.
+    [[ -L "$current" ]] || return 0
+    [[ -e "$app" && ! -L "$app" ]] || return 0
+    mkdir -p "$releases"
+
+    previous="$(basename "$(readlink "$current")")"
+    [[ -n "$previous" ]] || die "cannot determine the currently active wpfy release"
+    stamp="$(date -u +%Y%m%d%H%M%S)-$$"
+    release="$releases/release-$stamp"
+    mkdir "$release"
+    mv "$app" "$release/app"
+    # Keep the canonical root app path resolving while activation is in
+    # flight; it is swapped to current/app once current points at this
+    # release. Never leave a direct-release link behind.
+    ln -s "releases/$(basename "$release")" "$app" || {
+        _rollback_staged_release "$release" "$app" "$venv"
+        die "could not relink the staged wpfy app; previous release left active"
+    }
+    if [[ -e "$venv" && ! -L "$venv" ]]; then
+        mv "$venv" "$release/venv"
+    else
+        # Resolve to the existing active venv directly (never through
+        # current, which is about to be repointed at this release).
+        ln -s "../$previous/venv" "$release/venv"
+    fi
+    chmod 750 "$release"
+
+    repair_app=""
+    if [[ -L "$release/venv" ]]; then
+        # The staged release shares the previous release's venv, so the
+        # editable reinstall below mutates venv metadata that the active
+        # release depends on. Any rollback after that point must restore the
+        # previous release's own editable install before the staged release
+        # is deleted.
+        repair_app="$releases/$previous/app"
+    fi
+
+    expected="$(cd "$release/app/src" && pwd -P)" || {
+        _rollback_staged_release "$release" "$app" "$venv"
+        die "staged wpfy release is missing src/; previous release left active"
+    }
+
+    # A reused venv's editable install records the pre-move source location
+    # and does not reliably survive the app move, so reinstall wpfy editable
+    # with this release's own interpreter against this release's own app tree
+    # before trusting the release.
+    pip_log="$TMP_ROOT/staged-editable-install.log"
+    [[ -n "$TMP_ROOT" ]] || pip_log="/dev/null"
+    if ! "$release/venv/bin/python" -m pip install -e "$release/app" >"$pip_log" 2>&1; then
+        _rollback_staged_release "$release" "$app" "$venv" "$repair_app" || {
+            # Retained-release recovery guidance was already printed.
+            exit 1
+        }
+        if [[ -s "$pip_log" ]]; then
+            tail -n 15 "$pip_log" >&2
+        fi
+        die "staged wpfy editable reinstall failed; previous release left active"
+    fi
+
+    imported="$("$release/venv/bin/python" -c 'import os, wpfy; print(os.path.dirname(os.path.dirname(os.path.realpath(wpfy.__file__))))' 2>/dev/null)" || {
+        _rollback_staged_release "$release" "$app" "$venv" "$repair_app" || {
+            # Retained-release recovery guidance was already printed.
+            exit 1
+        }
+        die "staged wpfy release failed source verification; previous release left active"
+    }
+    [[ "$imported" == "$expected" ]] || {
+        _rollback_staged_release "$release" "$app" "$venv" "$repair_app" || {
+            # Retained-release recovery guidance was already printed.
+            exit 1
+        }
+        die "staged wpfy release does not resolve wpfy to its own source; previous release left active"
+    }
+
+    if ! ln -sfn "releases/$(basename "$release")" "$current"; then
+        _rollback_staged_release "$release" "$app" "$venv" "$repair_app" || {
+            # Retained-release recovery guidance was already printed.
+            exit 1
+        }
+        die "could not activate the new wpfy release; previous release left active"
+    fi
+    # Swap the temporary direct staged-app link for the canonical
+    # current-relative one; never leave a direct-release link behind.
+    ln -sfn "current/app" "$app"
+    [[ -e "$venv" ]] || ln -s "current/venv" "$venv"
+}
+
 ensure_versioned_layout() {
     [[ "$DRY_RUN" == "1" ]] && return 0
     local releases current app venv release stamp
@@ -355,6 +524,7 @@ ensure_versioned_layout() {
     mkdir -p "$INSTALL_ROOT" "$releases"
 
     if [[ -L "$current" ]]; then
+        activate_staged_release
         install_stable_wrapper
         return 0
     fi
@@ -399,6 +569,7 @@ main() {
     [[ "$USE_TTY" == "1" && "$DRY_RUN" != "1" ]] && printf '\033[?25l'
 
     local archive="$TMP_ROOT/wpfy.tar.gz"
+    log "wpfy bootstrap: installing from ref ${REF}"
     run_step 1 "Downloading source archive" download_archive "$archive"
     run_step 2 "Verifying source checksum" verify_archive_checksum "$archive"
     run_step 3 "Extracting source archive" extract_archive "$archive"
@@ -407,6 +578,7 @@ main() {
     local source_dir
     source_dir="$(cat "$TMP_ROOT/source-dir")"
     restore_terminal
+    log "Executing bundled installer from ${source_dir}"
     WPFY_INSTALL_LOG="$LOG_FILE" \
     WPFY_BOOTSTRAP_LOG="$LOG_FILE" \
     WPFY_PROGRESS_OFFSET=4 \
@@ -414,9 +586,14 @@ main() {
     WPFY_INSTALL_STARTED_AT="$INSTALL_STARTED_AT" \
     WPFY_VERBOSE="$VERBOSE" \
     WPFY_NO_COLOR="$NO_COLOR_REQUESTED" \
-        bash "$source_dir/wpfy" --skip-wpfy-install "${installer_args[@]}"
+        bash "$source_dir/wpfy" "${installer_args[@]}"
     install_update_trust "$source_dir"
     ensure_versioned_layout
 }
 
-main "$@"
+# Source-only mode for deterministic function-level tests: sourcing this file
+# with WPFY_BOOTSTRAP_SOURCE_ONLY=1 defines the functions without executing
+# the bootstrap (mirrors WPFY_INSTALLER_SOURCE_ONLY in wpfy).
+if [[ "${WPFY_BOOTSTRAP_SOURCE_ONLY:-0}" != "1" ]]; then
+    main "$@"
+fi

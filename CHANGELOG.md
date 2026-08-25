@@ -8,6 +8,31 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- Installer source identity (W4-11): the bundled installer no longer
+  pip-installs the package. It verifies that the venv's `wpfy` import
+  resolves to the staged source tree and fails loudly when it does not, and
+  the public bootstrap migrates legacy unversioned `/opt/wpfy/app` and
+  `/opt/wpfy/venv` trees into a versioned layout
+  (`/opt/wpfy/releases/legacy-<stamp>/` behind an `/opt/wpfy/current`
+  symlink). Validated on a disposable Ubuntu VPS on 2026-08-25; see
+  Validation.
+- Installer follow-up (2026-08-25): source-archive values no longer reach
+  logs or the console — download/copy failures print generic messages with
+  tool diagnostics suppressed, and the bootstrap log line names only the ref,
+  because an archive URL may carry private tokens or signed query parameters.
+  A repeated bootstrap now reuses the symlinked venv instead of running
+  `python3 -m venv` through the symlink: the root installer validates the
+  target interpreter and logs the reuse. When a versioned layout is already
+  active and the bundled installer stages a fresh physical app tree, the
+  bootstrap activates it as a new release: the staged tree moves to
+  `releases/release-<stamp>/app`, the release links the existing active venv
+  (or moves a physical one), a release-local editable install runs with the
+  release's own interpreter against its own tree — a reused venv's editable
+  metadata records the pre-move source location — and `import wpfy` must
+  resolve to that release's `app/src` before `current` is repointed. Any
+  relink, pip, import, or activation failure rolls back: the partial release
+  is deleted and the previous release stays active behind the canonical root
+  links.
 - Panel sign-in is now two steps. The password step verifies credentials
   first; only then, and only for accounts with TOTP enabled, does the panel
   ask for a code, backed by a single-use challenge that expires in 120
@@ -47,8 +72,124 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   card never claims the public domain is guarded -- or unguarded -- when
   disk says otherwise.
 
+### Deprecated
+
+- `wpfy stack migrate` is deprecated in 1.0 and will be removed no earlier
+  than 1.1. It has never been implemented — Docker-first wpfy has no
+  host-level stack to migrate from — so nothing changes at runtime in 1.0.
+  The 1.1 removal ships with guidance for operators coming from host-managed
+  stacks.
+- Grouped `wpfy site ...` / `wpfy stack ...` compatibility surfaces and
+  confirmed legacy removals are deprecated in 1.0. Nothing is removed before
+  1.1, and every removal must ship with actionable migration guidance naming
+  the replacement command. The flat command surface remains canonical.
+
+### Decisions
+
+Roadmap decisions recorded 2026-08-25 (documentation only; no feature work is
+claimed and none of this is validated):
+
+- FileBrowser Quantum stays disabled/parked through 1.0 stable and is
+  reassessed at 1.1 planning. No code is deleted (ADR 0031, amended).
+- WordPress Multisite is scheduled for 1.1 with both subdirectory and
+  subdomain modes. Subdomain mode requires a Cloudflare DNS wildcard record
+  and a passing wildcard TLS preflight before any mutation. Child sites of a
+  network share one WPFY site runtime and database — disclosed upfront —
+  while separately managed WPFY sites remain isolated from each other.
+  Implementation is blocked pending offline and disposable-VPS evidence
+  (ADR 0035).
+- 1.0 scope confirmed: telemetry stays inert by default, SMTP stays
+  test-only, and named S3-compatible storage profiles remain CLI-only.
+
+### Validation
+
+Ponytail batch status, 2026-08-25. Focused suite counts below are exact and
+per batch. The full offline suite passed after these batches: `pytest -q`
+exited 0 with 2277 passed in 649.22s. One test-only fixture correction was
+needed first (see the last bullet). Root/Docker-mutating shell tests and an
+independent installer review were not performed.
+
+- W4-11 installer source identity: local installer shell tests passed —
+  `tests/installer-idempotency.sh` and `tests/installer-payload.sh` both exit
+  0 (offline checks on a non-Linux host). The disposable Ubuntu/VPS install
+  gate completed on 2026-08-25: the full staged installer ran end-to-end
+  twice; the corrected failure-rollback probe — a forced staged-source
+  install failure — restored the previous source and exited 97; the
+  `/opt/wpfy/app` symlink was identical before and after the failed run,
+  resolving to `/opt/wpfy/releases/legacy-20260825013714-2557/app`; and
+  `wpfy --version` ran successfully after the failure. No independent
+  installer review was performed.
+- W1-03 shared `_current_paths()` export: `pytest tests/test_registry.py
+  tests/test_events.py -q` — 27 passed, offline. The CodeDebrief refresh is
+  blocked by an unavailable analyzer; its artifacts were not regenerated.
+- W1-02 suppression cleanup (`try/except X: pass` →
+  `contextlib.suppress(X)`): conversion batch complete across
+  `site_layout.py`, `site_security.py`, `panel_auth.py`,
+  `fail2ban_docker.py`, and `fail2ban_host.py`; suppression-batch pytest —
+  524 passed.
+- W1-07 unlink cleanup (`if exists(): unlink()` /
+  `try: unlink() except FileNotFoundError` → `Path.unlink(missing_ok=True)`):
+  convertible Path-based sites converted; the dir-fd no-follow sites are
+  intentionally untouched; unlink-batch pytest — 217 passed.
+- W1-10 SMTP TLS vocabulary: the hand-copied `TLS_MODES` tuple and the
+  match-based validator in `smtp.py` now derive from
+  `typing.get_args(TLSMode)`, preserving Literal order and error text;
+  TLS-modes pytest — 4 passed.
+- W1-03 tranche two: remaining modules import the shared lazy
+  `current_paths()` accessor exported from `settings.py`, keeping a
+  per-module `_current_paths` name for test call sites; path-access tests —
+  86 passed.
+- CodeDebrief artifacts were regenerated and validated OK in this pass,
+  superseding the earlier analyzer-blocked refresh noted above.
+- Full offline suite: `pytest -q` — exit 0, 2277 passed in 649.22s. It
+  passed only after a test-only fixture correction in
+  `tests/test_edge_backup.py`: `_patch_traefik_paths` now rebinds the
+  module-level `PATHS` to a `dataclasses.replace(...)` copy whose `state_dir`
+  stays under the tmp root, because `WpfyPaths` is a frozen dataclass and the
+  edge-backup transaction lock resolves
+  `Path(settings.PATHS.state_dir) / "traefik.lock"` at call time; targeted
+  rerun — 4 passed. No source changes were part of that correction.
+- Installer follow-up (2026-08-25), disposable Ubuntu/VPS evidence: the
+  redaction probe passed — download and copy failure paths stay generic and
+  never leak the archive URL, token, host, or path. The initial rerun
+  exposed two defects, venv creation attempted through the symlinked venv
+  and an activation path bug; both were discovered with the previous release
+  left active by the rollback and then fixed. The final repeat bootstrap
+  exited 0: `current` moved to `release-20260825055831-21347`, the root
+  links are `current/app` and `current/venv`, the Python import resolves to
+  the new release's `app/src`, and the wrapper version ran. The final full
+  pytest run for this follow-up passed: 2277 passed. Root/Docker-mutating shell tests
+  and an independent installer review were not performed.
+
 ### Fixed
 
+- Installer rollback no longer strands the active release's Python
+  environment. When a repeated bootstrap stages a release that shares the
+  previous release's venv, the release-local editable reinstall repoints that
+  shared venv's metadata at the staged tree; any failure after that point
+  deleted the staged release anyway, leaving the still-active previous
+  release's interpreter resolving `wpfy` into a deleted source tree. Rollback
+  now records the shared-venv mutation and, before deleting the staged
+  release, reinstalls the previous release's own app editable through the
+  shared interpreter. That repair resolves the shared venv symlink to its
+  target first and refuses to run when the target is missing or carries no
+  executable interpreter — the earlier single-expression resolution fell back
+  to the host `/bin/python` on a dangling symlink, risking host Python
+  mutation and a falsely successful rollback. If the repair fails or is
+  refused, the staged release is preserved —
+  it holds the only source tree the mutated venv still resolves to — and the
+  installer prints the exact manual repair and cleanup commands instead of
+  claiming the rollback succeeded. Physical-venv staging, first install, and
+  the success path are unchanged. Covered by shared-venv fail-import,
+  fail-pip, and repair-failure cases in `tests/installer-idempotency.sh`.
+- Installer cleanup paths no longer return non-zero when there is nothing to
+  clean. Both installers cleaned temporary state with `[[ -n "$VAR" ]] &&
+  rm …`, which evaluates to status 1 whenever the variable is empty; inside
+  the `EXIT`/`INT`/`TERM` traps under `set -euo pipefail`, that non-zero
+  status could distort the installer's own exit code. The cleanup branches in
+  `wpfy` (`cleanup_session`) and `install.sh` (`cleanup`) are now explicit
+  `if` blocks that end in `return 0`. Covered by `tests/installer-idempotency.sh`:
+  "installer cleanup succeeds without a session directory".
 - Disabling panel basic auth no longer reports success while an unmanaged
   router may still be prompting. When the rewrite of a recognized router
   fails, the credential file is restored (bytes and mode) so disk state

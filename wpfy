@@ -375,7 +375,10 @@ on_interrupt() {
 
 cleanup_session() {
     restore_terminal
-    [[ -n "$INSTALL_SESSION_DIR" ]] && rm -rf "$INSTALL_SESSION_DIR"
+    if [[ -n "$INSTALL_SESSION_DIR" ]]; then
+        rm -rf "$INSTALL_SESSION_DIR"
+    fi
+    return 0
 }
 
 ensure_root() {
@@ -674,7 +677,20 @@ install_python_package() {
         return 0
     fi
 
-    python3 -m venv "$VENV_DIR"
+    # A symlinked VENV_DIR points at the active release's venv (versioned
+    # layout); reusing it keeps the active environment authoritative. The venv
+    # module cannot create through the symlink, so only an invalid target may
+    # fail here, and it must fail clearly.
+    if [[ -L "$VENV_DIR" ]]; then
+        local venv_target
+        venv_target="$(readlink "$VENV_DIR")"
+        if [[ ! -x "$VENV_DIR/bin/python" ]]; then
+            die "existing wpfy venv $VENV_DIR -> $venv_target is not a usable Python environment"
+        fi
+        log "reusing existing wpfy venv at $VENV_DIR"
+    else
+        python3 -m venv "$VENV_DIR"
+    fi
     "$VENV_DIR/bin/python" -m pip install --upgrade pip setuptools wheel
     "$VENV_DIR/bin/python" -m pip install -e "$APP_DIR"
     cat >"$BIN_PATH" <<EOF
@@ -701,17 +717,44 @@ EOF
     chmod 755 "$BIN_PATH"
 }
 
-install_wpfy_pip() {
+resolve_installed_source_dir() {
+    "$VENV_DIR/bin/python" - <<'PY'
+import os
+import wpfy
+
+print(os.path.dirname(os.path.dirname(os.path.abspath(wpfy.__file__))))
+PY
+}
+
+verify_wpfy_source() {
+    local expected resolved
+    if [[ ! -d "$APP_DIR/src" ]]; then
+        die "staged source package missing at $APP_DIR/src"
+    fi
+    expected="$(cd "$APP_DIR/src" && pwd -P)"
+    if ! resolved="$(resolve_installed_source_dir)"; then
+        die "wpfy package failed to import from $VENV_DIR"
+    fi
+    if ! resolved="$(cd "$resolved" 2>/dev/null && pwd -P)"; then
+        die "installed wpfy source path does not exist: $resolved"
+    fi
+    if [[ "$resolved" != "$expected" ]]; then
+        die "installed wpfy resolves to $resolved, not the staged source at $expected"
+    fi
+    log "wpfy package verified from staged source ($resolved)"
+}
+
+verify_wpfy_install() {
     if [[ "$SKIP_WPFY_INSTALL" == "1" ]]; then
-        log "wpfy pip install skipped (--skip-wpfy-install)"
+        log "wpfy source verification skipped (--skip-wpfy-install)"
         [[ "$DRY_RUN" == "1" ]] || mark_step_skipped "bundled source install"
         return 0
     fi
     if [[ "$DRY_RUN" == "1" ]]; then
-        log "[dry-run] $VENV_DIR/bin/python -m pip install wpfy"
+        log "[dry-run] verify $VENV_DIR/bin/python imports wpfy from $APP_DIR/src"
         return 0
     fi
-    "$VENV_DIR/bin/python" -m pip install wpfy
+    verify_wpfy_source
 }
 
 write_config() {
@@ -781,7 +824,7 @@ main() {
                 log "  --dry-run            Show steps without executing"
                 log "  --verbose            Show command output while retaining the install log"
                 log "  --no-color           Disable ANSI colors and cursor updates"
-                log "  --skip-wpfy-install  Skip 'pip install wpfy' (source install from checkout only)"
+                log "  --skip-wpfy-install  Skip wpfy package source verification (advanced)"
                 exit 0
                 ;;
             *) die "unknown argument: $1" ;;
@@ -813,7 +856,7 @@ main() {
     run_step 7 "Locating source tree" locate_source_tree
     run_step 8 "Syncing source tree" sync_source
     run_step 9 "Creating Python environment" install_python_package
-    run_step 10 "Installing wpfy package" install_wpfy_pip
+    run_step 10 "Verifying wpfy source" verify_wpfy_install
     run_step 11 "Writing configuration" write_config
     run_step 12 "Running smoke checks" finish_install
 

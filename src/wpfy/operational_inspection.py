@@ -6,16 +6,15 @@ from pathlib import Path
 
 from . import registry, traefik
 from .certificate_lifecycle import cert_expiry_days, get_cert_info
+from .settings import current_paths
 from .site_definition import MYSQL_FLAVORS, SiteDefinition
 from .site_layout import list_sites, site_info, web_service_lines
 from .site_paths import domain_to_project, env_path, nginx_conf_path, read_env, site_dir
 from .site_runtime import compose_command, docker_available, http_probe_site, nginx_config_test, runtime_skip_requested
 
-
-def _current_paths():
-    from .settings import PATHS as current_paths
-
-    return current_paths
+# Shared lazy accessor (W1-03); the per-module alias stays because tests
+# monkeypatch this name to redirect path lookups.
+_current_paths = current_paths
 
 
 @dataclass(frozen=True, slots=True)

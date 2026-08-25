@@ -17,6 +17,7 @@ guarded by runtime capability detection (ipv6_capable).
 
 from __future__ import annotations
 
+import contextlib
 import os
 import re
 import secrets
@@ -25,6 +26,8 @@ import subprocess
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
+
+from .settings import current_paths
 
 # ---------------------------------------------------------------------------
 # Policy constants
@@ -111,16 +114,9 @@ class RunResult:
 # ---------------------------------------------------------------------------
 
 
-def _current_paths():
-    """Lazy import to pick up env-var-injected PATHS after test reload."""
-    from .settings import PATHS as current_paths
-
-    return current_paths
-
-
 def _fail2ban_root() -> Path:
     """Derive fail2ban root from config_dir parent, mirroring site_security."""
-    return Path(_current_paths().config_dir).parent / "fail2ban"
+    return Path(current_paths().config_dir).parent / "fail2ban"
 
 
 def _run(
@@ -220,12 +216,10 @@ def _replace_file(root: Path, target: str, replacement: str) -> None:
 
     root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     try:
-        try:
+        with contextlib.suppress(FileNotFoundError):
             metadata = os.stat(target, dir_fd=root_fd, follow_symlinks=False)
             if stat_mod.S_ISLNK(metadata.st_mode):
                 raise OSError(f"managed config is a symlink: {target}")
-        except FileNotFoundError:
-            pass
         os.replace(replacement, target, src_dir_fd=root_fd, dst_dir_fd=root_fd)
     finally:
         os.close(root_fd)
@@ -233,7 +227,7 @@ def _replace_file(root: Path, target: str, replacement: str) -> None:
 
 def _cleanup(root: Path, name: str) -> None:
     """Best-effort removal of a temporary file under *root*."""
-    try:
+    with contextlib.suppress(OSError):
         root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
         try:
             os.unlink(name, dir_fd=root_fd)
@@ -241,8 +235,6 @@ def _cleanup(root: Path, name: str) -> None:
             pass
         finally:
             os.close(root_fd)
-    except OSError:
-        pass
 
 
 def _install_text(root: Path, target: str, content: str, mode: int) -> bool:
@@ -534,7 +526,7 @@ def ipv6_capable() -> bool:
     if not shutil.which("ip"):
         return False
 
-    try:
+    with contextlib.suppress(FileNotFoundError, OSError):
         proc = subprocess.run(
             ["ip", "-6", "addr", "show", "scope", "global"],
             capture_output=True,
@@ -543,12 +535,10 @@ def ipv6_capable() -> bool:
         )
         if proc.returncode == 0 and proc.stdout.strip():
             return True
-    except (FileNotFoundError, OSError):
-        pass
 
     # Probe Docker edge network for IPv6 enablement.
     if shutil.which("docker"):
-        try:
+        with contextlib.suppress(FileNotFoundError, OSError):
             proc = subprocess.run(
                 [
                     "docker",
@@ -564,8 +554,6 @@ def ipv6_capable() -> bool:
             )
             if proc.returncode == 0 and proc.stdout.strip().lower() == "true":
                 return True
-        except (FileNotFoundError, OSError):
-            pass
 
     return False
 

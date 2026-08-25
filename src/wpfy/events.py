@@ -7,12 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-
-def _current_paths():
-    from .settings import PATHS as current_paths
-
-    return current_paths
-
+from .settings import current_paths
 
 _MAX_EVENT_BYTES = 1024 * 1024
 _SECRET_KEY = re.compile(
@@ -33,7 +28,7 @@ _QUOTED_KEY_ASSIGNMENT = re.compile(
 
 
 def event_log_path() -> Path:
-    return Path(_current_paths().state_dir) / "events" / "events.jsonl"
+    return Path(current_paths().state_dir) / "events" / "events.jsonl"
 
 
 def _redact(value: Any, key: str = "") -> Any:

@@ -10,15 +10,10 @@ import subprocess
 from typing import Final
 
 from . import metrics, site_cron, systemd
+from .settings import current_paths
 from .site_definition import WORDPRESS_FLAVORS
 from .site_layout import list_sites
 from .site_runtime import RuntimeResult, app_health_ok, runtime_skip_requested, site_health, wp_cli_command
-
-
-def _current_paths():
-    from .settings import PATHS as current_paths
-
-    return current_paths
 
 
 INTERVALS: Final = ("minute", "five-minute", "hourly", "six-hour", "daily", "weekly")
@@ -41,11 +36,11 @@ class CronRun:
 
 
 def cron_log_path() -> Path:
-    return Path(_current_paths().log_dir) / LOG_NAME
+    return Path(current_paths().log_dir) / LOG_NAME
 
 
 def custom_hook_path(interval: str) -> Path:
-    return Path(_current_paths().config_dir) / "custom" / "cron" / f"{interval}.sh"
+    return Path(current_paths().config_dir) / "custom" / "cron" / f"{interval}.sh"
 
 
 def install_timers() -> RuntimeResult:
@@ -250,12 +245,12 @@ def _load_health_line() -> str:
 
 
 def _disk_health_line() -> str:
-    probe = Path(_current_paths().install_root)
+    probe = Path(current_paths().install_root)
     while not probe.exists() and probe != probe.parent:
         probe = probe.parent
     usage = shutil.disk_usage(probe)
     used_percent = (usage.used / usage.total) * 100 if usage.total else 0
-    return f"disk health: {used_percent:.1f}% used at {_current_paths().install_root}"
+    return f"disk health: {used_percent:.1f}% used at {current_paths().install_root}"
 
 
 def _append_cron_log(lines: list[str]) -> None:

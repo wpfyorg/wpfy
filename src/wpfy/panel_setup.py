@@ -185,10 +185,7 @@ def _write_state(state: dict) -> None:
         os.replace(temp, path)
         os.chmod(path, 0o600)
     finally:
-        try:
-            temp.unlink()
-        except FileNotFoundError:
-            pass
+        temp.unlink(missing_ok=True)
 
 
 def state() -> dict:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import contextlib
 from contextlib import contextmanager
 from datetime import datetime, timezone
 import fcntl
@@ -412,21 +413,13 @@ def _rotate_panel_auth_log(path: Path) -> None:
     for i in range(_PANEL_AUTH_LOG_KEEP - 1, 0, -1):
         src = path.with_name(f"{path.name}.{i}")
         dst = path.with_name(f"{path.name}.{i + 1}")
-        try:
+        with contextlib.suppress(OSError):
             if src.exists():
-                try:
-                    dst.unlink()
-                except FileNotFoundError:
-                    pass
+                dst.unlink(missing_ok=True)
                 src.rename(dst)
-        except OSError:
-            pass
     rotated = path.with_name(f"{path.name}.1")
-    try:
-        try:
-            rotated.unlink()
-        except FileNotFoundError:
-            pass
+    with contextlib.suppress(OSError):
+        rotated.unlink(missing_ok=True)
         # Copy current content to .1, then truncate the active file in place
         # (same inode fail2ban is tailing).
         shutil.copyfile(path, rotated)
@@ -435,8 +428,6 @@ def _rotate_panel_auth_log(path: Path) -> None:
             os.ftruncate(fd, 0)
         finally:
             os.close(fd)
-    except OSError:
-        pass
 
 
 def _append_panel_auth_failure(
@@ -483,15 +474,13 @@ def _append_panel_auth_failure(
             finally:
                 os.close(fd)
     except (OSError, TypeError, ValueError) as exc:
-        try:
+        with contextlib.suppress(Exception):
             events.record_event(
                 "login_shield.health_failed",
                 outcome="failed",
                 detail=f"panel auth failure log write failed: {type(exc).__name__}",
                 actor="panel",
             )
-        except Exception:
-            pass
         raise
 
 
@@ -590,10 +579,7 @@ def _write_users(users: list[dict]) -> None:
         os.replace(temp, path)
         os.chmod(path, 0o600)
     finally:
-        try:
-            temp.unlink()
-        except FileNotFoundError:
-            pass
+        temp.unlink(missing_ok=True)
 
 
 def _find_user(users: list[dict], username: str) -> dict | None:
@@ -925,7 +911,7 @@ def _composite_password_work(password: str, salt: bytes) -> tuple[bytes, bytes, 
 
 
 def _dummy_password_work(password) -> None:
-    try:
+    with contextlib.suppress(TypeError, ValueError, OverflowError):
         legacy, prior, current = _composite_password_work(
             password if isinstance(password, str) else "", _DUMMY_SALT,
         )
@@ -933,8 +919,6 @@ def _dummy_password_work(password) -> None:
         hmac.compare_digest(legacy, zero)
         hmac.compare_digest(prior, zero)
         hmac.compare_digest(current, zero)
-    except (TypeError, ValueError, OverflowError):
-        pass
 
 
 def _parse_password_record(user: dict) -> tuple[int, int, int, int, bytes, bytes, bool] | None:

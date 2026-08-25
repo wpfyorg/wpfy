@@ -217,10 +217,7 @@ def _atomic_write(path: Path, content: bytes, mode: int = 0o600) -> None:
         os.replace(temporary, path)
         os.chmod(path, mode)
     finally:
-        try:
-            temporary.unlink()
-        except FileNotFoundError:
-            pass
+        temporary.unlink(missing_ok=True)
 
 
 def _set_acme_email(address: str) -> Path:
@@ -264,10 +261,7 @@ def record_applied_state(config_text: str) -> None:
 
 
 def _clear_applied_state() -> None:
-    try:
-        applied_state_path().unlink()
-    except FileNotFoundError:
-        pass
+    applied_state_path().unlink(missing_ok=True)
 
 
 def clear_applied_state() -> None:

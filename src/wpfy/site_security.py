@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import dataclass
+import contextlib
 import hashlib
 import ipaddress
 import json
@@ -25,6 +26,7 @@ from .fail2ban_host import (
     wordpress_filter_content,
 )
 from .site_paths import env_path, read_env, site_dir, site_exists, validate_domain
+from .settings import current_paths
 from .traefik import traefik_network_cidrs
 
 
@@ -119,22 +121,21 @@ def _require_site(domain: str) -> Path:
 
 def access_log_path(domain: str) -> Path:
     validate_domain(domain)
-    root = Path(_current_paths().sites_dir) / domain
+    root = Path(current_paths().sites_dir) / domain
     if not root.is_dir():
         raise FileNotFoundError(f"site not found: {domain}")
     return root / "nginx" / ACCESS_LOG_FILE
 
 
-def _current_paths():
-    from .settings import PATHS as current_paths
-
-    return current_paths
+# Legacy alias kept only because site_event_pipeline imports this name;
+# new code calls settings.current_paths() directly.
+_current_paths = current_paths
 
 
 def _fail2ban_root() -> Path:
     # Wpfy keeps its own configuration in /etc/wpfy; fail2ban and logrotate use
     # sibling system directories. Tests redirect WPFY_CONFIG_DIR and stay isolated.
-    return Path(_current_paths().config_dir).parent / "fail2ban"
+    return Path(current_paths().config_dir).parent / "fail2ban"
 
 
 def fail2ban_filter_path() -> Path:
@@ -161,7 +162,7 @@ def _site_mutation_lock(domain: str):
     """
     import fcntl
 
-    root = Path(_current_paths().state_dir) / "site-mutation-locks"
+    root = Path(current_paths().state_dir) / "site-mutation-locks"
     root.mkdir(parents=True, exist_ok=True)
     digest = hashlib.sha256(domain.encode("utf-8")).hexdigest()[:16]
     path = root / f"{digest}.lock"
@@ -177,7 +178,7 @@ def _site_mutation_lock(domain: str):
 def _logrotate_path(domain: str) -> Path:
     validate_domain(domain)
     digest = hashlib.sha256(domain.encode("utf-8")).hexdigest()[:16]
-    return Path(_current_paths().config_dir).parent / "logrotate.d" / f"wpfy-{digest}"
+    return Path(current_paths().config_dir).parent / "logrotate.d" / f"wpfy-{digest}"
 
 
 def fail2ban_available() -> bool:
@@ -235,19 +236,17 @@ def _safe_write_in_place(root: Path, name: str, content: str, mode: int) -> None
 def _replace_file(root: Path, target: str, replacement: str) -> None:
     root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     try:
-        try:
+        with contextlib.suppress(FileNotFoundError):
             metadata = os.stat(target, dir_fd=root_fd, follow_symlinks=False)
             if stat.S_ISLNK(metadata.st_mode):
                 raise OSError(f"managed security config is a symlink: {target}")
-        except FileNotFoundError:
-            pass
         os.replace(replacement, target, src_dir_fd=root_fd, dst_dir_fd=root_fd)
     finally:
         os.close(root_fd)
 
 
 def _cleanup(root: Path, name: str) -> None:
-    try:
+    with contextlib.suppress(OSError):
         root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
         try:
             os.unlink(name, dir_fd=root_fd)
@@ -255,8 +254,6 @@ def _cleanup(root: Path, name: str) -> None:
             pass
         finally:
             os.close(root_fd)
-    except OSError:
-        pass
 
 
 def _install_text(root: Path, target: str, content: str, mode: int) -> bool:
@@ -455,7 +452,7 @@ def _fail2ban_filter_content() -> str:
 def _enabled_fail2ban_domains(
     *, skip_invalid: bool = False, skipped_domains: list[str] | None = None
 ) -> tuple[str, ...]:
-    sites_root = Path(_current_paths().sites_dir)
+    sites_root = Path(current_paths().sites_dir)
     if not sites_root.is_dir():
         return ()
     domains: list[str] = []
@@ -670,10 +667,8 @@ def _prune_auth_fixture(domain: str, fixture_line: str) -> None:
     rewritten = "\n".join(kept)
     if kept and not rewritten.endswith("\n"):
         rewritten += "\n"
-    try:
+    with contextlib.suppress(OSError):
         _safe_write_in_place(root, AUTH_LOG_FILE, rewritten, 0o640)
-    except OSError:
-        pass
 
 
 def _fixture_pipeline_proof(domain: str, *, append_event: bool = False) -> tuple[bool, list[str]]:
@@ -741,24 +736,18 @@ def _fixture_pipeline_proof(domain: str, *, append_event: bool = False) -> tuple
 
 def _revert_fail2ban_state(domain: str) -> None:
     """Roll back an interrupted enable: state off, bridge guard off, configs re-rendered."""
-    try:
+    with contextlib.suppress(OSError, TypeError, ValueError):
         config = load_security(domain)
         if config["fail2ban"]:
             updated = dict(config)
             updated["fail2ban"] = False
             save_security(domain, updated)
-    except (OSError, TypeError, ValueError):
-        pass
-    try:
+    with contextlib.suppress(OSError, TypeError, ValueError):
         from .site_event_pipeline import ensure_event_pipeline_files
 
         ensure_event_pipeline_files(domain, enabled=False)
-    except (OSError, TypeError, ValueError):
-        pass
-    try:
+    with contextlib.suppress(OSError, RuntimeError, ValueError):
         _render_fail2ban_configs(skip_invalid=True)
-    except (OSError, RuntimeError, ValueError):
-        pass
     reload_error = _reload_fail2ban() if fail2ban_available() else None
     if reload_error:
         record_event(
@@ -1765,16 +1754,12 @@ def _recent_bans(jail_name: str) -> tuple[int | None, int | None]:
         stripped = line.strip()
         if "Currently banned:" in stripped:
             value = stripped.split(":", 1)[1].strip()
-            try:
+            with contextlib.suppress(ValueError):
                 currently = int(value)
-            except ValueError:
-                pass
         elif "Total banned:" in stripped:
             value = stripped.split(":", 1)[1].strip()
-            try:
+            with contextlib.suppress(ValueError):
                 total = int(value)
-            except ValueError:
-                pass
     return currently, total
 
 

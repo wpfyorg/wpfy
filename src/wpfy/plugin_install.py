@@ -26,6 +26,7 @@ import urllib.request
 import zipfile
 
 from .events import record_event
+from .settings import current_paths
 from .site_paths import site_dir, site_exists, validate_domain
 from .site_runtime import run_wp_cli
 from .site_security import (
@@ -107,15 +108,14 @@ class _PluginState:
 # ---------------------------------------------------------------------------
 
 
-def _current_paths():
-    from .settings import PATHS as current_paths
-
-    return current_paths
+# Legacy alias kept because tests read paths via plugin._current_paths();
+# new code calls settings.current_paths() directly (W1-03).
+_current_paths = current_paths
 
 
 def plugin_manifest_path() -> Path:
     """WPFY-owned manifest recording the pinned version and integrity evidence."""
-    return Path(_current_paths().state_dir) / "login-shield" / "plugin-manifest.json"
+    return Path(current_paths().state_dir) / "login-shield" / "plugin-manifest.json"
 
 
 def plugin_staging_dir(domain: str) -> Path:

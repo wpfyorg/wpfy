@@ -12,14 +12,9 @@ import tempfile
 from urllib.request import urlopen
 
 from .cloudflare_ranges import ips_are_cloudflare
+from .settings import current_paths
 from .site_runtime import RuntimeResult, docker_available, runtime_skip_requested
 from .traefik import TRAEFIK_CONTAINER
-
-
-def _current_paths():
-    from .settings import PATHS as current_paths
-
-    return current_paths
 
 
 @dataclass(frozen=True)
@@ -162,7 +157,7 @@ def preflight_ssl(domain: str) -> SSLPreflightResult:
 
 
 def _acme_json_path() -> str:
-    return os.path.join(_current_paths().traefik_dir, "letsencrypt", "acme.json")
+    return os.path.join(current_paths().traefik_dir, "letsencrypt", "acme.json")
 
 
 def _read_acme_file() -> list[dict] | None:

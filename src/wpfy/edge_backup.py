@@ -8,18 +8,13 @@ import tarfile
 import tempfile
 
 from .s3_backup import S3ConfigError, S3Uploader, load_s3_config, redact_s3_secrets
+from .settings import current_paths
 from .site_runtime import RuntimeResult, docker_available, runtime_skip_requested
 from . import traefik
 
 
-def _current_paths():
-    from .settings import PATHS as current_paths
-
-    return current_paths
-
-
 def _edge_backup_dir() -> Path:
-    return Path(_current_paths().state_dir) / "backups" / "edge"
+    return Path(current_paths().state_dir) / "backups" / "edge"
 
 
 def _local_acme_path() -> Path:

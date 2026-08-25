@@ -65,3 +65,15 @@ class WpfyPaths:
 
 
 PATHS = WpfyPaths()
+
+
+def current_paths() -> WpfyPaths:
+    """Late-bound accessor for PATHS.
+
+    Reads the module global at call time (not import time), so it stays
+    correct across `importlib.reload(wpfy.settings)` after env root changes:
+    reload mutates this module's dict in place, and this function's
+    `__globals__` is that same dict, so callers who imported the function
+    itself (not `PATHS` directly) still see the reloaded value.
+    """
+    return PATHS

@@ -4,6 +4,7 @@ from collections.abc import Iterable
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
+import contextlib
 import hashlib
 import json
 import re
@@ -475,10 +476,8 @@ def _merge_tree_safely(
                 continue
             mode = child.stat().st_mode & 0o777
             if child.is_dir():
-                try:
+                with contextlib.suppress(FileExistsError):
                     os.mkdir(child.name, mode=mode, dir_fd=destination_fd)
-                except FileExistsError:
-                    pass
                 child_fd = os.open(child.name, directory_flags, dir_fd=destination_fd)
                 try:
                     merge(child, child_fd, set())
@@ -584,10 +583,8 @@ def _ensure_directories_safely(root: Path, names: tuple[str, ...]) -> None:
     directory_fd = os.open(root, directory_flags)
     try:
         for name in names:
-            try:
+            with contextlib.suppress(FileExistsError):
                 os.mkdir(name, dir_fd=directory_fd)
-            except FileExistsError:
-                pass
             child_fd = os.open(name, directory_flags, dir_fd=directory_fd)
             os.close(directory_fd)
             directory_fd = child_fd
@@ -1228,14 +1225,10 @@ def _preserve_live_db_credentials(domain: str, live_env: dict[str, str]) -> Runt
 def _harden_restored_permissions(domain: str) -> RuntimeResult | None:
     target = site_dir(domain)
     try:
-        try:
+        with contextlib.suppress(FileNotFoundError):
             _chmod_file_safely(target, ".env", 0o600)
-        except FileNotFoundError:
-            pass
-        try:
+        with contextlib.suppress(FileNotFoundError):
             _chmod_file_safely(target / "nginx", site_security.HTPASSWD_FILE, 0o640)
-        except FileNotFoundError:
-            pass
         target_fd = os.open(target, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
         try:
             try:
@@ -1361,12 +1354,10 @@ def restore_site(domain: str, archive_path: str) -> RuntimeResult:
 
 
 def list_sites() -> list[dict[str, str]]:
-    try:
+    with contextlib.suppress(Exception):
         sites = registry.list_sites()
         if sites:
             return sites
-    except Exception:
-        pass
     root = Path(_current_paths().sites_dir)
     if not root.exists():
         return []
@@ -1393,7 +1384,7 @@ def list_sites() -> list[dict[str, str]]:
 
 def site_info(domain: str) -> dict[str, str]:
     validate_domain(domain)
-    try:
+    with contextlib.suppress(Exception):
         info = registry.get_site(domain)
         if info:
             info["path"] = str(site_dir(domain))
@@ -1403,8 +1394,6 @@ def site_info(domain: str) -> dict[str, str]:
             info["ssl"] = "enabled" if info.get("ssl_enabled") else "disabled"
             info["redis"] = "1" if info.get("cache_type") == "redis" else "0"
             return info
-    except Exception:
-        pass
     if not site_exists(domain):
         raise FileNotFoundError(f"site not found: {domain}")
 
@@ -1428,7 +1417,7 @@ def remove_site_scaffold(domain: str) -> bool:
     if removed:
         shutil.rmtree(path)
         registry.remove_site(domain)
-    try:
+    with contextlib.suppress(OSError):
         rotation_removed = site_security._remove_access_log_rotation(domain)
         auth_rotation_removed = site_event_pipeline._remove_auth_log_rotation(domain)
         configs_changed = site_security._render_fail2ban_configs(skip_invalid=True)
@@ -1441,8 +1430,6 @@ def remove_site_scaffold(domain: str) -> bool:
                     outcome="failed",
                     detail="fail2ban reload failed after site removal",
                 )
-    except OSError:
-        pass
     return removed
 
 
@@ -1462,10 +1449,8 @@ def _project_collision(domain: str) -> str | None:
     Traefik routers."""
     project = domain_to_project(domain)
     known: set[str] = set()
-    try:
+    with contextlib.suppress(Exception):
         known.update(site["domain"] for site in registry.list_sites() if site.get("domain"))
-    except Exception:
-        pass
     sites_root = Path(_current_paths().sites_dir)
     if sites_root.exists():
         for env_file in sites_root.glob("*/.env"):
@@ -1653,7 +1638,7 @@ def _validate_nginx_candidate(domain: str, content: str) -> RuntimeResult:
     except (OSError, subprocess.SubprocessError) as exc:
         return RuntimeResult(3, f"nginx validation failed: {exc}")
     finally:
-        try:
+        with contextlib.suppress(OSError):
             root_fd = os.open(extra_root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
             try:
                 os.unlink(candidate_name, dir_fd=root_fd)
@@ -1661,8 +1646,6 @@ def _validate_nginx_candidate(domain: str, content: str) -> RuntimeResult:
                 pass
             finally:
                 os.close(root_fd)
-        except OSError:
-            pass
 
 
 def validate_nginx_custom(domain: str, content: str | None = None) -> RuntimeResult:
@@ -1711,7 +1694,7 @@ def _validate_php_candidate(domain: str, content: str) -> RuntimeResult:
     except (OSError, subprocess.SubprocessError) as exc:
         return RuntimeResult(3, f"PHP custom config validation failed: {exc}")
     finally:
-        try:
+        with contextlib.suppress(OSError):
             root_fd = os.open(php_root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
             try:
                 os.unlink(candidate_name, dir_fd=root_fd)
@@ -1719,8 +1702,6 @@ def _validate_php_candidate(domain: str, content: str) -> RuntimeResult:
                 pass
             finally:
                 os.close(root_fd)
-        except OSError:
-            pass
 
 
 def validate_php_custom(domain: str, content: str | None = None) -> RuntimeResult:
@@ -1751,19 +1732,17 @@ def set_nginx_custom(domain: str, content: str) -> RuntimeResult:
         _write_text_safely(extra_root, replacement_name, content)
         root_fd = os.open(extra_root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
         try:
-            try:
+            with contextlib.suppress(FileNotFoundError):
                 metadata = os.stat("custom.conf", dir_fd=root_fd, follow_symlinks=False)
                 if stat.S_ISLNK(metadata.st_mode):
                     return RuntimeResult(3, "nginx custom config refused: custom.conf is a symlink")
-            except FileNotFoundError:
-                pass
             os.replace(replacement_name, "custom.conf", src_dir_fd=root_fd, dst_dir_fd=root_fd)
         finally:
             os.close(root_fd)
     except OSError as exc:
         return RuntimeResult(3, f"failed to install nginx custom config: {exc}")
     finally:
-        try:
+        with contextlib.suppress(OSError):
             root_fd = os.open(extra_root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
             try:
                 os.unlink(replacement_name, dir_fd=root_fd)
@@ -1771,8 +1750,6 @@ def set_nginx_custom(domain: str, content: str) -> RuntimeResult:
                 pass
             finally:
                 os.close(root_fd)
-        except OSError:
-            pass
 
     reload_proc = compose_command(domain, "exec", "-T", "web", "nginx", "-s", "reload")
     if reload_proc.returncode != 0:

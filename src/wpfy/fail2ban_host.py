@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import contextlib
 import os
 from pathlib import Path
 import re
@@ -10,6 +11,7 @@ import subprocess
 import time
 
 from .events import record_event
+from .settings import current_paths
 
 
 # ---------------------------------------------------------------------------
@@ -77,12 +79,6 @@ class HostFail2banResult:
 # ---------------------------------------------------------------------------
 
 
-def _current_paths():
-    from .settings import PATHS as current_paths
-
-    return current_paths
-
-
 def extract_failure_id(match: re.Match) -> str:
     """Extract the ban target from a fail2ban 1.0 match.
 
@@ -98,7 +94,7 @@ def extract_failure_id(match: re.Match) -> str:
 
 def _fail2ban_root() -> Path:
     """Derive fail2ban config root from WPFY_CONFIG_DIR (same as site_security)."""
-    return Path(_current_paths().config_dir).parent / "fail2ban"
+    return Path(current_paths().config_dir).parent / "fail2ban"
 
 
 def _runtime_skip_requested() -> bool:
@@ -198,7 +194,7 @@ def _stop_and_disable_service() -> None:
     """Best-effort stop/disable of the fail2ban unit before package rollback."""
     if _runtime_skip_requested():
         return
-    try:
+    with contextlib.suppress(OSError, subprocess.SubprocessError, subprocess.TimeoutExpired):
         subprocess.run(
             ["systemctl", "disable", "--now", "fail2ban"],
             check=False,
@@ -206,8 +202,6 @@ def _stop_and_disable_service() -> None:
             text=True,
             timeout=_SUBPROCESS_TIMEOUT,
         )
-    except (OSError, subprocess.SubprocessError, subprocess.TimeoutExpired):
-        pass
 
 
 def _rollback_fresh_install() -> None:
@@ -539,10 +533,8 @@ def _atomic_write(path: Path, content: str, mode: int = 0o644) -> bool:
         os.chmod(candidate, mode)
         os.replace(candidate, path)
     finally:
-        try:
+        with contextlib.suppress(OSError, FileNotFoundError):
             candidate.unlink()
-        except (OSError, FileNotFoundError):
-            pass
     return True
 
 
@@ -555,10 +547,8 @@ def _backup_wpfy_files(root: Path) -> dict[str, str]:
             continue
         for path in directory.iterdir():
             if path.is_file() and _is_wpfy_managed(path):
-                try:
+                with contextlib.suppress(OSError):
                     backups[f"{subdir}/{path.name}"] = path.read_text(encoding="utf-8")
-                except OSError:
-                    pass
     return backups
 
 
@@ -566,11 +556,9 @@ def _restore_wpfy_files(root: Path, backups: dict[str, str]) -> None:
     """Restore WPFY-owned files from backup snapshot."""
     for relpath, content in backups.items():
         target = root / relpath
-        try:
+        with contextlib.suppress(OSError):
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text(content, encoding="utf-8")
-        except OSError:
-            pass
 
 
 def wordpress_filter_content() -> str:
@@ -731,7 +719,7 @@ def panel_filter_content() -> str:
 
 def _panel_auth_log_path() -> Path:
     """Host path of the panel auth failure log (default /var/log/wpfy/...)."""
-    return Path(_current_paths().log_dir) / PANEL_AUTH_LOG_FILENAME
+    return Path(current_paths().log_dir) / PANEL_AUTH_LOG_FILENAME
 
 
 def panel_jail_content() -> str:
