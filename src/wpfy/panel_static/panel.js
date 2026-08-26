@@ -863,6 +863,34 @@ export function recentOverview() {
   return lastOverview;
 }
 
+async function refreshUpdateIndicator() {
+  const chip = $("chip-update");
+  if (!chip) return;
+  // Non-admins never see the update banner; hide any state left over from a
+  // previous admin session instead of leaving it stale.
+  if (!session.isAdmin) {
+    show(chip, false);
+    return;
+  }
+  try {
+    const data = await api("/api/update/check");
+    // The await yields the event loop; the session may have changed while the
+    // request was in flight. Re-check before touching the banner.
+    if (!session.isAdmin) {
+      show(chip, false);
+      return;
+    }
+    const available = data.update_available === true;
+    show(chip, available);
+    if (available && data.candidate_version) {
+      $("update-summary").textContent = `wpfy ${data.candidate_version} is available. Review before applying.`;
+    }
+    if (data.command) $("update-command").value = data.command;
+  } catch (error) {
+    show(chip, false);
+  }
+}
+
 async function refreshVersionChip() {
   // Site managers get 403 from system-scoped /api/overview, so the identity
   // payload (/api/auth/me) carries the version for them; the overview fetch
@@ -1222,6 +1250,9 @@ async function finishSetup() {
   showApp();
   startStream();
   await Promise.all([refreshVersionChip(), refreshHealthChip(), refreshJobsChip()]);
+  // Fire-and-forget: the update chip must not delay initial routing, and
+  // refreshUpdateIndicator() handles its own failures.
+  void refreshUpdateIndicator();
   await handleRoute(location.pathname);
 }
 
@@ -1373,6 +1404,15 @@ function wireShell() {
       $("one-time-copy-status").textContent = "Copy failed — select the values and copy manually.";
     }
   });
+  $("btn-update-command-copy")?.addEventListener("click", async () => {
+    const status = $("update-command-status");
+    try {
+      await copyText($("update-command")?.value || "wpfy update --check");
+      status.textContent = "Copied.";
+    } catch (error) {
+      status.textContent = "Copy failed — select command and copy manually.";
+    }
+  });
 
   // The stream is the shell's only refresh trigger: no polling timers to leak.
   onPanelEvent((event) => {
@@ -1401,6 +1441,9 @@ async function boot() {
     showApp();
     startStream();
     await Promise.all([refreshVersionChip(), refreshHealthChip(), refreshJobsChip()]);
+    // Fire-and-forget: the update chip must not delay initial routing, and
+    // refreshUpdateIndicator() handles its own failures.
+    void refreshUpdateIndicator();
     await handleRoute(location.pathname);
   } catch (error) {
     if (error.status === 401 || error.message === "unauthorized") {

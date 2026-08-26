@@ -67,7 +67,7 @@ from .site_runtime import (
     start_site_runtime,
     stop_site_runtime,
 )
-from . import panel_exposure, traefik
+from . import panel_exposure, traefik, update_lifecycle
 from . import file_manager as panel_file_manager
 from .file_manager_providers import quantum as quantum_provider
 
@@ -947,6 +947,11 @@ def _memory_total_bytes() -> int | None:
 _PUBLIC_IP_CACHE: dict[str, tuple[float, str | None]] = {}
 _PUBLIC_IP_TTL_POSITIVE_S = 300.0
 _PUBLIC_IP_TTL_NEGATIVE_S = 60.0
+_UPDATE_CHECK_LOCK = threading.Lock()
+_UPDATE_CHECK_CACHE: tuple[float, dict[str, object]] | None = None
+_UPDATE_CHECK_TTL_POSITIVE_S = 900.0
+_UPDATE_CHECK_TTL_NEGATIVE_S = 60.0
+_UPDATE_CHECK_COMMAND = "wpfy update --check"
 
 
 def _cached_public_ip() -> str | None:
@@ -961,6 +966,46 @@ def _cached_public_ip() -> str | None:
     ttl = _PUBLIC_IP_TTL_POSITIVE_S if ip is not None else _PUBLIC_IP_TTL_NEGATIVE_S
     _PUBLIC_IP_CACHE["ip"] = (now + ttl, ip)
     return ip
+
+
+def _update_check_payload(result: update_lifecycle.CheckResult) -> dict[str, object]:
+    manifest = result.manifest
+    return {
+        "ok": result.ok,
+        "status": "update-available" if result.update_available else "current" if result.ok else "unavailable",
+        "update_available": result.update_available,
+        "current_version": result.state.active_version or __version__,
+        "candidate_version": manifest.version if manifest is not None else None,
+        "message": result.message if result.ok else "Update check unavailable.",
+        "command": _UPDATE_CHECK_COMMAND,
+    }
+
+
+def api_update_check() -> dict[str, object]:
+    """Return read-only update state, with bounded remote-check caching."""
+    global _UPDATE_CHECK_CACHE
+    now = time.monotonic()
+    with _UPDATE_CHECK_LOCK:
+        cached = _UPDATE_CHECK_CACHE
+        if cached is not None and cached[0] > now:
+            return dict(cached[1])
+        try:
+            result = update_lifecycle.Updater().check(channel="stable")
+            payload = _update_check_payload(result)
+        except Exception:  # noqa: BLE001, BROAD_EXCEPT_OK
+            _LOGGER.warning("update availability check failed", exc_info=True)
+            payload = {
+                "ok": False,
+                "status": "unavailable",
+                "update_available": False,
+                "current_version": __version__,
+                "candidate_version": None,
+                "message": "Update check unavailable.",
+                "command": _UPDATE_CHECK_COMMAND,
+            }
+        ttl = _UPDATE_CHECK_TTL_POSITIVE_S if payload["ok"] else _UPDATE_CHECK_TTL_NEGATIVE_S
+        _UPDATE_CHECK_CACHE = (time.monotonic() + ttl, payload)
+        return dict(payload)
 
 
 def api_overview() -> dict:
@@ -2308,6 +2353,7 @@ def _delete_user_totp(principal, match, query, body):
 
 
 def _get_overview(principal, match, query, body): return 200, api_overview()
+def _get_update_check(principal, match, query, body): return 200, api_update_check()
 def _get_sites(principal, match, query, body):
     payload = api_sites()
     if _principal_is_manager(principal):
@@ -3370,6 +3416,7 @@ _ROUTES = (
         _delete_user, RouteMeta("user.remove", "system", True),
     ),
     Route("GET", re.compile(r"^/api/overview$"), _get_overview, RouteMeta("system.overview", "system")),
+    Route("GET", re.compile(r"^/api/update/check$"), _get_update_check, RouteMeta("system.update.check", "system")),
     Route("GET", re.compile(r"^/api/sites$"), _get_sites, RouteMeta("site.list", "system")),
     Route("POST", re.compile(r"^/api/sites$"), _post_create_site, RouteMeta("site.create", "system", True)),
     Route("GET", re.compile(r"^/api/metrics$"), _get_metrics, RouteMeta("system.metrics", "system")),

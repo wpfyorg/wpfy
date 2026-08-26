@@ -192,6 +192,23 @@
             <div id="jobs-menu-body"></div>
           </div>
         </div>
+        <div class="nav-item dropdown d-none" id="chip-update">
+          <a href="#" class="nav-link px-2" data-bs-toggle="dropdown" aria-label="Update available" aria-expanded="false" title="Update available">
+            <span class="status status-yellow"><span class="status-dot"></span><span>Update available</span></span>
+          </a>
+          <div class="dropdown-menu dropdown-menu-end dropdown-menu-arrow update-menu">
+            <h6 class="dropdown-header">Update available</h6>
+            <div class="px-3 pb-2">
+              <p class="mb-2" id="update-summary">A newer wpfy release is ready for review.</p>
+              <label class="form-label mb-1" for="update-command">Check from terminal</label>
+              <div class="input-group input-group-sm">
+                <input class="form-control font-monospace" id="update-command" type="text" readonly value="wpfy update --check" aria-label="Update check command">
+                <button class="btn" id="btn-update-command-copy" type="button">Copy</button>
+              </div>
+              <span class="text-secondary small d-block mt-2" id="update-command-status" role="status"></span>
+            </div>
+          </div>
+        </div>
         <div class="nav-item dropdown">
           <a href="#" class="nav-link d-flex lh-1 p-0 px-2" data-bs-toggle="dropdown" aria-label="Open account menu" aria-expanded="false" id="chip-account">
             <span class="avatar avatar-sm" id="account-avatar">–</span>

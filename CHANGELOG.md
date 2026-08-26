@@ -71,6 +71,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   (exposed but the router cannot be attributed to wpfy), and `off`. The
   card never claims the public domain is guarded -- or unguarded -- when
   disk says otherwise.
+- Read-only update-availability indicator in the panel: it verifies the
+  signed stable-channel manifest through the same domain updater the CLI
+  uses and caches the result, then points the operator at
+  `wpfy update --check` on the host. The panel exposes no apply or
+  rollback action for updates.
 
 ### Deprecated
 
