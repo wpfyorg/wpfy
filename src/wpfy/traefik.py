@@ -66,6 +66,51 @@ _RFC1918_NETWORKS: tuple[ipaddress.IPv4Network, ...] = (
     cast(ipaddress.IPv4Network, ipaddress.ip_network("192.168.0.0/16")),
 )
 _ULA_NETWORK: ipaddress.IPv6Network = cast(ipaddress.IPv6Network, ipaddress.ip_network("fc00::/7"))
+#: WPFY's own ULA prefix (fd4a:3b1c::/48, pseudo-random per RFC 4193). Every
+#: wpfy IPv6 subnet is carved from this so it can never collide with a real
+#: routed v6 range or another vendor's ULA.
+WPFY_ULA_PREFIX = cast(ipaddress.IPv6Network, ipaddress.ip_network("fd4a:3b1c::/48"))
+
+#: wpfy hands out /64s -- the smallest routable IPv6 unit -- from the /48
+#: above. 48 -> 64 leaves a 16-bit index, so the index is literally the fourth
+#: hextet: index N is fd4a:3b1c:0:<N>::/64.
+WPFY_ULA_SUBNET_PREFIXLEN = 64
+WPFY_ULA_INDEX_SPACE = 1 << (WPFY_ULA_SUBNET_PREFIXLEN - WPFY_ULA_PREFIX.prefixlen)
+
+#: Reserved infrastructure indices, one per consumer. Only shared edge
+#: infrastructure gets IPv6; per-site networks stay IPv4-only on purpose (see
+#: `site_layout`), so this list is the complete set of wpfy IPv6 subnets.
+WPFY_ULA_INDEX_DOCKER_BRIDGE = 0  # daemon.json fixed-cidr-v6 (docker0)
+WPFY_ULA_INDEX_TRAEFIK_NETWORK = 1
+WPFY_ULA_INDEX_PANEL_EDGE_NETWORK = 2
+
+
+def wpfy_ula_subnet(index: int) -> str:
+    """The index-th /64 carved from `WPFY_ULA_PREFIX`.
+
+    Total-function on the documented index space and a hard error outside it:
+    silently wrapping an out-of-range index would hand two consumers the same
+    subnet, which is the cross-site isolation break this scheme exists to
+    prevent.
+    """
+    if not isinstance(index, int) or isinstance(index, bool):
+        raise TypeError(f"ULA subnet index must be an int, got {type(index).__name__}")
+    if not 0 <= index < WPFY_ULA_INDEX_SPACE:
+        raise ValueError(
+            f"ULA subnet index {index} outside 0..{WPFY_ULA_INDEX_SPACE - 1}; "
+            f"{WPFY_ULA_PREFIX} holds exactly {WPFY_ULA_INDEX_SPACE} /"
+            f"{WPFY_ULA_SUBNET_PREFIXLEN} subnets"
+        )
+    offset = index << (128 - WPFY_ULA_SUBNET_PREFIXLEN)
+    network = ipaddress.ip_network(
+        (int(WPFY_ULA_PREFIX.network_address) + offset, WPFY_ULA_SUBNET_PREFIXLEN)
+    )
+    return str(network)
+
+
+# Shared-edge ULA subnets, both inside WPFY_ULA_PREFIX by construction.
+TRAEFIK_NETWORK_ULA_SUBNET = wpfy_ula_subnet(WPFY_ULA_INDEX_TRAEFIK_NETWORK)
+PANEL_EDGE_NETWORK_ULA_SUBNET = wpfy_ula_subnet(WPFY_ULA_INDEX_PANEL_EDGE_NETWORK)
 
 
 @dataclass(frozen=True, slots=True)
@@ -280,6 +325,20 @@ def _traefik_compose(*args: str) -> subprocess.CompletedProcess[str]:
     )
 
 
+def _network_ipv6_subnet(network_name: str) -> str:
+    """The explicit ULA subnet for a shared wpfy network.
+
+    Docker would otherwise auto-pick from its own pool, which is exactly how
+    two networks end up sharing a range; an explicit distinct subnet per
+    network keeps the isolation guarantee legible.
+    """
+    if network_name == TRAEFIK_NETWORK:
+        return TRAEFIK_NETWORK_ULA_SUBNET
+    if network_name == PANEL_EDGE_NETWORK:
+        return PANEL_EDGE_NETWORK_ULA_SUBNET
+    raise RuntimeError(f"no IPv6 subnet defined for network {network_name!r}")
+
+
 def _ensure_bridge_network(network_name: str) -> RuntimeResult:
     if runtime_skip_requested():
         return RuntimeResult(0, "traefik network creation skipped by WPFY_SKIP_RUNTIME=1", skipped=True)
@@ -287,16 +346,24 @@ def _ensure_bridge_network(network_name: str) -> RuntimeResult:
         return RuntimeResult(0, "traefik network creation skipped (Docker/Compose not available)", skipped=True)
 
     proc = subprocess.run(
-        ["docker", "network", "inspect", network_name],
+        ["docker", "network", "inspect", "--format", "{{json .}}", network_name],
         check=False,
         capture_output=True,
         text=True,
     )
     if proc.returncode == 0:
+        mismatch = _network_ipv6_mismatch(proc.stdout, network_name)
+        if mismatch is not None:
+            return _ipv6_migration_refusal(network_name, mismatch)
         return RuntimeResult(0, f"traefik network '{network_name}' already exists", ran=True)
 
+    subnet = _network_ipv6_subnet(network_name)
     proc = subprocess.run(
-        ["docker", "network", "create", "--driver", "bridge", network_name],
+        [
+            "docker", "network", "create", "--driver", "bridge",
+            "--ipv6", "--subnet", subnet,
+            network_name,
+        ],
         check=False,
         capture_output=True,
         text=True,
@@ -304,7 +371,51 @@ def _ensure_bridge_network(network_name: str) -> RuntimeResult:
     if proc.returncode != 0:
         message = proc.stderr.strip() or proc.stdout.strip() or "docker network create failed"
         return RuntimeResult(proc.returncode, message)
-    return RuntimeResult(0, f"traefik network '{network_name}' created", ran=True)
+    return RuntimeResult(0, f"traefik network '{network_name}' created with IPv6 ({subnet})", ran=True)
+
+
+def _network_ipv6_mismatch(inspect_json: str, network_name: str) -> str | None:
+    """Describe the IPv6 gap on an existing network, or None when satisfied."""
+    try:
+        payload = json.loads(inspect_json.strip())
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    expected = _network_ipv6_subnet(network_name)
+    enable_v6 = payload.get("EnableIPv6")
+    ipam = payload.get("IPAM")
+    raw_configs = ipam.get("Config") if isinstance(ipam, dict) else None
+    configs = raw_configs if isinstance(raw_configs, list) else []
+    subnets = {
+        str(config.get("Subnet"))
+        for config in configs
+        if isinstance(config, dict) and config.get("Subnet")
+    }
+    if enable_v6 is not True:
+        return "IPv6 disabled"
+    if expected not in subnets:
+        # IPv6 enabled but with a different/auto-chosen subnet: still a
+        # mismatch against the documented topology.
+        present = ", ".join(sorted(subnets)) or "none"
+        return f"IPv6 enabled but subnet(s) [{present}] do not include the documented {expected}"
+    return None
+
+
+def _ipv6_migration_refusal(network_name: str, mismatch: str) -> RuntimeResult:
+    """Refuse to touch a live network; name the explicit opt-in path.
+
+    Recreating the network means disconnecting Traefik and every site from
+    it -- never done silently under a running stack.
+    """
+    return RuntimeResult(
+        3,
+        f"Docker network '{network_name}' exists but needs IPv6 work ({mismatch}). "
+        "'docker network create' cannot modify an existing network, and recreating "
+        "it would disconnect every container attached to it. To migrate, run "
+        f"'wpfy stack ipv6-migrate' (stops the edge proxy and all sites, recreates "
+        f"'{network_name}' with IPv6, brings everything back). Nothing was changed.",
+    )
 
 
 def ensure_traefik_network() -> RuntimeResult:
@@ -313,6 +424,16 @@ def ensure_traefik_network() -> RuntimeResult:
 
 def ensure_panel_edge_network() -> RuntimeResult:
     return _ensure_bridge_network(PANEL_EDGE_NETWORK)
+
+
+def _subnet_version(value: object) -> int | None:
+    """4, 6, or None when `value` is not a parseable subnet."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        return ipaddress.ip_network(value.strip(), strict=False).version
+    except ValueError:
+        return None
 
 
 def _private_network(value: object, *, network_name: str) -> ipaddress.IPv4Network | ipaddress.IPv6Network:
@@ -423,13 +544,32 @@ def _panel_edge_ipam(
     configs = ipam.get("Config") if isinstance(ipam, dict) else None
     if not isinstance(configs, list) or not configs:
         raise RuntimeError(f"cannot determine {network_name} facts: Docker reported no IPAM config")
-    if len(configs) != 1:
+    for config in configs:
+        if not isinstance(config, dict):
+            raise RuntimeError(f"cannot determine {network_name} facts: Docker IPAM config is invalid")
+
+    # A dual-stack edge network reports two IPAM configs, one per family, so
+    # "exactly one config" would hard-fail the moment IPv6 is enabled here --
+    # taking `edge_bind_address` and domainless exposure with it. Select by
+    # family instead of counting: the panel binds a host IPv4 address and the
+    # panel-edge ufw rule is an IPv4 rule, so v4 wins when both are present,
+    # and a v6-only network still resolves to its v6 facts. Two configs of the
+    # *same* family remain ambiguous and are still refused.
+    by_version: dict[int | None, list[dict[str, object]]] = {}
+    for config in configs:
+        by_version.setdefault(_subnet_version(config.get("Subnet")), []).append(config)
+    for version in (4, 6):
+        if len(by_version.get(version, ())) > 1:
+            raise RuntimeError(
+                f"cannot determine {network_name} facts: expected one private subnet, "
+                f"got {len(by_version[version])}"
+            )
+    selected = by_version.get(4) or by_version.get(6) or by_version.get(None) or []
+    if len(selected) != 1:
         raise RuntimeError(
-            f"cannot determine {network_name} facts: expected one private subnet, got {len(configs)}"
+            f"cannot determine {network_name} facts: expected one private subnet, got {len(selected)}"
         )
-    config = configs[0]
-    if not isinstance(config, dict):
-        raise RuntimeError(f"cannot determine {network_name} facts: Docker IPAM config is invalid")
+    config = selected[0]
     subnet = _private_network(config.get("Subnet"), network_name=network_name)
     gateway = _private_gateway(config.get("Gateway"), subnet, network_name=network_name)
     return subnet, gateway
@@ -706,22 +846,35 @@ def _network_gateway(network_name: str = TRAEFIK_NETWORK) -> str | None:
             return None
     if not docker_available():
         return None
+    # Newline-separated, not concatenated: a dual-stack network has one IPAM
+    # config per family, and "{{.Gateway}}{{end}}" would glue them into
+    # "172.19.0.1fd4a:3b1c:0:1::1", which parses as neither.
     proc = subprocess.run(
-        ["docker", "network", "inspect", "--format", "{{range .IPAM.Config}}{{.Gateway}}{{end}}", network_name],
+        [
+            "docker", "network", "inspect", "--format",
+            "{{range .IPAM.Config}}{{.Gateway}}\n{{end}}", network_name,
+        ],
         check=False,
         capture_output=True,
         text=True,
     )
     if proc.returncode != 0:
         return None
-    gateway = proc.stdout.strip()
-    if not gateway:
+    gateways = []
+    for line in proc.stdout.splitlines():
+        candidate = line.strip()
+        if not candidate:
+            continue
+        try:
+            gateways.append(ipaddress.ip_address(candidate))
+        except ValueError:
+            continue
+    if not gateways:
         return None
-    try:
-        ipaddress.ip_address(gateway)
-    except ValueError:
-        return None
-    return gateway
+    # Callers bind and firewall on IPv4; prefer it, and only fall back to a v6
+    # gateway on a network that genuinely has no v4 config.
+    preferred = next((address for address in gateways if address.version == 4), gateways[0])
+    return str(preferred)
 
 
 def effective_acme_email() -> str:

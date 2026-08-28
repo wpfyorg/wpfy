@@ -3374,6 +3374,15 @@ def add_stack_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentPar
     install.add_argument("--adminer", action="store_true")
     install.add_argument("--composer", action="store_true")
     install.add_argument("--mysqltuner", action="store_true")
+    ipv6_group = install.add_mutually_exclusive_group()
+    ipv6_group.add_argument(
+        "--ipv6", action="store_true", default=None,
+        help="enable Docker daemon IPv6 even if the host looks IPv4-only",
+    )
+    ipv6_group.add_argument(
+        "--no-ipv6", dest="ipv6", action="store_false",
+        help="leave Docker daemon IPv6 off even if the host has global IPv6",
+    )
     install.set_defaults(handler=handle_stack_install)
 
     acme_email = _add_parser(
@@ -3403,6 +3412,22 @@ def add_stack_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentPar
             "status": handle_stack_status,
         }
         stack_parser.set_defaults(handler=handler_map[name])
+
+    ipv6_migrate = _add_parser(
+        stack_subparsers,
+        "ipv6-migrate",
+        help="Recreate the shared edge networks with IPv6. Stops every site first.",
+        description=(
+            "One-time migration for stacks installed before Docker IPv6 support: "
+            "stops Traefik (all sites go offline), recreates 'wpfy' and "
+            "'wpfy-panel-edge' with IPv6, and starts the edge proxy again."
+        ),
+    )
+    ipv6_migrate.add_argument(
+        "--force", action="store_true",
+        help="required; this is a deliberate maintenance window",
+    )
+    ipv6_migrate.set_defaults(handler=handle_stack_ipv6_migrate)
 
 
 def add_sftp_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
@@ -3723,6 +3748,7 @@ def handle_stack_install(args: argparse.Namespace) -> CommandResult:
         host_tools=host_tools,
         helpers=helpers,
         mysqltuner=getattr(args, "mysqltuner", False),
+        ipv6=getattr(args, "ipv6", None),
     ), progress=_progress)
     results = [
         _section("stack install"),
@@ -3817,6 +3843,16 @@ def handle_stack_purge(args: argparse.Namespace) -> CommandResult:
 
 def handle_stack_migrate(args: argparse.Namespace) -> CommandResult:
     return CommandResult(_render_summary("stack migrate", ["not implemented for Docker-first wpfy in v1"]))
+
+
+def handle_stack_ipv6_migrate(args: argparse.Namespace) -> CommandResult:
+    result = stack.ipv6_migrate(force=getattr(args, "force", False))
+    lines = [_section("stack ipv6-migrate")]
+    for fact in result.facts:
+        lines.append(f"{fact.name}: {fact.status} {fact.message}")
+    if result.exit_code == 0:
+        lines.append("edge networks now carry IPv6; per-site networks migrate on their next site update")
+    return CommandResult("\n".join(lines), exit_code=result.exit_code)
 
 
 def _site_cache_selection(args: argparse.Namespace) -> tuple[str, str, str] | CommandResult:

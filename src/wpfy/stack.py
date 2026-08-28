@@ -4,7 +4,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 import subprocess
 
-from . import firewall_ports, traefik
+from . import daemon_ipv6, firewall_ports, traefik
 from .fail2ban_host import ensure_fail2ban_host
 from .image_references import ADMINER_IMAGE, HELPER_IMAGE_REFERENCES, MARIADB_IMAGE, REDIS_IMAGE
 from .php_runtime import DEFAULT_PHP_VERSION, PHP_IMAGE_REPOSITORY, php_image
@@ -30,6 +30,8 @@ class StackInstallRequest:
     host_tools: tuple[str, ...] = ()
     helpers: tuple[str, ...] = ()
     mysqltuner: bool = False
+    #: None = follow host capability; True/False = explicit operator override.
+    ipv6: bool | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -129,6 +131,18 @@ def install(
             facts.append(StackFact("fail2ban", status_name, f2b.message, 0))
         else:
             facts.append(StackFact("fail2ban", "FAIL", f2b.message, f2b.exit_code))
+
+    if request.install_all or request.nginx:
+        # Docker daemon IPv6: merge wpfy's keys into daemon.json. Never
+        # restarts the daemon -- the message tells the operator to do that
+        # themselves, because restarting stops every container on the host.
+        try:
+            daemon6 = daemon_ipv6.ensure_daemon_ipv6(enable=request.ipv6)
+            status_name = "SKIP" if daemon6.skipped else "OK" if daemon6.exit_code == 0 else "FAIL"
+        except (OSError, RuntimeError) as exc:
+            daemon6 = RuntimeResult(1, str(exc))
+            status_name = "FAIL"
+        facts.append(StackFact("docker-ipv6", status_name, daemon6.message, daemon6.exit_code))
 
     if "ufw" in request.host_tools:
         notify("Ensuring host firewall (ufw)...")
@@ -256,3 +270,76 @@ def purge(*, force: bool) -> StackResult:
         f"docker rmi {php_image(DEFAULT_PHP_VERSION)} {MARIADB_IMAGE} {REDIS_IMAGE} {traefik.TRAEFIK_IMAGE}",
     ))
     return StackResult(tuple(facts))
+
+
+def ipv6_migrate(*, force: bool) -> StackResult:
+    """Explicitly migrate the shared edge networks to IPv6.
+
+    The only sanctioned path that recreates them, because recreation
+    disconnects every attached container. Stops the edge proxy (taking all
+    sites offline for the duration), removes and recreates each network that
+    lacks its IPv6 topology, then starts everything back.
+    """
+    if not force:
+        return StackResult((StackFact("ipv6-migrate", "FAIL", (
+            "this stops Traefik and EVERY site until it finishes; re-run with "
+            "--force to proceed"
+        ), 2),), 2)
+
+    facts: list[StackFact] = []
+    stopped = traefik.stop_traefik()
+    status_name = "SKIP" if stopped.skipped else "OK" if stopped.exit_code == 0 else "FAIL"
+    facts.append(StackFact("Traefik stop", status_name, stopped.message, stopped.exit_code))
+    if stopped.exit_code != 0:
+        return StackResult(tuple(facts), stopped.exit_code)
+
+    # Every managed site goes down too: their site networks are not touched
+    # here (per-site networks carry no edge identity and are recreated by the
+    # site's own lifecycle), but they route through Traefik, so the honest
+    # contract is a maintenance window covering the whole stack.
+    exit_code = 0
+    for network_name in (traefik.PANEL_EDGE_NETWORK, traefik.TRAEFIK_NETWORK):
+        try:
+            inspect = subprocess.run(
+                ["docker", "network", "inspect", "--format", "{{json .}}", network_name],
+                check=False, capture_output=True, text=True,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            facts.append(StackFact(network_name, "FAIL", str(exc), 1))
+            exit_code = 1
+            continue
+        if inspect.returncode != 0:
+            facts.append(StackFact(network_name, "INFO", "does not exist; will be created on next start"))
+            continue
+        mismatch = traefik._network_ipv6_mismatch(inspect.stdout, network_name)
+        if mismatch is None:
+            facts.append(StackFact(network_name, "OK", "already has IPv6 topology"))
+            continue
+        removed = subprocess.run(
+            ["docker", "network", "rm", network_name],
+            check=False, capture_output=True, text=True,
+        )
+        if removed.returncode != 0:
+            message = _process_message(removed, "docker network rm failed")
+            facts.append(StackFact(network_name, "FAIL", f"{message} ({mismatch})", removed.returncode))
+            exit_code = removed.returncode or 1
+            continue
+        created = subprocess.run(
+            [
+                "docker", "network", "create", "--driver", "bridge",
+                "--ipv6", "--subnet", traefik._network_ipv6_subnet(network_name),
+                network_name,
+            ],
+            check=False, capture_output=True, text=True,
+        )
+        if created.returncode != 0:
+            message = _process_message(created, "docker network create failed")
+            facts.append(StackFact(network_name, "FAIL", message, created.returncode))
+            exit_code = created.returncode or 1
+            continue
+        facts.append(StackFact(network_name, "OK", f"recreated with IPv6 ({mismatch})"))
+
+    started = traefik.start_traefik()
+    status_name = "SKIP" if started.skipped else "OK" if started.exit_code == 0 else "FAIL"
+    facts.append(StackFact("Traefik start", status_name, started.message, started.exit_code))
+    return StackResult(tuple(facts), exit_code or started.exit_code)

@@ -174,8 +174,20 @@ function wpfy_shield_is_never_ban( $ip ) {
         }
         return false;
     }
-    // ::1 IPv6 loopback.
-    if ( '::1' === $parsed ) {
+    // IPv6. Mirrors the v4 arm above: sentinel, loopback, and the container
+     // ranges wpfy itself owns. Only WPFY's assigned fd4a:3b1c::/48 prefix is
+     // static infrastructure; another routed/operator ULA remains bannable.
+    $packed = @inet_pton( $parsed );
+    if ( false === $packed || 16 !== strlen( $packed ) ) {
+        return true;
+    }
+    // '::' unspecified sentinel and '::1' loopback.
+    if ( "\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0" === $packed
+        || "\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\1" === $packed ) {
+        return true;
+    }
+    // WPFY's fd4a:3b1c::/48 unique-local infrastructure prefix.
+    if ( "\\xfd\\x4a\\x3b\\x1c\\x00\\x00" === substr( $packed, 0, 6 ) ) {
         return true;
     }
     return false;

@@ -273,6 +273,17 @@ def _covers_ssh(port: str, protocol: str) -> bool:
     return int(low) <= target <= int(high or low)
 
 
+def _source_is_ipv6(source: str) -> bool:
+    """True when a ufw rule source is a literal IPv6 address or network."""
+    candidate = source.replace("(v6)", "").strip()
+    if not candidate or candidate.lower() == "anywhere":
+        return False
+    try:
+        return ipaddress.ip_network(candidate, strict=False).version == 6
+    except ValueError:
+        return False
+
+
 def _collapse(rules: list[PortRule]) -> tuple[PortRule, ...]:
     """One row per rule the operator wrote, not one per address family.
 
@@ -353,12 +364,17 @@ def parse_status(output: str) -> FirewallStatus:
         if not _PORT_RANGE.match(port.replace("(v6)", "").strip()):
             continue  # named application profiles ("OpenSSH", "Nginx Full")
         source, _, comment = match.group("source").partition("#")
+        source = source.strip()
         rules.append(PortRule(
             port=port.strip(),
             protocol=protocol.strip() or "any",
             action=match.group("action").lower(),
-            source=source.strip(),
-            v6=bool(match.group("v6")),
+            source=source,
+            # ufw prints the "(v6)" marker only on the Anywhere twins, so a
+            # rule written against a literal IPv6 source ("allow 9443/tcp from
+            # 2001:db8::/32") carries no marker at all. Reading the family off
+            # the source is what makes `_collapse`'s promise true.
+            v6=bool(match.group("v6")) or _source_is_ipv6(source),
             comment=comment.strip(),
         ))
     return FirewallStatus(

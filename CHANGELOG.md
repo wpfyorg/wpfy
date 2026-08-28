@@ -8,6 +8,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- IPv6 enforcement for Docker-backed edge traffic: `wpfy stack install --ipv6`
+  safely merges the required Docker daemon settings, creates IPv6-enabled WPFY
+  shared bridges, and exposes an explicit `wpfy stack ipv6-migrate --force`
+  path for existing bridges. Fail2ban reports IPv6 protection active only
+  after the live Docker daemon confirms IPv6 is enabled.
+
+### Changed
+
+- WPFY-managed Docker addressing now reserves distinct ULA subnets for the
+  shared edge and panel edge. Per-site networks remain IPv4-only. Panel-edge
+  gateway selection is address-family aware while preserving an IPv4 host bind
+  for UFW rules.
+
+- Traefik and site security paths now preserve verified IPv6 client identity
+  across the shared edge, while excluding WPFY-owned ULA addresses from ban
+  targets. Live dual-stack verification remains pending.
+
 - Installer source identity (W4-11): the bundled installer no longer
   pip-installs the package. It verifies that the venv's `wpfy` import
   resolves to the staged source tree and fails loudly when it does not, and

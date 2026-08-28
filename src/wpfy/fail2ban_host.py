@@ -784,6 +784,35 @@ def _default_enabled_jails(root: Path) -> tuple[str, ...]:
     return tuple(dict.fromkeys(enabled))
 
 
+def _enabled_site_chains(root: Path) -> tuple[str, ...]:
+    """Chain names for every currently-enabled per-site Login Shield jail.
+
+    Reads ``jail.d/wpfy-wordpress.conf`` directly -- the per-site jail
+    aggregate site_security.py owns (``fail2ban_jail_path()``). site_security
+    imports this module, so importing it back here would cycle; the filename
+    is the stable jail.d contract between the two, not a private detail.
+    """
+    from .fail2ban_docker import CHAIN_PREFIX
+
+    path = root / "jail.d" / "wpfy-wordpress.conf"
+    try:
+        content = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ()
+    chains: list[str] = []
+    current: str | None = None
+    for line in content.splitlines():
+        stripped = line.strip()
+        match = re.match(r"^\[([^\]]+)\]$", stripped)
+        if match:
+            current = match.group(1)
+            continue
+        if current and re.match(r"^enabled\s*=\s*true\b", stripped):
+            chains.append(f"{CHAIN_PREFIX}{current}")
+            current = None
+    return tuple(chains)
+
+
 def _install_wpfy_configs(root: Path) -> tuple[bool, list[str]]:
     """Install/update WPFY-owned config files. Returns (changed, list of written paths)."""
     changed = False
@@ -1100,6 +1129,38 @@ def ensure_fail2ban_host() -> HostFail2banResult:
                 changed=True,
                 installed=True,
                 health_ok=True,
+            )
+
+    # Step 7.5: Docker can restart independently of fail2ban and wipes
+    # DOCKER-USER on the way back up. On the unchanged-config path fail2ban
+    # itself never reloads (Step 7 only reloads when config changed), so
+    # nothing else re-attaches the WPFY chains until a jail's next ban/unban
+    # happens to trigger actioncheck -- which may be never. Repair it here
+    # for the panel jail and every currently-enabled per-site jail.
+    # Idempotent (create-if-missing + check-before-insert, never flushes a
+    # chain that may hold live bans); a failed repair fails the health check
+    # rather than reporting healthy (no fail-open).
+    if not (config_changed or freshly_installed):
+        from .fail2ban_docker import reattach_chain
+
+        reattach_errors: list[str] = []
+        for target_chain in (PANEL_JAIL_CHAIN, *_enabled_site_chains(root)):
+            reattach_ok, reattach_detail = reattach_chain(target_chain)
+            if not reattach_ok:
+                reattach_errors.append(f"{target_chain}: {reattach_detail}")
+        if reattach_errors:
+            detail = f"DOCKER-USER chain reattach failed: {'; '.join(reattach_errors)}"
+            record_event(
+                "login_shield.health_failed",
+                outcome="error",
+                detail=detail,
+            )
+            return HostFail2banResult(
+                exit_code=1,
+                message=f"fail2ban healthy but {detail}",
+                changed=False,
+                installed=True,
+                health_ok=False,
             )
 
     # Step 8: Final health verification.

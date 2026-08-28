@@ -35,6 +35,7 @@ from .settings import current_paths
 # The single source of truth is fail2ban_host.SAFE_ALLOWLIST. These split
 # aliases exist for callers that need v4/v6 separately and are derived from
 # the canonical tuple so they cannot drift (t08 consolidation).
+from . import daemon_ipv6
 from .fail2ban_host import SAFE_ALLOWLIST
 
 ALLOWLIST_IPV4: tuple[str, ...] = tuple(
@@ -592,24 +593,20 @@ def enforcement_status(*, chain: str | None = None) -> EnforcementStatus:
     elif docker_user_result.skipped:
         attached = True  # assume OK when runtime skipped
 
-    # IPv6 status: ipv6_active is currently never True, and the three checks
-    # below decide only *which* reason the operator is told.
+    # IPv6 status. Three of these checks -- action rendered with ip6tables
+    # commands, ip6tables DOCKER-USER present, WPFY chain attached to it --
+    # were all satisfied on an IPv6-only host on 2026-08-21 while the ban still
+    # did not hold: with IPv6 off in the Docker daemon, inbound IPv6 to a
+    # published port is relayed by docker-proxy in userland, never enters
+    # ip6tables FORWARD, and the correctly installed rule sits at zero packets.
+    # Rules being *installed* has never been evidence that a packet arrives.
     #
-    # Those checks -- action rendered with ip6tables commands, ip6tables
-    # DOCKER-USER present, WPFY chain attached to it -- were all satisfied on
-    # an IPv6-only host on 2026-08-21, and the ban still did not hold. wpfy
-    # enables IPv6 on neither the Docker daemon nor any Docker network, so
-    # inbound IPv6 to a published port is relayed by docker-proxy in userland:
-    # it never enters ip6tables FORWARD, the correctly installed rule sits at
-    # zero packets while the v4 chain counts normally, and Traefik sees the
-    # bridge gateway instead of the client. Nothing this module can install
-    # changes that.
-    #
-    # So the claim is withheld rather than dressed up. Reporting "active" for
-    # a rule that cannot match is worse than reporting nothing: it tells an
-    # operator with public IPv6 that half their surface is covered when none
-    # of it is. Restoring a real check belongs with the decision to enable
-    # Docker IPv6, which needs its own ADR.
+    # So the fourth check is the load-bearing one, and it queries the running
+    # daemon (`daemon_ipv6_active`), not /etc/docker/daemon.json: `wpfy stack
+    # install` writes that file without restarting Docker, so between the write
+    # and the operator's restart the file says enabled while every v6 packet is
+    # still bypassing the chain. Claiming "active" off the file would recreate
+    # exactly the false assurance this check was withheld for. See ADR 0036.
     ipv6_active = False
     degraded_reason = ""
     if ipv6:
@@ -625,12 +622,17 @@ def enforcement_status(*, chain: str | None = None) -> EnforcementStatus:
         elif ip6_result.skipped:
             ip6_attached = True
         ban_capable = action_rendered_ipv6() is True
-        if ip6_docker_user_present and ip6_attached and ban_capable:
-            # Everything this module owns is in place; the gap is above it.
+        daemon_active = daemon_ipv6.daemon_ipv6_active()
+        if ip6_docker_user_present and ip6_attached and ban_capable and daemon_active:
+            ipv6_active = True
+        elif ip6_docker_user_present and ip6_attached and ban_capable:
+            # Everything this module owns is in place; the gap is the daemon.
             degraded_reason = (
-                "IPv6 ban rules install but never match: wpfy does not enable "
-                "IPv6 on the Docker network, so inbound IPv6 is relayed in "
-                "userland and bypasses DOCKER-USER"
+                "IPv6 ban rules install but never match: the running Docker "
+                "daemon still has IPv6 off, so inbound IPv6 is relayed in "
+                "userland and bypasses DOCKER-USER. Run 'wpfy stack install' "
+                "to write the daemon config, then restart Docker (this stops "
+                "every container on the host)"
             )
         else:
             reasons = []
@@ -640,6 +642,8 @@ def enforcement_status(*, chain: str | None = None) -> EnforcementStatus:
                 reasons.append("IPv6 DOCKER-USER not configured")
             elif not ip6_attached:
                 reasons.append("WPFY chain not attached in IPv6 DOCKER-USER")
+            if not daemon_active:
+                reasons.append("running Docker daemon has IPv6 off")
             degraded_reason = "; ".join(reasons)
     else:
         # Not IPv6 capable — not degraded, just not applicable.
@@ -693,3 +697,59 @@ def action_is_stale() -> bool:
     if rendered is None:
         return False
     return ipv6_capable() and not rendered
+
+
+# ---------------------------------------------------------------------------
+# Public API — chain repair (Docker restart drift)
+# ---------------------------------------------------------------------------
+
+
+def _reattach_family(binary: str, chain: str) -> tuple[bool, str]:
+    """Ensure *chain* exists and is attached to DOCKER-USER for one iptables family.
+
+    Mirrors the rendered action's own actionstart/actioncheck contract
+    (create chain idempotently, check-before-insert) but never flushes -- an
+    existing WPFY chain may hold live bans. The final ``-C`` re-check is
+    authoritative: a swallowed create/insert error must never read back as
+    "attached".
+    """
+    _run([binary, "-w", "-N", chain])
+    check = _run([binary, "-w", "-C", "DOCKER-USER", "-j", chain])
+    if not (check.skipped or check.returncode == 0):
+        _run([binary, "-w", "-I", "DOCKER-USER", "1", "-j", chain])
+        check = _run([binary, "-w", "-C", "DOCKER-USER", "-j", chain])
+    if check.skipped:
+        return True, "skipped by WPFY_SKIP_RUNTIME"
+    if check.returncode == 0:
+        return True, "attached"
+    return False, check.stderr.strip() or check.stdout.strip() or "attachment check failed"
+
+
+def reattach_chain(chain: str, *, ipv6: bool | None = None) -> tuple[bool, str]:
+    """Idempotently restore *chain*'s DOCKER-USER attachment (IPv4 + IPv6).
+
+    A Docker restart recreates DOCKER-USER, dropping every jump into it.
+    fail2ban's own actioncheck would repair that -- but only on the jail's
+    next ban/unban, which may never come. This closes that gap for any
+    caller that wants the chain healthy right now (host-level periodic
+    check, panel status, etc).
+
+    IPv6 is gated on live capability (:func:`ipv6_capable`), never assumed:
+    a host without current global IPv6 has no reason to touch ip6tables, and
+    ``ipv6_capable`` already honors WPFY_TEST_IPV6_CAPABLE / WPFY_SKIP_RUNTIME.
+
+    Returns ``(ok, detail)``. ``ok`` is only True when the DOCKER-USER
+    attachment was actually verified present (or the runtime is skipped) --
+    a failed repair is reported as a failure, never silently treated as
+    healthy.
+    """
+    validate_chain_name(chain)
+    if ipv6 is None:
+        ipv6 = ipv6_capable()
+
+    ipv4_ok, ipv4_detail = _reattach_family("iptables", chain)
+    if not ipv6:
+        return ipv4_ok, f"ipv4: {ipv4_detail}"
+
+    ipv6_ok, ipv6_detail = _reattach_family("ip6tables", chain)
+    return ipv4_ok and ipv6_ok, f"ipv4: {ipv4_detail}; ipv6: {ipv6_detail}"

@@ -82,6 +82,14 @@ PHP_IMAGE_REPOSITORY = _PHP_IMAGE_REPOSITORY
 # operators; userns-remap is not in use, so the container uid maps 1:1 to the host.
 SITE_UID_BASE = 100000
 
+#: Per-site networks are deliberately IPv4-only. They carry only
+#: nginx<->php<->mariadb<->redis traffic, none of which is reachable from
+#: outside the host, so IPv6 there buys nothing -- while a per-site v6 subnet
+#: needs a per-site allocator, and any allocator smaller than the site count is
+#: a cross-site isolation break waiting to happen. IPv6 belongs at the edge
+#: (the daemon's own bridge and the two shared edge networks), which is where
+#: inbound client addresses actually get mangled. See ADR 0036.
+
 # nginx's add_header inheritance is all-or-nothing: a location that adds a header
 # of its own drops every header inherited from the server block. Any location that
 # must add one re-emits this list instead of silently shedding the security set.

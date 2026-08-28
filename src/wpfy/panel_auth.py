@@ -120,7 +120,14 @@ UNKNOWN_CLIENT = "0.0.0.0"
 # fail2ban safe allowlist), and the default Docker bridge subnet (a container
 # on a shared bridge is never a client worth banning). Not broadened to all
 # private networks, per plan.
-_NEVER_BAN_STATIC_CIDRS = ("0.0.0.0/32", "127.0.0.0/8", "::1/128", "172.17.0.0/16")
+# Only WPFY's assigned IPv6 ULA prefix is static never-ban infrastructure.
+# ``fc00::/7`` covers unrelated operator networks and routed ULA clients; a
+# caller from either must remain bannable. Discovered edge endpoints below cover
+# the remaining live WPFY infrastructure. "::/128" is the v6 unspecified
+# sentinel, matching the 0.0.0.0/32 entry.
+_NEVER_BAN_STATIC_CIDRS = (
+    "0.0.0.0/32", "127.0.0.0/8", "::/128", "::1/128", "172.17.0.0/16", str(traefik.WPFY_ULA_PREFIX),
+)
 
 # Discovered never-ban members (Traefik edge endpoints + panel backend) are
 # cached with a short monotonic TTL, mirroring `panel.trusted_edge_networks`.
