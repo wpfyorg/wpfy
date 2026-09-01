@@ -122,6 +122,14 @@ claimed and none of this is validated):
   (ADR 0035).
 - 1.0 scope confirmed: telemetry stays inert by default, SMTP stays
   test-only, and named S3-compatible storage profiles remain CLI-only.
+- Production SMTP alerting is deferred to v1.1 (ADR 0037). SMTP stays
+  transport-only in 1.0 — stored transport settings plus explicit test
+  sends. The planned v1.1 direction is global SMTP configuration with
+  per-site propagation and event-driven alert rules; the final secrets
+  storage/isolation design is deferred to an implementation ADR that must
+  exist before any alerting code ships, and production SMTP credentials
+  must not be shared directly across site containers. Documentation only;
+  no feature work and nothing validated.
 
 ### Validation
 

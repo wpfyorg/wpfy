@@ -54,3 +54,6 @@ _bmad/
 .claude/
 .playwright/
 .agents/research/
+
+# RunCloud audit captures can contain credentials, private keys, and packet data.
+runcloud-audit/10-evidence/
