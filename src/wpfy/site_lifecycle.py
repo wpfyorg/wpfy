@@ -1,3 +1,4 @@
+"""Site lifecycle orchestration (create, update, enable SSL, delete)."""
 from __future__ import annotations
 
 from collections.abc import Callable
@@ -35,6 +36,7 @@ from .traefik import acme_email_problem
 
 @dataclass(frozen=True)
 class WordPressCredentials:
+    """WordPress admin credentials."""
     user: str
     email: str
     password: str
@@ -69,6 +71,7 @@ def resolve_wp_admin_credentials(
 
 @dataclass(frozen=True)
 class CreateSiteRequest:
+    """Site creation request."""
     domain: str
     flavor: str
     page_cache: str = "none"
@@ -86,6 +89,7 @@ class CreateSiteRequest:
 
 @dataclass(frozen=True)
 class UpdateSiteRequest:
+    """Site update request."""
     domain: str
     php_version: str | None = None
     flavor: str | None = None
@@ -104,6 +108,7 @@ class UpdateSiteRequest:
 
 @dataclass(frozen=True)
 class CreateSiteResult:
+    """Site creation result."""
     spec: SiteSpec
     touched: tuple[str, ...]
     bootstrap: RuntimeResult
@@ -117,11 +122,13 @@ class CreateSiteResult:
 
     @property
     def created(self) -> bool:
+        """Check if created."""
         return bool(self.touched)
 
 
 @dataclass(frozen=True)
 class UpdateSiteResult:
+    """Site update result."""
     spec: SiteSpec
     touched: tuple[str, ...]
     runtime: RuntimeResult
@@ -134,6 +141,7 @@ class UpdateSiteResult:
 
 @dataclass(frozen=True)
 class EnableSSLResult:
+    """SSL enablement result."""
     spec: SiteSpec
     touched: tuple[str, ...]
     runtime: RuntimeResult
@@ -144,6 +152,7 @@ class EnableSSLResult:
 
 @dataclass(frozen=True)
 class DeleteSiteRequest:
+    """Site deletion request."""
     domain: str
     force: bool = False
     skip_backup: bool = False
@@ -151,6 +160,7 @@ class DeleteSiteRequest:
 
 @dataclass(frozen=True)
 class DeleteSiteResult:
+    """Site deletion result."""
     backup: RuntimeResult
     runtime: RuntimeResult
     removed: bool
@@ -158,6 +168,7 @@ class DeleteSiteResult:
 
 
 class SiteLifecycleError(Exception):
+    """Site lifecycle error."""
     def __init__(self, message: str, *, exit_code: int = 2, preflight: bool = False) -> None:
         super().__init__(message)
         self.exit_code = exit_code
@@ -252,6 +263,7 @@ def create_site(
     credentials: Callable[[], WordPressCredentials],
     progress: Callable[[str], None] | None = None,
 ) -> CreateSiteResult:
+    """Create site."""
     _validate_site_vocabularies(
         php_version=request.php_version,
         letsencrypt=request.letsencrypt,
@@ -399,6 +411,7 @@ def create_site(
 
 
 def update_site(request: UpdateSiteRequest) -> UpdateSiteResult:
+    """Update site."""
     _validate_site_vocabularies(
         php_version=request.php_version if request.php_version is not None else DEFAULT_PHP_VERSION,
         letsencrypt=request.letsencrypt,
@@ -577,6 +590,7 @@ def enable_ssl(
     dns_provider: str | None = None,
     proxied_override: bool | None = None,
 ) -> EnableSSLResult:
+    """Enable ssl."""
     _validate_site_vocabularies(
         php_version=DEFAULT_PHP_VERSION,
         letsencrypt=letsencrypt,
@@ -661,6 +675,7 @@ def enable_ssl(
 
 
 def delete_site(request: DeleteSiteRequest) -> DeleteSiteResult:
+    """Delete site."""
     domain = request.domain
     try:
         site_info(domain)

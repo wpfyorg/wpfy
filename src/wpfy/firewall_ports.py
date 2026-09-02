@@ -82,6 +82,7 @@ _ADDED_SHORT = re.compile(r"^(?P<port>[\d:]+)(?:/(?P<protocol>\w+))?\s*$")
 
 @dataclass(frozen=True, slots=True)
 class PortRule:
+    """Firewall port rule."""
     port: str
     protocol: str
     action: str
@@ -107,6 +108,7 @@ class PanelEdgeRuleSpec:
 
 @dataclass(frozen=True, slots=True)
 class FirewallStatus:
+    """Firewall status and active rules."""
     installed: bool
     active: bool
     default_incoming: str
@@ -150,6 +152,7 @@ def _skip_runtime() -> bool:
 
 
 def ufw_available() -> bool:
+    """Check if ufw is available."""
     return shutil.which(_ufw_binary()) is not None
 
 
@@ -234,6 +237,7 @@ def validate_port(value: str) -> str:
 
 
 def validate_protocol(value: str) -> str:
+    """Validate protocol."""
     protocol = str(value or "").strip().lower()
     if protocol not in _PROTOCOLS:
         raise ValueError(f"invalid protocol: {value!r}; accepted values: {', '.join(_PROTOCOLS)}")
@@ -252,6 +256,7 @@ def validate_source(value: str | None) -> str | None:
 
 
 def validate_comment(value: str | None) -> str | None:
+    """Validate comment."""
     if value is None or str(value).strip() == "":
         return None
     comment = str(value).strip()
@@ -385,6 +390,7 @@ def parse_status(output: str) -> FirewallStatus:
 
 
 def status() -> FirewallStatus:
+    """Return status."""
     if not ufw_available():
         return FirewallStatus(
             installed=False, active=False, default_incoming="unknown", default_outgoing="unknown",
@@ -563,6 +569,7 @@ class _AddedPanelEdgeRule:
     rule_argv: tuple[str, ...]
 
     def matches(self, spec: PanelEdgeRuleSpec) -> bool:
+        """Check if matches."""
         return (
             self.port == spec.port
             and self.bridge == spec.bridge
@@ -848,6 +855,7 @@ remove_panel_edge_rules = remove_all_panel_edge_rules
 
 
 def allow_port(port: str, protocol: str, *, source: str | None = None, comment: str | None = None) -> RuntimeResult:
+    """Allow port."""
     port, protocol = validate_port(port), validate_protocol(protocol)
     source, comment = validate_source(source), validate_comment(comment)
     scope = f" from {source}" if source else ""
@@ -857,6 +865,7 @@ def allow_port(port: str, protocol: str, *, source: str | None = None, comment: 
 
 def deny_port(port: str, protocol: str, *, source: str | None = None, comment: str | None = None,
               force: bool = False) -> RuntimeResult:
+    """Deny port."""
     port, protocol = validate_port(port), validate_protocol(protocol)
     source, comment = validate_source(source), validate_comment(comment)
     blocked = _guard(port, protocol, force, "deny")
@@ -869,6 +878,7 @@ def deny_port(port: str, protocol: str, *, source: str | None = None, comment: s
 
 def delete_rule(port: str, protocol: str, action: str = "allow", *, source: str | None = None,
                 force: bool = False) -> RuntimeResult:
+    """Delete rule."""
     port, protocol = validate_port(port), validate_protocol(protocol)
     source = validate_source(source)
     action = str(action or "").strip().lower()
@@ -899,4 +909,5 @@ def enable() -> RuntimeResult:
 
 
 def disable() -> RuntimeResult:
+    """Disable."""
     return _mutate(["disable"], "firewall disabled; every port is open again")

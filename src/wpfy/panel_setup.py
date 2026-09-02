@@ -1,3 +1,4 @@
+"""Panel initial setup flow and state management."""
 from __future__ import annotations
 
 from contextlib import contextmanager
@@ -21,11 +22,13 @@ _EMAIL_SHAPE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 
 def state_path() -> Path:
+    """Return state path."""
     return Path(settings.PATHS.config_dir) / "panel-state.json"
 
 
 @contextmanager
 def state_lock():
+    """State lock."""
     path = state_path().with_suffix(".lock")
     path.parent.mkdir(parents=True, exist_ok=True)
     fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
@@ -90,6 +93,7 @@ def issue_setup_secret() -> str:
 
 
 def clear_setup_secret() -> None:
+    """Clear setup secret."""
     with state_lock():
         current = _default_state()
         current.update(_read_state())
@@ -189,6 +193,7 @@ def _write_state(state: dict) -> None:
 
 
 def state() -> dict:
+    """State."""
     with state_lock():
         current = _default_state()
         current.update(_read_state())
@@ -196,6 +201,7 @@ def state() -> dict:
 
 
 def status(*, remote: bool) -> dict:
+    """Return status."""
     configured = panel_auth.login_required()
     if configured:
         return {"configured": True, "setup_available": False}
@@ -214,6 +220,7 @@ def _text(value: object, field: str, maximum: int = 80) -> str:
 
 
 def create_account(body: dict, *, client: str | None, remote: bool) -> tuple[str, dict]:
+    """Create first user account during panel setup."""
     # Account creation over the edge used to be refused outright, on the
     # reasoning that the operator can always reach loopback through an SSH
     # tunnel. A domainless exposure has no tunnel in the picture, so the refusal
@@ -296,6 +303,7 @@ def create_account(body: dict, *, client: str | None, remote: bool) -> tuple[str
 
 
 def mark_telemetry_sent(timestamp: str) -> None:
+    """Mark telemetry sent."""
     with state_lock():
         current = _default_state()
         current.update(_read_state())
@@ -304,6 +312,7 @@ def mark_telemetry_sent(timestamp: str) -> None:
 
 
 def set_telemetry_enabled(enabled: bool) -> None:
+    """Set telemetry enabled."""
     with state_lock():
         current = _default_state()
         current.update(_read_state())

@@ -79,16 +79,19 @@ EXTRA_EVENT_NEEDLES = ("password reset",)
 
 
 def security_dir(domain: str) -> Path:
+    """Return security directory."""
     validate_domain(domain)
     return site_dir(domain) / "security"
 
 
 def auth_log_path(domain: str) -> Path:
+    """Return auth log path."""
     validate_domain(domain)
     return security_dir(domain) / AUTH_LOG_FILE
 
 
 def bridge_path(domain: str) -> Path:
+    """Return bridge path."""
     validate_domain(domain)
     return security_dir(domain) / BRIDGE_MU_FILE
 

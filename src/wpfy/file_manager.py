@@ -1,3 +1,4 @@
+"""File manager provider lifecycle and session management."""
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -20,6 +21,7 @@ _LIMIT_MESSAGE = "The server has reached its active file-manager limit. Disable 
 
 
 class FileManagerError(RuntimeError):
+    """File manager operation error."""
     def __init__(self, code: str, message: str) -> None:
         self.code = code
         super().__init__(message)
@@ -27,6 +29,7 @@ class FileManagerError(RuntimeError):
 
 @dataclass(frozen=True)
 class FileManagerState:
+    """File manager instance state."""
     state: str
     domain: str
     provider: str | None = None
@@ -41,13 +44,28 @@ class FileManagerState:
 
 
 class FileManagerProvider(Protocol):
-    def ensure_config(self, domain: str) -> None: ...
-    def start(self, domain: str) -> None: ...
-    def stop(self, domain: str) -> None: ...
-    def status(self, domain: str) -> dict: ...
-    def health(self, domain: str) -> bool: ...
-    def create_launch_session(self, domain: str, username: str) -> str: ...
-    def reset_metadata(self, domain: str) -> None: ...
+    """File manager provider interface."""
+    def ensure_config(self, domain: str) -> None:
+        """Ensure provider configuration for domain."""
+        ...
+    def start(self, domain: str) -> None:
+        """Start file manager for domain."""
+        ...
+    def stop(self, domain: str) -> None:
+        """Stop file manager for domain."""
+        ...
+    def status(self, domain: str) -> dict:
+        """Get file manager status for domain."""
+        ...
+    def health(self, domain: str) -> bool:
+        """Check file manager health for domain."""
+        ...
+    def create_launch_session(self, domain: str, username: str) -> str:
+        """Create launch session for user on domain."""
+        ...
+    def reset_metadata(self, domain: str) -> None:
+        """Reset file manager metadata for domain."""
+        ...
 
 
 _locks: dict[str, threading.Lock] = {}
@@ -55,6 +73,7 @@ _locks_lock = threading.Lock()
 
 
 def _get_lock(domain: str) -> threading.Lock:
+    """Reset metadata."""
     with _locks_lock:
         if domain not in _locks:
             _locks[domain] = threading.Lock()
@@ -99,6 +118,7 @@ def _max_file_managers() -> int:
 
 
 def count_running_file_managers() -> int:
+    """Count running file managers."""
     if runtime_skip_requested():
         return 0
     try:
@@ -123,6 +143,7 @@ def _write_state(domain: str, state: dict) -> None:
 
 
 def get_file_manager_state(domain: str, provider: FileManagerProvider | None = None) -> FileManagerState:
+    """Get file manager state."""
     stored = _read_state(domain) or {}
     holders = stored.get("lease_holders", [])
     if not isinstance(holders, list):
@@ -143,6 +164,7 @@ def get_file_manager_state(domain: str, provider: FileManagerProvider | None = N
 
 
 def enable_file_manager(domain: str, username: str, provider: FileManagerProvider) -> dict:
+    """Enable file manager."""
     from .site_paths import site_exists, app_dir
 
     if not site_exists(domain):
@@ -223,6 +245,7 @@ def enable_file_manager(domain: str, username: str, provider: FileManagerProvide
 
 
 def mark_ready(domain: str) -> dict:
+    """Mark ready."""
     with _get_lock(domain):
         current = _read_state(domain) or {}
         now = datetime.now(timezone.utc)
@@ -242,6 +265,7 @@ def mark_ready(domain: str) -> dict:
 
 
 def disable_file_manager(domain: str, provider: FileManagerProvider) -> dict:
+    """Disable file manager."""
     lock = _get_lock(domain)
     with lock:
         try:
@@ -261,6 +285,7 @@ def disable_file_manager(domain: str, provider: FileManagerProvider) -> dict:
 
 
 def create_lease(domain: str, username: str | None = None) -> dict:
+    """Create lease."""
     with _get_lock(domain):
         now = datetime.now(timezone.utc)
         stored = _read_state(domain) or {}
@@ -284,10 +309,12 @@ def create_lease(domain: str, username: str | None = None) -> dict:
 
 
 def lease_holder_usernames(domain: str) -> list[str]:
+    """Lease holder usernames."""
     return list(dict.fromkeys((_read_state(domain) or {}).get("lease_holders", [])))
 
 
 def launch_session(domain: str, username: str, provider: FileManagerProvider) -> dict:
+    """Launch session."""
     state = _read_state(domain) or {}
     if state.get("state") != "ready":
         raise RuntimeError("file manager is not ready")
@@ -296,6 +323,7 @@ def launch_session(domain: str, username: str, provider: FileManagerProvider) ->
 
 
 def is_in_warning_window(domain: str) -> bool:
+    """Check if in warning window."""
     stored = _read_state(domain) or {}
     expires = stored.get("idle_expires_at")
     if not expires or stored.get("state") != "ready":

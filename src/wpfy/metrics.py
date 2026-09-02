@@ -1,3 +1,4 @@
+"""System metrics collection and storage."""
 from __future__ import annotations
 
 from contextlib import closing
@@ -48,6 +49,7 @@ _SIZE_MULTIPLIERS: Final = {
 
 @dataclass(frozen=True, slots=True)
 class Sample:
+    """Single metrics sample."""
     timestamp: int
     scope: str
     cpu_percent: float
@@ -60,6 +62,7 @@ class Sample:
 
 @dataclass(frozen=True, slots=True)
 class SampleRun:
+    """Metrics sampling run."""
     samples: tuple[Sample, ...]
     warnings: tuple[str, ...] = ()
 
@@ -72,10 +75,12 @@ class _SiteTotals:
 
 
 def metrics_db_path() -> Path:
+    """Return metrics db path."""
     return Path(settings.PATHS.state_dir) / "metrics.sqlite3"
 
 
 def sample_once() -> SampleRun:
+    """Sample once."""
     warnings: list[str] = []
     timestamp = int(time.time())
     load1 = _load1()
@@ -126,6 +131,7 @@ def sample_once() -> SampleRun:
 
 
 def read_samples(scope: str, range_key: str) -> tuple[Sample, ...]:
+    """Read samples."""
     try:
         seconds = _RANGE_SECONDS[range_key]
     except KeyError as exc:
@@ -173,6 +179,7 @@ def latest_samples(max_age_seconds: int = 900) -> tuple[Sample, ...]:
 
 
 def prune(retention_days: int = RETENTION_DAYS, *, now: int | None = None) -> int:
+    """Prune."""
     if retention_days < 0:
         raise ValueError("retention_days must not be negative")
     path = metrics_db_path()

@@ -1,3 +1,4 @@
+"""Shared infrastructure stack installation and lifecycle."""
 from __future__ import annotations
 
 from collections.abc import Callable
@@ -20,6 +21,7 @@ HOST_TOOLS = ("netdata", "fail2ban", "ufw", "ngxblocker", "nanorc", "dashboard",
 
 @dataclass(frozen=True, slots=True)
 class StackInstallRequest:
+    """Stack installation request."""
     install_all: bool = False
     nginx: bool = False
     php_version: str | None = None
@@ -36,6 +38,7 @@ class StackInstallRequest:
 
 @dataclass(frozen=True, slots=True)
 class StackFact:
+    """Stack installation fact."""
     name: str
     status: str
     message: str
@@ -44,12 +47,14 @@ class StackFact:
 
 @dataclass(frozen=True, slots=True)
 class StackResult:
+    """Stack operation result."""
     facts: tuple[StackFact, ...]
     exit_code: int = 0
 
 
 @dataclass(frozen=True, slots=True)
 class StackStatus:
+    """Stack status."""
     traefik: RuntimeResult
     docker_version: str | None
     images: tuple[str, ...]
@@ -58,6 +63,7 @@ class StackStatus:
 
     @property
     def exit_code(self) -> int:
+        """Return exit code."""
         return self.traefik.exit_code or (1 if self.docker_error or self.images_error else 0)
 
 
@@ -66,6 +72,7 @@ def _process_message(proc: subprocess.CompletedProcess[str], fallback: str) -> s
 
 
 def pull_image(image: str) -> StackFact:
+    """Pull image."""
     try:
         proc = subprocess.run(["docker", "pull", image], check=False, capture_output=True, text=True)
     except (OSError, subprocess.SubprocessError) as exc:
@@ -81,6 +88,7 @@ def install(
     *,
     progress: Callable[[str], None] | None = None,
 ) -> StackResult:
+    """Install."""
     notify = progress or (lambda _message: None)
     facts: list[StackFact] = []
     pulled_php_versions: set[str] = set()
@@ -169,6 +177,7 @@ def install(
 
 
 def status() -> StackStatus:
+    """Return status."""
     traefik_result = traefik.traefik_status()
     try:
         version = subprocess.run(
@@ -196,10 +205,12 @@ def status() -> StackStatus:
 
 
 def remove() -> RuntimeResult:
+    """Remove."""
     return traefik.stop_traefik()
 
 
 def upgrade() -> StackResult:
+    """Upgrade."""
     compose_file = traefik.traefik_compose_path()
     if not compose_file.exists():
         fact = StackFact(
@@ -241,6 +252,7 @@ def upgrade() -> StackResult:
 
 
 def purge(*, force: bool) -> StackResult:
+    """Purge."""
     if not force:
         return StackResult((StackFact("Traefik", "FAIL", "--force is required", 2),), 2)
     stopped = traefik.stop_traefik()

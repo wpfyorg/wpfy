@@ -1,3 +1,4 @@
+"""WordPress cron job execution and scheduling."""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -52,6 +53,7 @@ _FIELD_LIMITS: Final = (
 
 @dataclass(frozen=True, slots=True)
 class CronJobRun:
+    """Cron job execution run."""
     domain: str
     job_id: str | None
     outcome: str
@@ -64,11 +66,13 @@ class CronJobRun:
 
 @dataclass(frozen=True, slots=True)
 class CronDueRun:
+    """Cron due jobs run."""
     moment: datetime
     jobs: tuple[CronJobRun, ...]
 
     @property
     def exit_code(self) -> int:
+        """Return exit code."""
         return 1 if any(job.exit_code != 0 for job in self.jobs) else 0
 
 
@@ -195,6 +199,7 @@ def allowed_services(domain: str) -> frozenset[str]:
 
 
 def validate_service(domain: str, service: object) -> str:
+    """Validate service."""
     if not isinstance(service, str):
         raise TypeError("service must be a string")
     if service not in allowed_services(domain):

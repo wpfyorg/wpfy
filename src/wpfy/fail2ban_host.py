@@ -1,3 +1,4 @@
+"""Host-level fail2ban integration for panel and WordPress authentication."""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -67,6 +68,7 @@ FAILURE_ID_GROUPS = frozenset({"fid", "ip4", "ip6", "dns"})
 
 @dataclass(frozen=True, slots=True)
 class HostFail2banResult:
+    """Host-level fail2ban setup result."""
     exit_code: int
     message: str
     changed: bool = False

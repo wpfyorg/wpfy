@@ -1,3 +1,4 @@
+"""Site definition model and validation."""
 from __future__ import annotations
 
 from collections.abc import Callable
@@ -60,6 +61,7 @@ def compose_hardening_lines(
     *,
     cap_add: tuple[str, ...] = (),
 ) -> list[str]:
+    """Compose hardening lines."""
     lines = [
         "    security_opt:",
         "      - no-new-privileges:true",
@@ -85,24 +87,28 @@ def compose_hardening_lines(
 
 
 def validate_page_cache(value: str) -> str:
+    """Validate page cache."""
     if value not in PAGE_CACHE_OPTIONS:
         raise ValueError(f"invalid page cache: {value!r}")
     return value
 
 
 def validate_object_cache(value: str) -> str:
+    """Validate object cache."""
     if value not in OBJECT_CACHE_OPTIONS:
         raise ValueError(f"invalid object cache: {value!r}")
     return value
 
 
 def validate_adminer_port(value: str) -> str:
+    """Validate adminer port."""
     if not isinstance(value, str) or not value.isdigit() or not 1 <= int(value) <= 65535:
         raise ValueError(f"invalid Adminer port: {value!r}")
     return value
 
 
 def validate_php_setting(name: str, value: str) -> str:
+    """Validate php setting."""
     field = PHP_SETTING_FIELDS.get(name)
     if field is None:
         raise ValueError(f"unknown PHP setting: {name}")
@@ -113,6 +119,7 @@ def validate_php_setting(name: str, value: str) -> str:
 
 @dataclass(frozen=True)
 class SiteDefinition:
+    """Site definition and configuration."""
     domain: str
     flavor: str
     use_mysql: bool
@@ -136,6 +143,7 @@ class SiteDefinition:
 
     @classmethod
     def from_env(cls, domain: str, values: dict[str, str]) -> SiteDefinition:
+        """Create instance from environment variables."""
         persisted_flavor = values.get("SITE_FLAVOR", "site")
         legacy_page_cache, legacy_object_cache = LEGACY_CACHE_FLAVORS.get(
             persisted_flavor, ("none", "none"),
@@ -184,6 +192,7 @@ class SiteDefinition:
         )
 
     def env_values(self, existing: dict[str, str], generated_secret: Callable[[], str]) -> list[tuple[str, str]]:
+        """Return environment variable values."""
         project = domain_to_project(self.domain)
         values = [
             ("DOMAIN", self.domain),
@@ -227,6 +236,7 @@ class SiteDefinition:
         return values
 
     def registry_metadata(self) -> dict[str, object]:
+        """Return registry metadata."""
         page_cache = validate_page_cache(self.page_cache)
         object_cache = "redis" if self.use_redis else validate_object_cache(self.object_cache)
         metadata: dict[str, object] = {
@@ -248,6 +258,7 @@ class SiteDefinition:
 
 
 def adminer_service_lines(definition: SiteDefinition) -> list[str]:
+    """Adminer service lines."""
     if definition.adminer_port is None:
         raise ValueError("Adminer service requires a port")
     port = validate_adminer_port(definition.adminer_port)
@@ -272,6 +283,7 @@ def adminer_service_lines(definition: SiteDefinition) -> list[str]:
 
 
 def sftp_service_lines(definition: SiteDefinition) -> list[str]:
+    """Sftp service lines."""
     project = domain_to_project(definition.domain)
     uid = definition.site_uid if definition.site_uid is not None else 1000
     return [

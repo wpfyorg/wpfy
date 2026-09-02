@@ -1,3 +1,4 @@
+"""Panel authentication, session management, and TOTP enrollment."""
 from __future__ import annotations
 
 import base64
@@ -148,6 +149,7 @@ _PANEL_AUTH_LOG_KEEP = 3
 
 @dataclass(frozen=True, slots=True)
 class Session:
+    """Panel user session."""
     username: str
     created_at: float
     last_seen_at: float
@@ -181,10 +183,12 @@ class PasswordLoginOutcome:
 
     @property
     def mfa_required(self) -> bool:
+        """Mfa required."""
         return self.challenge is not None
 
 
 class ClientThrottleError(ValueError):
+    """Client rate limit exceeded."""
     pass
 
 
@@ -198,12 +202,14 @@ class LoginAdmissionError(ClientThrottleError):
 
 @dataclass(frozen=True, slots=True)
 class LoginFailure:
+    """Login authentication failure."""
     count: int
     locked_until: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)
 class ClientFailure:
+    """Client request failure."""
     count: int
     cooldown_until: float
     expires_at: float
@@ -223,6 +229,7 @@ _PENDING_LOGINS: dict[str, PendingLogin] = {}
 
 
 class UserStoreError(ValueError):
+    """User store operation error."""
     pass
 
 
@@ -231,6 +238,7 @@ class ReauthenticationError(ValueError):
 
 
 def users_path() -> Path:
+    """Return users path."""
     return Path(settings.PATHS.config_dir) / "panel-users.json"
 
 
@@ -535,10 +543,12 @@ def _validate_role(role: str) -> str:
 
 
 def validate_username(username: object) -> str:
+    """Validate username."""
     return _validate_username(username)
 
 
 def validate_password(password: object) -> str:
+    """Validate password."""
     return _validate_password(password)
 
 
@@ -677,6 +687,7 @@ def _require_admin(users: list[dict]) -> None:
 def add_user(
     username, password, *, role, sites=(), first_name="", last_name="", email="",
 ) -> None:
+    """Add user."""
     username = _validate_username(username)
     password = _validate_password(password)
     role = _validate_role(role)
@@ -708,6 +719,7 @@ def add_user(
 
 
 def remove_user(username) -> None:
+    """Remove user."""
     username = _validate_username(username)
     with _STATE_LOCK, _store_lock():
         users = _read_users()
@@ -722,10 +734,12 @@ def remove_user(username) -> None:
 
 
 def list_users() -> list[dict]:
+    """List users."""
     return [_public_user(user) for user in _read_users()]
 
 
 def set_password(username, password) -> None:
+    """Set password."""
     username = _validate_username(username)
     password = _validate_password(password)
     password_hash, password_salt = _password_record(password)
@@ -742,6 +756,7 @@ def set_password(username, password) -> None:
 
 
 def set_role(username, role) -> None:
+    """Set role."""
     username = _validate_username(username)
     role = _validate_role(role)
     with _STATE_LOCK, _store_lock():
@@ -755,6 +770,7 @@ def set_role(username, role) -> None:
 
 
 def set_sites(username, sites) -> None:
+    """Set sites."""
     username = _validate_username(username)
     sites = _validated_sites(sites)
     with _STATE_LOCK, _store_lock():
@@ -767,6 +783,7 @@ def set_sites(username, sites) -> None:
 
 
 def update_user(username, *, role=None, password=None, sites=None) -> None:
+    """Update user."""
     username = _validate_username(username)
     if role is not None:
         role = _validate_role(role)
@@ -867,6 +884,7 @@ def change_password(username, current_password, new_password, *, keep_token=None
 
 
 def assign_site(username, domain) -> None:
+    """Assign site."""
     username = _validate_username(username)
     validate_domain(domain)
     with _STATE_LOCK, _store_lock():
@@ -879,6 +897,7 @@ def assign_site(username, domain) -> None:
 
 
 def revoke_site(username, domain) -> None:
+    """Revoke site."""
     username = _validate_username(username)
     validate_domain(domain)
     with _STATE_LOCK, _store_lock():
@@ -1048,11 +1067,13 @@ def _verify_password_with_fingerprint(username, password) -> tuple[bool, tuple[o
 
 
 def verify_password(username, password) -> bool:
+    """Verify password."""
     valid, _fingerprint = _verify_password_with_fingerprint(username, password)
     return valid
 
 
 def enable_totp(username) -> tuple[str, str]:
+    """Enable totp."""
     username = _validate_username(username)
     with _STATE_LOCK, _store_lock():
         users = _read_users()
@@ -1078,6 +1099,7 @@ def _prune_pending_totp(now: float) -> None:
 
 
 def begin_totp_enrollment(username) -> tuple[str, str]:
+    """Begin totp enrollment."""
     username = _validate_username(username)
     now = time.time()
     with _STATE_LOCK:
@@ -1103,6 +1125,7 @@ def begin_totp_enrollment(username) -> tuple[str, str]:
 
 
 def complete_totp_enrollment(username, code: object) -> tuple[object, object, object]:
+    """Complete totp enrollment."""
     username = _validate_username(username)
     now = time.time()
     with _STATE_LOCK, _store_lock():
@@ -1133,6 +1156,7 @@ def complete_totp_enrollment(username, code: object) -> tuple[object, object, ob
 
 
 def cancel_totp_enrollment(username) -> None:
+    """Cancel totp enrollment."""
     username = _validate_username(username)
     with _STATE_LOCK:
         _PENDING_TOTP.pop(username, None)
@@ -1199,6 +1223,7 @@ def recover_disable_totp(username) -> None:
 
 
 def login_required() -> bool:
+    """Login required."""
     try:
         return bool(_read_users())
     except UserStoreError:
@@ -1206,6 +1231,7 @@ def login_required() -> bool:
 
 
 def totp_code(secret: bytes, timestamp: float, *, digits: int = 6) -> str:
+    """Totp code."""
     if not isinstance(secret, bytes) or not secret:
         raise ValueError("TOTP secret must be non-empty bytes")
     if not isinstance(digits, int) or not 1 <= digits <= 10:
@@ -1302,6 +1328,7 @@ def _prune_client_failures(now: float) -> None:
 
 
 def client_throttled(client) -> bool:
+    """Client throttled."""
     now = time.time()
     with _STATE_LOCK:
         _prune_client_failures(now)
@@ -1338,6 +1365,7 @@ def _register_client_failure(client: str, now: float) -> None:
 
 
 def register_client_failure(client) -> None:
+    """Register client failure."""
     now = time.time()
     with _STATE_LOCK:
         _register_client_failure(_client_key(client), now)
@@ -1354,6 +1382,7 @@ def _prune_fm_enable(now: float) -> None:
 
 
 def fm_enable_allowed(username: str) -> bool:
+    """Fm enable allowed."""
     now = time.time()
     with _STATE_LOCK:
         _prune_fm_enable(now)
@@ -1361,6 +1390,7 @@ def fm_enable_allowed(username: str) -> bool:
 
 
 def register_fm_enable(username: str) -> None:
+    """Register fm enable."""
     now = time.time()
     with _STATE_LOCK:
         _prune_fm_enable(now)
@@ -1370,6 +1400,7 @@ def register_fm_enable(username: str) -> None:
 def login(
     username: object, password: object, totp: object = None, *, client=None, setup: bool = False,
 ) -> tuple[str, dict] | None:
+    """Authenticate user with username, password, and optional TOTP code."""
     # These checks are intentionally before admission and before any KDF.  The
     # HTTP layer has already bounded the JSON body, but a valid-sized body can
     # still contain values that would make password verification needlessly
@@ -1691,6 +1722,7 @@ def cancel_login(challenge: object, *, client=None) -> None:
 
 
 def authenticate_session(token: object) -> dict | None:
+    """Authenticate session."""
     if not isinstance(token, str) or not token:
         return None
     now = time.time()
@@ -1721,6 +1753,7 @@ def authenticate_session(token: object) -> dict | None:
 def finish_setup_session(
     token: object, expected_fingerprint: tuple[object, object, object] | None = None,
 ) -> bool:
+    """Finish setup session."""
     if not isinstance(token, str) or not token:
         return False
     with _STATE_LOCK, _store_lock():
@@ -1745,6 +1778,7 @@ def finish_setup_session(
 
 
 def logout(token: object) -> None:
+    """Logout."""
     if isinstance(token, str):
         with _STATE_LOCK:
             _SESSIONS.pop(token, None)
@@ -1800,6 +1834,7 @@ def revoke_session_by_id(username: str, token_id: object) -> bool:
 
 
 def reset_state() -> None:
+    """Reset state."""
     global _NEVER_BAN_EDGE_CACHE, _NEVER_BAN_EDGE_STALE, _NEVER_BAN_EDGE_GRACE_UNTIL
     global _NEVER_BAN_EDGE_REQUEST_SAFE
     with _STATE_LOCK:

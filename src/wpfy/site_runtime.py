@@ -1,3 +1,4 @@
+"""Site runtime operations (Docker Compose, WP-CLI, health checks, logs)."""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -23,6 +24,7 @@ from .site_paths import (
 
 @dataclass(frozen=True, slots=True)
 class RuntimeResult:
+    """Site runtime operation result."""
     exit_code: int
     message: str
     ran: bool = False
@@ -31,6 +33,7 @@ class RuntimeResult:
 
 @dataclass(frozen=True, slots=True)
 class HealthResult:
+    """Site health check result."""
     domain: str
     scaffold_ready: bool
     bootstrap_ready: bool
@@ -42,6 +45,7 @@ class HealthResult:
 
 @dataclass(frozen=True, slots=True)
 class ProcessResult:
+    """Process execution result."""
     exit_code: int
     stdout: str = ""
     stderr: str = ""
@@ -51,11 +55,13 @@ class ProcessResult:
 
 @dataclass(frozen=True, slots=True)
 class LogResetResult:
+    """Log reset result."""
     stop: RuntimeResult
     restart: RuntimeResult | None = None
 
     @property
     def exit_code(self) -> int:
+        """Return exit code."""
         if self.stop.exit_code != 0 or self.stop.skipped:
             return self.stop.exit_code or 1
         if self.restart is None:
@@ -64,6 +70,7 @@ class LogResetResult:
 
 
 def app_health_ok(status: str, bootstrap_ready: bool, runtime_ready: bool) -> bool | None:
+    """App health ok."""
     if not bootstrap_ready:
         return False
     if runtime_ready or status == "ready":
@@ -74,11 +81,13 @@ def app_health_ok(status: str, bootstrap_ready: bool, runtime_ready: bool) -> bo
 
 
 def runtime_skip_requested() -> bool:
+    """Runtime skip requested."""
     return os.environ.get("WPFY_SKIP_RUNTIME", "0") == "1"
 
 
 @lru_cache(maxsize=1)
 def docker_available() -> bool:
+    """Check if docker is available."""
     docker = shutil.which("docker")
     if not docker:
         return False
@@ -92,6 +101,7 @@ def compose_command(
     input_text: str | None = None,
     timeout: float | None = None,
 ) -> subprocess.CompletedProcess[str]:
+    """Compose command."""
     return subprocess.run(
         ["docker", "compose", *args],
         cwd=site_dir(domain),
@@ -108,6 +118,7 @@ def wp_cli_command(
     *args: str,
     input_text: str | None = None,
 ) -> subprocess.CompletedProcess[str]:
+    """Wp cli command."""
     return subprocess.run(
         ["docker", "compose", "--profile", "cli", "run", "--rm", "-T", "wpcli", *args],
         cwd=site_dir(domain),
@@ -119,6 +130,7 @@ def wp_cli_command(
 
 
 def start_site_runtime(domain: str) -> RuntimeResult:
+    """Start site runtime."""
     if runtime_skip_requested():
         return RuntimeResult(0, "runtime skipped by WPFY_SKIP_RUNTIME=1", skipped=True)
     if not docker_available():
@@ -138,6 +150,7 @@ def start_site_runtime(domain: str) -> RuntimeResult:
 
 
 def stop_site_runtime(domain: str, *, remove_volumes: bool = False) -> RuntimeResult:
+    """Stop site runtime."""
     if runtime_skip_requested() or not docker_available():
         return RuntimeResult(0, "runtime stop skipped", skipped=True)
     args = ("down", "-v") if remove_volumes else ("down",)
@@ -150,6 +163,7 @@ def stop_site_runtime(domain: str, *, remove_volumes: bool = False) -> RuntimeRe
 
 
 def runtime_status(domain: str) -> RuntimeResult:
+    """Get runtime status."""
     if runtime_skip_requested() or not docker_available():
         return RuntimeResult(0, "runtime status unavailable (Docker/Compose not available)", skipped=True)
     proc = compose_command(domain, "ps")
@@ -242,6 +256,7 @@ def _compose_exec(domain: str, *args: str) -> subprocess.CompletedProcess[str]:
 
 
 def http_probe_site(domain: str) -> RuntimeResult:
+    """Http probe site."""
     if runtime_skip_requested() or not docker_available():
         return RuntimeResult(0, "http probe skipped", skipped=True)
     proc = _compose_exec(domain, "web", "sh", "-lc", "wget -qO- http://127.0.0.1:8080/healthz.html")
@@ -254,6 +269,7 @@ def http_probe_site(domain: str) -> RuntimeResult:
 
 
 def nginx_config_test(domain: str) -> RuntimeResult:
+    """Nginx config test."""
     if runtime_skip_requested() or not docker_available():
         return RuntimeResult(0, "nginx config test skipped", skipped=True)
     proc = _compose_exec(domain, "web", "nginx", "-t")
@@ -264,6 +280,7 @@ def nginx_config_test(domain: str) -> RuntimeResult:
 
 
 def site_health(domain: str) -> HealthResult:
+    """Site health."""
     validate_domain(domain)
     scaffold_ready = site_exists(domain)
     bootstrap_ready = False
@@ -350,6 +367,7 @@ def site_health(domain: str) -> HealthResult:
 
 
 def wait_for_service(domain: str, service: str, timeout_seconds: int = 60) -> RuntimeResult:
+    """Wait for service."""
     if runtime_skip_requested() or not docker_available():
         return RuntimeResult(0, f"{service} wait skipped (Docker/Compose not available)", skipped=True)
     deadline = time.monotonic() + timeout_seconds
@@ -375,6 +393,7 @@ def site_logs(
     follow: bool = False,
     no_color: bool = False,
 ) -> ProcessResult:
+    """Site logs."""
     unknown = set(services) - LOG_SERVICES
     if unknown:
         raise ValueError(f"unknown log service: {sorted(unknown)[0]}")
@@ -405,6 +424,7 @@ def site_logs(
 
 
 def reset_site_logs(domain: str) -> LogResetResult:
+    """Reset site logs."""
     stop = stop_site_runtime(domain)
     if stop.exit_code != 0 or stop.skipped:
         return LogResetResult(stop)
@@ -421,6 +441,7 @@ def _wp_cli_args(args: tuple[str, ...], *, interactive: bool) -> list[str]:
 
 
 def run_wp_cli(domain: str, *args: str, interactive: bool = False) -> ProcessResult:
+    """Run wp cli."""
     if runtime_skip_requested() or not docker_available():
         return ProcessResult(1, stderr="runtime unavailable (Docker/Compose not available)", skipped=True)
     try:

@@ -1,3 +1,4 @@
+"""Edge infrastructure backup and restore (Traefik, certificates, configuration)."""
 from __future__ import annotations
 
 from datetime import datetime, timezone
@@ -38,6 +39,7 @@ def backup_edge(
     s3_profile: str | None = None,
     uploader: S3Uploader | None = None,
 ) -> RuntimeResult:
+    """Backup edge."""
     backup_dir = Path(destination_dir) if destination_dir is not None else _edge_backup_dir()
     backup_dir.mkdir(parents=True, exist_ok=True)
     backup_dir.chmod(0o700)
@@ -110,6 +112,7 @@ def _validate_edge_member(member: tarfile.TarInfo) -> str | None:
 
 
 def restore_edge(archive_path: str, *, force: bool) -> RuntimeResult:
+    """Restore edge."""
     if not force:
         return RuntimeResult(2, "edge restore aborted: --force required")
     source = Path(archive_path)

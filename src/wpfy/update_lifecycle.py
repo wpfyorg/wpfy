@@ -31,6 +31,7 @@ from .settings import PATHS, WpfyPaths
 
 
 class UpdateExitCode(IntEnum):
+    """Update command exit code."""
     OK = 0
     ERROR = 1
     INVALID = 2
@@ -50,34 +51,42 @@ class UpdaterError(Exception):
 
 
 class ManifestError(UpdaterError):
+    """Manifest validation error."""
     exit_code = UpdateExitCode.INVALID
 
 
 class SignatureError(ManifestError):
+    """Signature verification error."""
     exit_code = UpdateExitCode.SIGNATURE
 
 
 class IntegrityError(UpdaterError):
+    """Integrity check error."""
     exit_code = UpdateExitCode.INTEGRITY
 
 
 class DownloadError(UpdaterError):
+    """Download error."""
     exit_code = UpdateExitCode.DOWNLOAD
 
 
 class StagingError(UpdaterError):
+    """Staging error."""
     exit_code = UpdateExitCode.STAGING
 
 
 class ActivationError(UpdaterError):
+    """Activation error."""
     exit_code = UpdateExitCode.ACTIVATION
 
 
 class RollbackError(UpdaterError):
+    """Rollback error."""
     exit_code = UpdateExitCode.ROLLBACK
 
 
 class BusyError(UpdaterError):
+    """Update lock busy error."""
     exit_code = UpdateExitCode.BUSY
 
 
@@ -90,6 +99,7 @@ DEFAULT_STABLE_MANIFEST_URL = (
 
 @dataclass(frozen=True)
 class SignatureResult:
+    """Signature verification result."""
     verified: bool
     fingerprint: str = ""
     detail: str = ""
@@ -100,6 +110,7 @@ class SignatureResult:
 
 @dataclass(frozen=True)
 class ReleaseManifest:
+    """Release manifest."""
     schema: int
     product: str
     channel: str
@@ -114,6 +125,7 @@ class ReleaseManifest:
 
     @property
     def tag(self) -> str:
+        """Return version tag."""
         base, pre = self.version[:], ""
         match = re.fullmatch(r"(\d+\.\d+\.\d+)(a|b|rc)(\d+)", self.version)
         if match:
@@ -122,10 +134,12 @@ class ReleaseManifest:
 
     @property
     def prerelease(self) -> bool:
+        """Check if prerelease version."""
         match = _SEMVER_RE.fullmatch(self.version)
         return bool(match and match.group("pre"))
 
     def as_dict(self) -> dict[str, Any]:
+        """Convert to dictionary."""
         return {
             "schema": self.schema,
             "product": self.product,
@@ -150,6 +164,7 @@ class ReleaseManifest:
 
 @dataclass(frozen=True)
 class UpdateState:
+    """Update state."""
     active_version: str | None = None
     active_sequence: int = -1
     active_channel: str | None = None
@@ -161,6 +176,7 @@ class UpdateState:
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> "UpdateState":
+        """Create instance from mapping."""
         releases = value.get("releases", [])
         if not isinstance(releases, list) or not all(isinstance(item, dict) for item in releases):
             raise ManifestError("updater state has invalid releases")
@@ -189,6 +205,7 @@ class UpdateState:
         )
 
     def as_dict(self) -> dict[str, Any]:
+        """Convert to dictionary."""
         return {
             "active_version": self.active_version,
             "active_sequence": self.active_sequence,
@@ -203,6 +220,7 @@ class UpdateState:
 
 @dataclass(frozen=True)
 class UpdateResult:
+    """Update operation result."""
     exit_code: int
     message: str
     state: UpdateState
@@ -212,15 +230,18 @@ class UpdateResult:
 
     @property
     def ok(self) -> bool:
+        """Check if operation succeeded."""
         return self.exit_code == UpdateExitCode.OK
 
     @property
     def success(self) -> bool:
+        """Check if operation was successful."""
         return self.ok
 
 
 @dataclass(frozen=True)
 class CheckResult:
+    """Update check result."""
     manifest: ReleaseManifest | None
     state: UpdateState
     update_available: bool
@@ -229,11 +250,13 @@ class CheckResult:
 
     @property
     def ok(self) -> bool:
+        """Check if operation succeeded."""
         return self.exit_code == UpdateExitCode.OK and self.manifest is not None
 
 
 @dataclass(frozen=True)
 class UpdaterConfig:
+    """Updater configuration."""
     paths: WpfyPaths = PATHS
     product: str = "wpfy"
     manifest_url: str = field(default_factory=lambda: os.environ.get("WPFY_UPDATE_MANIFEST_URL", DEFAULT_STABLE_MANIFEST_URL))
@@ -265,10 +288,12 @@ class UpdaterConfig:
 
 
 class CommandRunner(Protocol):
+    """Command runner interface."""
     def __call__(self, argv: Sequence[str]) -> Any: ...
 
 
 class Fetcher(Protocol):
+    """Remote resource fetcher interface."""
     def __call__(self, url: str, destination: Path, max_bytes: int) -> None: ...
 
 
@@ -301,6 +326,7 @@ def _timestamp(value: Any, field_name: str) -> _datetime.datetime:
 
 def _parse_json_strict(text: str) -> Any:
     def pairs(items: list[tuple[str, Any]]) -> dict[str, Any]:
+        """Return key-value pairs."""
         result: dict[str, Any] = {}
         for key, value in items:
             if key in result:
@@ -309,6 +335,7 @@ def _parse_json_strict(text: str) -> Any:
         return result
 
     def invalid_constant(value: str) -> Any:
+        """Invalid constant."""
         raise ManifestError(f"invalid JSON constant: {value}")
 
     try:
@@ -538,6 +565,7 @@ def atomic_write_json(path: str | Path, value: Mapping[str, Any], *, mode: int =
 
 
 def read_state(path: str | Path) -> UpdateState:
+    """Read state."""
     target = Path(path)
     if not target.exists() and not target.is_symlink():
         return UpdateState()
@@ -615,6 +643,7 @@ def load_signed_manifest(
     runner: CommandRunner | None = None,
     now: _datetime.datetime | None = None,
 ) -> ReleaseManifest:
+    """Load signed manifest."""
     result = verify_manifest_signature(
         manifest_path, signature_path, config.keyring_path or "", config.signer_fingerprint,
         runner=runner, timeout_seconds=config.gpg_timeout_seconds,
@@ -958,9 +987,11 @@ class Updater:
 
     @property
     def paths(self) -> WpfyPaths:
+        """Paths."""
         return self.config.paths
 
     def status(self) -> UpdateState:
+        """Return status."""
         return read_state(self.paths.update_state_path)
 
     def _save_state(self, state: UpdateState) -> None:
@@ -1050,6 +1081,7 @@ class Updater:
         manifest_path: str | Path | None = None,
         signature_path: str | Path | None = None,
     ) -> CheckResult:
+        """Check."""
         state = self.status()
         try:
             manifest = self._load(channel, Path(manifest_path) if manifest_path else None, Path(signature_path) if signature_path else None)
@@ -1066,6 +1098,7 @@ class Updater:
         signature_path: str | Path | None = None,
         wheel_path: str | Path | None = None,
     ) -> UpdateResult:
+        """Apply changes."""
         try:
             with _UpdateLock(Path(self.paths.update_lock_path)):
                 self._recover_locked()
@@ -1154,6 +1187,7 @@ class Updater:
             return UpdateResult(int(UpdateExitCode.ERROR), "updater operation failed", self.status(), changed=False)
 
     def rollback(self, version: str | None = None) -> UpdateResult:
+        """Rollback changes."""
         try:
             with _UpdateLock(Path(self.paths.update_lock_path)):
                 self._recover_locked()
@@ -1325,6 +1359,7 @@ def _prune_releases(root: Path, retain: int, keep: set[Path]) -> None:
     if isinstance(retain, bool) or not isinstance(retain, int) or retain < 0:
         raise ValueError("retain must be a non-negative integer")
     def sequence(item: Path) -> int:
+        """Return sequence."""
         match = re.match(r"(\d+)-", item.name)
         return int(match.group(1)) if match else -1
     candidates = sorted(
@@ -1343,18 +1378,22 @@ def _prune_releases(root: Path, retain: int, keep: set[Path]) -> None:
 
 # Friendly functional API for adapters that do not need to retain an Updater instance.
 def status(*, config: UpdaterConfig | None = None) -> UpdateState:
+    """Return status."""
     return Updater(config).status()
 
 
 def check(channel: str = "stable", *, config: UpdaterConfig | None = None, **kwargs: Any) -> CheckResult:
+    """Check."""
     return Updater(config).check(channel, **kwargs)
 
 
 def apply(channel: str = "stable", *, config: UpdaterConfig | None = None, **kwargs: Any) -> UpdateResult:
+    """Apply changes."""
     return Updater(config).apply(channel, **kwargs)
 
 
 def rollback(version: str | None = None, *, config: UpdaterConfig | None = None) -> UpdateResult:
+    """Rollback changes."""
     return Updater(config).rollback(version)
 
 

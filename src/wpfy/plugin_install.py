@@ -77,6 +77,7 @@ _ZIP_CHUNK = 1024 * 1024
 
 @dataclass(frozen=True, slots=True)
 class IntegrityResult:
+    """Plugin integrity check result."""
     verified: bool
     errors: tuple[str, ...] = ()
     file_count: int = 0
@@ -87,6 +88,7 @@ class IntegrityResult:
 
 @dataclass(frozen=True, slots=True)
 class PluginInstallResult:
+    """Plugin installation result."""
     exit_code: int
     message: str
     changed: bool = False
@@ -119,11 +121,13 @@ def plugin_manifest_path() -> Path:
 
 
 def plugin_staging_dir(domain: str) -> Path:
+    """Return plugin staging directory."""
     validate_domain(domain)
     return site_dir(domain) / STAGING_SUBDIR
 
 
 def load_plugin_manifest() -> dict | None:
+    """Load plugin manifest."""
     try:
         return json.loads(plugin_manifest_path().read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):

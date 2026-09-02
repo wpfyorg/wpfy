@@ -1,3 +1,4 @@
+"""Backup schedule management via systemd timers."""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -14,6 +15,7 @@ VALID_WEEKDAYS = {"mon", "tue", "wed", "thu", "fri", "sat", "sun"}
 
 @dataclass(frozen=True, slots=True)
 class BackupSchedule:
+    """Backup schedule configuration."""
     cadence: str
     time: str
     destination_dir: str | None = None
@@ -22,14 +24,17 @@ class BackupSchedule:
 
 
 def service_path() -> Path:
+    """Return the systemd service file path."""
     return systemd.systemd_dir() / SERVICE_NAME
 
 
 def timer_path() -> Path:
+    """Return the systemd timer file path."""
     return systemd.systemd_dir() / TIMER_NAME
 
 
 def validate_time(value: str) -> bool:
+    """Validate time string in HH:MM format."""
     parts = value.split(":")
     if len(parts) != 2:
         return False
@@ -42,10 +47,12 @@ def validate_time(value: str) -> bool:
 
 
 def validate_weekday(value: str) -> bool:
+    """Validate weekday abbreviation."""
     return value in VALID_WEEKDAYS
 
 
 def install_schedule(schedule: BackupSchedule) -> RuntimeResult:
+    """Install systemd timer and service for backup schedule."""
     return systemd.install_units(
         {
             service_path(): _service_content(schedule),
@@ -57,6 +64,7 @@ def install_schedule(schedule: BackupSchedule) -> RuntimeResult:
 
 
 def disable_schedule() -> RuntimeResult:
+    """Disable and remove backup schedule."""
     return systemd.disable_units(
         [TIMER_NAME],
         [timer_path(), service_path()],
@@ -65,6 +73,7 @@ def disable_schedule() -> RuntimeResult:
 
 
 def schedule_status() -> RuntimeResult:
+    """Check backup schedule status."""
     if not timer_path().exists():
         return RuntimeResult(2, "schedule: not configured")
     return RuntimeResult(0, f"schedule: configured at {timer_path()}", ran=True)

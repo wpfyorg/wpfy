@@ -1,3 +1,4 @@
+"""DNS provider configuration and validation."""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -13,18 +14,22 @@ from .site_paths import read_env
 
 @dataclass(frozen=True, slots=True)
 class CloudflareConfig:
+    """Cloudflare DNS provider configuration."""
     token: str
 
 
 class DNSConfigError(RuntimeError):
+    """DNS configuration error."""
     pass
 
 
 def cloudflare_config_path() -> Path:
+    """Return cloudflare config path."""
     return Path(current_paths().config_dir) / "dns-cloudflare.env"
 
 
 def write_cloudflare_config(config: CloudflareConfig) -> Path:
+    """Write cloudflare config."""
     path = cloudflare_config_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     with os.fdopen(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w", encoding="utf-8") as output:
@@ -35,6 +40,7 @@ def write_cloudflare_config(config: CloudflareConfig) -> Path:
 
 
 def load_cloudflare_config() -> CloudflareConfig:
+    """Load cloudflare config."""
     path = cloudflare_config_path()
     try:
         values = {key: value.strip() for key, value in read_env(path).items()}
@@ -49,12 +55,14 @@ def load_cloudflare_config() -> CloudflareConfig:
 
 
 def clear_cloudflare_config() -> None:
+    """Clear cloudflare config."""
     path = cloudflare_config_path()
     if path.exists():
         path.unlink()
 
 
 def test_cloudflare_config(config: CloudflareConfig) -> str:
+    """Get test cloudflare configuration."""
     request = Request(
         "https://api.cloudflare.com/client/v4/user/tokens/verify",
         headers={"Authorization": f"Bearer {config.token}", "Accept": "application/json"},
@@ -71,4 +79,5 @@ def test_cloudflare_config(config: CloudflareConfig) -> str:
 
 
 def redact_cloudflare_secret(message: str, config: CloudflareConfig) -> str:
+    """Redact cloudflare secret."""
     return redact_values(message, (config.token,))

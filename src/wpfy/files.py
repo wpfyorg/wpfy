@@ -1,3 +1,4 @@
+"""File operations with chroot jail enforcement."""
 from __future__ import annotations
 
 import ctypes
@@ -23,6 +24,7 @@ _DIRECTORY_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
 
 @dataclass(frozen=True)
 class Download:
+    """File download handle."""
     name: str
     size: int
     stream: BinaryIO
@@ -48,6 +50,7 @@ def _path_parts(rel_path: str) -> tuple[str, ...]:
 
 
 def normalise_path(rel_path: str) -> str:
+    """Return normalise path."""
     return "/".join(_path_parts(rel_path))
 
 
@@ -61,6 +64,7 @@ def _open_directory(path: Path | str, *, dir_fd: int | None = None) -> int:
 
 
 def resolve_in_jail(domain: str, rel_path: str) -> Path:
+    """Resolve in jail."""
     validate_domain(domain)
     if not site_exists(domain):
         raise FileNotFoundError(f"site not found: {domain}")
@@ -178,6 +182,7 @@ def _entry_type(metadata: os.stat_result) -> str:
 
 
 def list_files(domain: str, rel_path: str = "") -> dict:
+    """List files."""
     directory_fd = _open_target_fd(domain, rel_path, os.O_RDONLY | os.O_DIRECTORY)
     try:
         entries = []
@@ -212,6 +217,7 @@ def _read_limited(fd: int, limit: int) -> bytes:
 
 
 def read_file(domain: str, rel_path: str) -> dict:
+    """Read file."""
     fd = _open_target_fd(domain, rel_path, os.O_RDONLY)
     try:
         metadata = os.fstat(fd)
@@ -278,6 +284,7 @@ def _replace_from_writer(domain: str, directory_fd: int, name: str, writer) -> N
 
 
 def write_file(domain: str, rel_path: str, content: str) -> dict:
+    """Write file."""
     _require_non_root(rel_path)
     if not isinstance(content, str):
         raise ValueError("content must be a string")
@@ -287,6 +294,7 @@ def write_file(domain: str, rel_path: str, content: str) -> dict:
     directory_fd, name = _open_parent_fd(domain, rel_path)
 
     def writer(fd: int) -> None:
+        """Writer."""
         view = memoryview(data)
         while view:
             written = os.write(fd, view)
@@ -300,6 +308,7 @@ def write_file(domain: str, rel_path: str, content: str) -> dict:
 
 
 def upload_file(domain: str, rel_path: str, stream: BinaryIO, content_length: int) -> dict:
+    """Upload file."""
     _require_non_root(rel_path)
     if not isinstance(content_length, int) or content_length < 0:
         raise ValueError("invalid upload length")
@@ -308,6 +317,7 @@ def upload_file(domain: str, rel_path: str, stream: BinaryIO, content_length: in
     directory_fd, name = _open_parent_fd(domain, rel_path)
 
     def writer(fd: int) -> None:
+        """Writer."""
         remaining = content_length
         while remaining:
             chunk = stream.read(min(_CHUNK_BYTES, remaining))
@@ -327,6 +337,7 @@ def upload_file(domain: str, rel_path: str, stream: BinaryIO, content_length: in
 
 
 def open_download(domain: str, rel_path: str) -> Download:
+    """Open download."""
     fd = _open_target_fd(domain, rel_path, os.O_RDONLY)
     try:
         metadata = os.fstat(fd)
@@ -340,6 +351,7 @@ def open_download(domain: str, rel_path: str) -> Download:
 
 
 def make_directory(domain: str, rel_path: str) -> dict:
+    """Make directory."""
     _require_non_root(rel_path)
     directory_fd, name = _open_parent_fd(domain, rel_path)
     try:
@@ -383,6 +395,7 @@ def _rename_noreplace(source_fd: int, source_name: str, target_fd: int, target_n
 
 
 def rename_path(domain: str, rel_path: str, to_path: str) -> dict:
+    """Return rename path."""
     source_normalised = _require_non_root(rel_path)
     target_normalised = _require_non_root(to_path)
     if source_normalised == target_normalised:
@@ -425,6 +438,7 @@ def _remove_tree(parent_fd: int, name: str) -> None:
 
 
 def delete_path(domain: str, rel_path: str, confirm: str | None = None) -> dict:
+    """Delete path."""
     normalised = _require_non_root(rel_path)
     directory_fd, name = _open_parent_fd(domain, rel_path)
     try:
@@ -452,6 +466,7 @@ def delete_path(domain: str, rel_path: str, confirm: str | None = None) -> dict:
 
 
 def chmod_path(domain: str, rel_path: str, mode: str) -> dict:
+    """Return chmod path."""
     _require_non_root(rel_path)
     if not isinstance(mode, str) or mode not in ALLOWED_MODES:
         raise ValueError("mode must be one of: " + ", ".join(sorted(ALLOWED_MODES)))

@@ -1,3 +1,4 @@
+"""Systemd unit installation and management."""
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping, Sequence
@@ -10,14 +11,17 @@ from .site_runtime import RuntimeResult
 
 
 def systemd_dir() -> Path:
+    """Return systemd directory."""
     return Path(os.environ.get("WPFY_SYSTEMD_DIR", "/etc/systemd/system"))
 
 
 def command_line(command: Sequence[str]) -> str:
+    """Command line."""
     return " ".join(shlex.quote(part) for part in command)
 
 
 def run_systemctl(command: list[str]) -> RuntimeResult:
+    """Run systemctl."""
     try:
         proc = subprocess.run(command, check=False, capture_output=True, text=True)
     except FileNotFoundError:
@@ -29,6 +33,7 @@ def run_systemctl(command: list[str]) -> RuntimeResult:
 
 
 def install_units(units: Mapping[Path, str], timer_names: Sequence[str], success_message: str) -> RuntimeResult:
+    """Install units."""
     if os.environ.get("WPFY_SKIP_RUNTIME") == "1":
         return RuntimeResult(0, "skipped by WPFY_SKIP_RUNTIME", skipped=True)
     try:
@@ -45,6 +50,7 @@ def install_units(units: Mapping[Path, str], timer_names: Sequence[str], success
 
 
 def disable_units(timer_names: Sequence[str], owned_paths: Iterable[Path], success_message: str) -> RuntimeResult:
+    """Disable units."""
     result = run_systemctl(["systemctl", "disable", "--now", *timer_names])
     if result.exit_code != 0:
         return result

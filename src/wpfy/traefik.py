@@ -1,3 +1,4 @@
+"""Traefik edge proxy configuration and lifecycle."""
 from __future__ import annotations
 
 import ipaddress
@@ -115,6 +116,7 @@ PANEL_EDGE_NETWORK_ULA_SUBNET = wpfy_ula_subnet(WPFY_ULA_INDEX_PANEL_EDGE_NETWOR
 
 @dataclass(frozen=True, slots=True)
 class AcmeEmailResolution:
+    """ACME email resolution result."""
     email: str
     source: str
 
@@ -137,59 +139,73 @@ class PanelEdgeNetworkFacts:
 
     @property
     def network(self) -> str:
+        """Network."""
         return self.network_name
 
     @property
     def private_subnet(self) -> str:
+        """Private subnet."""
         return self.subnet
 
     @property
     def bind_address(self) -> str:
+        """Bind address."""
         return self.gateway
 
     @property
     def gateway_address(self) -> str:
+        """Gateway address."""
         return self.gateway
 
     @property
     def bridge_name(self) -> str:
+        """Bridge name."""
         return self.bridge
 
     @property
     def bridge_interface(self) -> str:
+        """Bridge interface."""
         return self.bridge
 
     @property
     def host_bridge(self) -> str:
+        """Host bridge."""
         return self.bridge
 
     @property
     def interface(self) -> str:
+        """Interface."""
         return self.bridge
 
 
 def traefik_dir() -> Path:
+    """Return traefik directory."""
     return Path(settings.PATHS.traefik_dir)
 
 
 def traefik_compose_path() -> Path:
+    """Return traefik compose path."""
     return traefik_dir() / "compose.yaml"
 
 
 def traefik_config_path() -> Path:
+    """Return traefik config path."""
     return traefik_dir() / "traefik.yml"
 
 
 def acme_email_path() -> Path:
+    """Return acme email path."""
     return Path(settings.PATHS.config_dir) / "acme.env"
 
 
 def applied_state_path() -> Path:
+    """Return applied state path."""
     return Path(settings.PATHS.state_dir) / "traefik-applied.json"
 
 
 @contextmanager
 def traefik_transaction():
+    """Traefik transaction."""
     if getattr(_transaction_state, "held", False):
         raise RuntimeError("Traefik transaction cannot be re-entered in the same thread")
     path = Path(settings.PATHS.state_dir) / "traefik.lock"
@@ -274,6 +290,7 @@ def _set_acme_email(address: str) -> Path:
 
 
 def set_acme_email(address: str) -> Path:
+    """Set acme email."""
     with traefik_transaction():
         return _set_acme_email(address)
 
@@ -292,6 +309,7 @@ def _applied_config_hash() -> str | None:
 
 
 def applied_config_hash() -> str | None:
+    """Applied config hash."""
     with traefik_transaction():
         return _applied_config_hash()
 
@@ -301,6 +319,7 @@ def _record_applied_state(config_text: str) -> None:
 
 
 def record_applied_state(config_text: str) -> None:
+    """Record applied state."""
     with traefik_transaction():
         _record_applied_state(config_text)
 
@@ -310,6 +329,7 @@ def _clear_applied_state() -> None:
 
 
 def clear_applied_state() -> None:
+    """Clear applied state."""
     with traefik_transaction():
         _clear_applied_state()
 
@@ -419,10 +439,12 @@ def _ipv6_migration_refusal(network_name: str, mismatch: str) -> RuntimeResult:
 
 
 def ensure_traefik_network() -> RuntimeResult:
+    """Ensure traefik network."""
     return _ensure_bridge_network(TRAEFIK_NETWORK)
 
 
 def ensure_panel_edge_network() -> RuntimeResult:
+    """Ensure panel edge network."""
     return _ensure_bridge_network(PANEL_EDGE_NETWORK)
 
 
@@ -878,6 +900,7 @@ def _network_gateway(network_name: str = TRAEFIK_NETWORK) -> str | None:
 
 
 def effective_acme_email() -> str:
+    """Effective acme email."""
     with traefik_transaction():
         return resolve_acme_email().email
 
@@ -897,6 +920,7 @@ def acme_email_problem() -> str | None:
 
 
 def traefik_static_config() -> str:
+    """Get traefik static configuration."""
     with traefik_transaction():
         return _traefik_static_config()
 
@@ -971,6 +995,7 @@ def _static_config_needs_apply() -> bool:
 
 
 def static_config_needs_apply() -> bool:
+    """Static config needs apply."""
     with traefik_transaction():
         return _static_config_needs_apply()
 
@@ -1008,6 +1033,7 @@ def _resolve_docker_gid() -> int | None:
 
 
 def traefik_compose_content() -> str:
+    """Traefik compose content."""
     config_mount = str(traefik_config_path())
     dynamic_mount = str(traefik_dir() / "dynamic")
     docker_gid = _resolve_docker_gid()
@@ -1140,6 +1166,7 @@ def _ensure_traefik_scaffold() -> list[str]:
 
 
 def ensure_traefik_scaffold() -> list[str]:
+    """Ensure traefik scaffold."""
     with traefik_transaction():
         return _ensure_traefik_scaffold()
 
@@ -1286,6 +1313,7 @@ def _pull_traefik_image() -> RuntimeResult:
 
 
 def start_traefik() -> RuntimeResult:
+    """Start traefik."""
     if runtime_skip_requested():
         return RuntimeResult(0, "traefik start skipped by WPFY_SKIP_RUNTIME=1", skipped=True)
     if not docker_available():
@@ -1348,11 +1376,13 @@ def _restart_traefik_existing_locked(*, scaffold: bool = False) -> RuntimeResult
 
 
 def restart_traefik_existing() -> RuntimeResult:
+    """Restart traefik existing."""
     with traefik_transaction():
         return _restart_traefik_existing_locked(scaffold=True)
 
 
 def stop_traefik() -> RuntimeResult:
+    """Stop traefik."""
     if runtime_skip_requested() or not docker_available():
         return RuntimeResult(0, "traefik stop skipped", skipped=True)
     try:
@@ -1370,6 +1400,7 @@ def stop_traefik() -> RuntimeResult:
 
 
 def traefik_status() -> RuntimeResult:
+    """Get traefik status."""
     if runtime_skip_requested() or not docker_available():
         return RuntimeResult(0, "traefik status unavailable (Docker/Compose not available)", skipped=True)
     if not traefik_compose_path().exists():
@@ -1398,6 +1429,7 @@ def traefik_health() -> str:
 
 
 def traefik_running() -> bool:
+    """Traefik running."""
     docker = shutil.which("docker")
     if not docker:
         return False
@@ -1411,6 +1443,7 @@ def traefik_running() -> bool:
 
 
 def reload_traefik() -> RuntimeResult:
+    """Reload traefik."""
     if runtime_skip_requested():
         return RuntimeResult(0, "traefik reload skipped by WPFY_SKIP_RUNTIME=1", skipped=True)
     if not docker_available():

@@ -1,3 +1,4 @@
+"""Site registry for fast metadata lookup."""
 from __future__ import annotations
 
 import json
@@ -14,6 +15,7 @@ from .site_paths import read_env
 
 class Registry:
 
+    """Site registry."""
     def __init__(self, path: Path | None = None) -> None:
         self._path = path or Path(current_paths().state_dir, "sites.json")
         self._sites: dict[str, dict[str, Any]] = {}
@@ -46,6 +48,7 @@ class Registry:
         return dirs
 
     def add_site(self, domain: str, metadata: dict[str, Any]) -> None:
+        """Add site."""
         entry = dict(metadata)
         entry.setdefault("domain", domain)
         entry.setdefault("flavor", "unknown")
@@ -58,6 +61,7 @@ class Registry:
         self._save()
 
     def update_site(self, domain: str, metadata: dict[str, Any]) -> None:
+        """Update site."""
         existing = self._sites.get(domain, {})
         merged = dict(existing)
         merged.update(metadata)
@@ -67,17 +71,21 @@ class Registry:
         self._save()
 
     def remove_site(self, domain: str) -> None:
+        """Remove site."""
         self._sites.pop(domain, None)
         self._save()
 
     def get_site(self, domain: str) -> dict[str, Any] | None:
+        """Get site."""
         entry = self._sites.get(domain)
         return dict(entry) if entry is not None else None
 
     def list_sites(self) -> list[dict[str, Any]]:
+        """List sites."""
         return [dict(v) for v in self._sites.values()]
 
     def sync_from_filesystem(self, sites_dir: str | None = None) -> dict[str, Any]:
+        """Sync from filesystem."""
         added, removed, updated = 0, 0, 0
         root = Path(sites_dir) if sites_dir else Path(current_paths().sites_dir)
         fs_domains: set[str] = set()
@@ -122,24 +130,30 @@ def _get_registry() -> Registry:
 
 
 def add_site(domain: str, metadata: dict[str, Any]) -> None:
+    """Add site."""
     _get_registry().add_site(domain, metadata)
 
 
 def update_site(domain: str, metadata: dict[str, Any]) -> None:
+    """Update site."""
     _get_registry().update_site(domain, metadata)
 
 
 def remove_site(domain: str) -> None:
+    """Remove site."""
     _get_registry().remove_site(domain)
 
 
 def get_site(domain: str) -> dict[str, Any] | None:
+    """Get site."""
     return _get_registry().get_site(domain)
 
 
 def list_sites() -> list[dict[str, Any]]:
+    """List sites."""
     return _get_registry().list_sites()
 
 
 def sync_from_filesystem(sites_dir: str | None = None) -> dict[str, Any]:
+    """Sync from filesystem."""
     return _get_registry().sync_from_filesystem(sites_dir)

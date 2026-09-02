@@ -1,3 +1,4 @@
+"""Anonymous usage telemetry collection and submission."""
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
@@ -21,14 +22,17 @@ _ACTIVE_STATES = frozenset({"healthy", "running"})
 
 
 def endpoint() -> str:
+    """Endpoint."""
     return os.environ.get("WPFY_TELEMETRY_ENDPOINT", TELEMETRY_ENDPOINT).strip()
 
 
 def environment_disabled() -> bool:
+    """Environment disabled."""
     return os.environ.get("WPFY_TELEMETRY", "").strip().lower() in _DISABLED_VALUES
 
 
 def enabled() -> bool:
+    """Enabled."""
     current = panel_setup.state()
     return (
         isinstance(current.get("install_id"), str)
@@ -68,6 +72,7 @@ def _active_site_count(sites: list[dict]) -> int:
 
 
 def payload() -> dict:
+    """Payload."""
     current = panel_setup.state()
     sites = list_sites()
     os_name, release = _os_release()
@@ -83,10 +88,12 @@ def payload() -> dict:
 
 
 def set_enabled(value: bool) -> None:
+    """Set enabled."""
     panel_setup.set_telemetry_enabled(value)
 
 
 def status() -> dict:
+    """Return status."""
     current = panel_setup.state()
     return {
         "stored_enabled": bool(current.get("telemetry_enabled")),
@@ -138,4 +145,5 @@ def _send_if_due() -> None:
 
 
 def maybe_send_async() -> None:
+    """Maybe send async."""
     threading.Thread(target=_send_if_due, name="wpfy-telemetry", daemon=True).start()

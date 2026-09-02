@@ -1,3 +1,4 @@
+"""SFTP server lifecycle per site."""
 from __future__ import annotations
 
 from dataclasses import replace
@@ -103,6 +104,7 @@ def _sftp_ufw_note(domain: str, host_port: str) -> str:
 
 
 def ensure_sftp_container(domain: str, password: str | None = None) -> RuntimeResult:
+    """Ensure sftp container."""
     try:
         validate_domain(domain)
     except ValueError as exc:
@@ -161,6 +163,7 @@ def ensure_sftp_container(domain: str, password: str | None = None) -> RuntimeRe
 
 
 def rotate_sftp_password(domain: str, password: str | None = None) -> RuntimeResult:
+    """Rotate sftp password."""
     password = password or generated_secret()[:16]
     result = ensure_sftp_container(domain, password=password)
     record_event(
@@ -198,6 +201,7 @@ def _delete_ufw_note(domain: str, host_port: str) -> str:
 
 
 def remove_sftp_container(domain: str) -> RuntimeResult:
+    """Remove sftp container."""
     try:
         validate_domain(domain)
     except ValueError as exc:
@@ -283,6 +287,7 @@ def remove_sftp_container(domain: str) -> RuntimeResult:
 
 
 def sftp_status(domain: str) -> RuntimeResult:
+    """Get sftp status."""
     try:
         validate_domain(domain)
     except ValueError as exc:

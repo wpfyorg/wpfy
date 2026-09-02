@@ -1,3 +1,4 @@
+"""Secret redaction utilities."""
 from __future__ import annotations
 
 import re
@@ -8,6 +9,7 @@ REDACTION_MARKER: Final = "***REDACTED***"
 
 
 def redact_values(text: str, values: Iterable[str]) -> str:
+    """Redact values."""
     secrets = sorted({value for value in values if value}, key=len, reverse=True)
     if not secrets:
         return text

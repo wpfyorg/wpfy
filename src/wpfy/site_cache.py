@@ -1,3 +1,4 @@
+"""Site-level cache configuration (page cache, object cache, opcache)."""
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
@@ -69,6 +70,7 @@ PLUGIN_PURGE_ARGS = {
 
 @dataclass(frozen=True, slots=True)
 class CacheActionResult:
+    """Cache action result."""
     status: str
     message: str
     exit_code: int = 0
@@ -77,16 +79,19 @@ class CacheActionResult:
 
 @dataclass(frozen=True, slots=True)
 class CacheConfigurationResult:
+    """Cache configuration result."""
     definition: SiteDefinition
     actions: tuple[CacheActionResult, ...]
     touched: tuple[str, ...] = ()
 
     @property
     def exit_code(self) -> int:
+        """Return exit code."""
         return next((action.exit_code for action in self.actions if action.exit_code != 0), 0)
 
     @property
     def message(self) -> str:
+        """Return message."""
         return "; ".join(action.message for action in self.actions if action.message)
 
 
@@ -274,6 +279,7 @@ def _cleanup(root: Path, name: str) -> None:
 
 
 def render_cache_nginx(domain: str) -> CacheActionResult:
+    """Render cache nginx."""
     definition = _definition(domain)
     plugin = validate_page_cache(definition.page_cache)
     cache_content = _cache_snippet(plugin, definition.ssl_enabled)
@@ -351,6 +357,7 @@ def _process_message(proc: ProcessResult, fallback: str) -> str:
 
 
 def install_page_cache(domain: str, plugin: str) -> CacheActionResult:
+    """Install page cache."""
     _definition(domain)
     plugin = validate_page_cache(plugin)
     selected_slug = PAGE_CACHE_PLUGIN_SLUG.get(plugin)
@@ -371,6 +378,7 @@ def install_page_cache(domain: str, plugin: str) -> CacheActionResult:
 
 
 def set_wp_cache_constants(domain: str) -> CacheActionResult:
+    """Set wp cache constants."""
     definition = _definition(domain)
     value = "true" if definition.page_cache != "none" else "false"
     proc = run_wp_cli(
@@ -389,6 +397,7 @@ def set_wp_cache_constants(domain: str) -> CacheActionResult:
 
 
 def wire_redis_backend(domain: str) -> CacheActionResult:
+    """Wire redis backend."""
     definition = _definition(domain)
     if definition.object_cache == "none":
         run_wp_cli(domain, "redis", "disable", interactive=False)
@@ -409,6 +418,7 @@ def wire_redis_backend(domain: str) -> CacheActionResult:
 
 
 def configure_site_cache(domain: str) -> CacheConfigurationResult:
+    """Configure site cache."""
     definition = _definition(domain)
     actions = (
         render_cache_nginx(domain),
@@ -420,6 +430,7 @@ def configure_site_cache(domain: str) -> CacheConfigurationResult:
 
 
 def set_page_cache(domain: str, plugin: str) -> CacheConfigurationResult:
+    """Set page cache."""
     definition = _definition(domain)
     plugin = validate_page_cache(plugin)
     desired = replace(definition, page_cache=plugin)
@@ -441,6 +452,7 @@ def set_page_cache(domain: str, plugin: str) -> CacheConfigurationResult:
 
 
 def set_object_cache(domain: str, backend: str) -> CacheConfigurationResult:
+    """Set object cache."""
     definition = _definition(domain)
     backend = validate_object_cache(backend)
     desired = replace(definition, object_cache=backend, use_redis=backend == "redis")
@@ -492,6 +504,7 @@ def _purge_rocket_files(domain: str) -> cache_operations.CacheOutcome:
 
 
 def purge_site_cache(domain: str) -> cache_operations.CacheResult:
+    """Purge site cache."""
     definition = _definition(domain)
     outcomes: list[cache_operations.CacheOutcome] = []
     purge_args = PLUGIN_PURGE_ARGS.get(definition.page_cache)

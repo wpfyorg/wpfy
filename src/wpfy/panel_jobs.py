@@ -1,3 +1,4 @@
+"""Panel background job orchestration."""
 from __future__ import annotations
 
 import threading
@@ -11,6 +12,7 @@ from .events import _redact
 
 @dataclass
 class Job:
+    """Background job."""
     id: str
     action: str
     domain: str | None
@@ -26,6 +28,7 @@ _LOCK = threading.RLock()
 
 
 def create_job(action: str, domain: str | None = None) -> Job:
+    """Create job."""
     job = Job(id=uuid.uuid4().hex, action=action, domain=domain)
     with _LOCK:
         _JOBS[job.id] = job
@@ -33,6 +36,7 @@ def create_job(action: str, domain: str | None = None) -> Job:
 
 
 def complete_job(job_id: str, *, result: dict | None = None, one_time: dict | None = None) -> None:
+    """Complete job."""
     with _LOCK:
         job = _JOBS[job_id]
         job.result = result
@@ -41,6 +45,7 @@ def complete_job(job_id: str, *, result: dict | None = None, one_time: dict | No
 
 
 def fail_job(job_id: str, message: str) -> None:
+    """Fail job."""
     with _LOCK:
         job = _JOBS[job_id]
         job.result = {"error": message}
@@ -49,6 +54,7 @@ def fail_job(job_id: str, message: str) -> None:
 
 
 def append_step(job_id: str, step: str) -> None:
+    """Append step."""
     with _LOCK:
         job = _JOBS.get(job_id)
         if job is not None:
@@ -56,11 +62,13 @@ def append_step(job_id: str, step: str) -> None:
 
 
 def get_job(job_id: str) -> Job | None:
+    """Get job."""
     with _LOCK:
         return _JOBS.get(job_id)
 
 
 def consume_job(job_id: str) -> tuple[Job | None, dict | None]:
+    """Consume job."""
     with _LOCK:
         job = _JOBS.get(job_id)
         if job is None:
@@ -71,14 +79,17 @@ def consume_job(job_id: str) -> tuple[Job | None, dict | None]:
 
 
 def list_jobs() -> list[Job]:
+    """List jobs."""
     with _LOCK:
         return sorted(_JOBS.values(), key=lambda job: job.created_at, reverse=True)
 
 
 def run_job(fn: Callable[[], dict | None], *, action: str, domain: str | None = None) -> Job:
+    """Run job."""
     job = create_job(action, domain)
 
     def runner() -> None:
+        """Runner."""
         try:
             value = fn()
             if isinstance(value, tuple) and len(value) == 2:

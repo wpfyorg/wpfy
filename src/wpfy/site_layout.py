@@ -1,3 +1,4 @@
+"""Site scaffold, compose generation, backup, and WordPress provisioning."""
 from __future__ import annotations
 
 from collections.abc import Iterable
@@ -22,6 +23,7 @@ from . import site_event_pipeline
 from . import site_security
 from .events import record_event
 from .image_references import MARIADB_IMAGE, REDIS_IMAGE, WEB_IMAGE
+from . import php_runtime
 from .php_runtime import PHP_IMAGE_REPOSITORY as _PHP_IMAGE_REPOSITORY, php_image
 from .redaction import redact_values
 from .s3_backup import S3ConfigError, S3Uploader, load_s3_config, redact_s3_secrets
@@ -146,6 +148,7 @@ def _wordpress_release_sha1(url: str) -> str:
 
 
 def list_backup_archives(domain: str) -> list[Path]:
+    """List backup archives."""
     validate_domain(domain)
     backups = backups_dir(domain)
     if not backups.exists():
@@ -155,6 +158,7 @@ def list_backup_archives(domain: str) -> list[Path]:
 
 
 def latest_backup_archive(domain: str) -> RuntimeResult:
+    """Latest backup archive."""
     archives = list_backup_archives(domain)
     if not archives:
         return RuntimeResult(2, f"no backup archives found for {domain}")
@@ -162,6 +166,7 @@ def latest_backup_archive(domain: str) -> RuntimeResult:
 
 
 def prune_backup_archives(domain: str, keep: int, *, dry_run: bool = False) -> RuntimeResult:
+    """Prune backup archives."""
     validate_domain(domain)
     if keep < 0:
         return RuntimeResult(2, "keep must be 0 or greater")
@@ -184,6 +189,7 @@ def _router_rule(domain: str, *, wildcard: bool) -> str:
 
 
 def web_service_lines(spec: SiteSpec) -> list[str]:
+    """Web service lines."""
     project = domain_to_project(spec.domain)
     if spec.site_uid is None:
         raise ValueError("web_service_lines requires spec.site_uid; allocate it via ensure_site_scaffold")
@@ -271,11 +277,17 @@ def web_service_lines(spec: SiteSpec) -> list[str]:
 
 
 def compose_content(spec: SiteSpec) -> str:
+    """Compose content."""
     project = domain_to_project(spec.domain)
     if spec.site_uid is None:
         raise ValueError("compose_content requires spec.site_uid; allocate it via ensure_site_scaffold")
     user = f"{spec.site_uid}:{spec.site_uid}"
     db_image = MARIADB_IMAGE
+    app_children, app_mem, app_cpus = php_runtime.app_resources()
+    # pids_limit 512 covers the FPM master plus 8 workers with ample headroom;
+    # keep it above the derived worker count so fork() never hits the ceiling
+    # on very large hosts (children can reach 512 when RAM/CPU both allow).
+    app_pids = max(512, app_children + 12)
     lines = [f"name: {project}", "services:", *web_service_lines(spec)]
     lines.extend([
         "  app:",
@@ -283,7 +295,7 @@ def compose_content(spec: SiteSpec) -> str:
         f"    container_name: {project}-app",
         "    restart: unless-stopped",
         f'    user: "{user}"',
-        *compose_hardening_lines(512, "512m", "1.00"),
+        *compose_hardening_lines(app_pids, app_mem, app_cpus),
         "    env_file:",
         "      - .env",
         "    networks:",
@@ -292,6 +304,8 @@ def compose_content(spec: SiteSpec) -> str:
         "      - ./app:/var/www/html",
         "      - ./php/zz-wpfy.ini:/usr/local/etc/php/conf.d/zz-wpfy.ini:ro",
         "      - ./php/custom.ini:/usr/local/etc/php/conf.d/zzz-custom.ini:ro",
+        "      - ./php/zz-wpfy-pool.conf:/usr/local/etc/php-fpm.d/zz-wpfy-pool.conf:ro",
+        "      - ./php/pool-custom.conf:/usr/local/etc/php-fpm.d/zzz-pool-custom.conf:ro",
         f"      - ./security/{site_event_pipeline.AUTH_LOG_FILE}:"
         f"{site_event_pipeline.AUTH_LOG_CONTAINER_PATH}",
         f"      - ./security/{site_event_pipeline.BRIDGE_MU_FILE}:"
@@ -403,10 +417,12 @@ def compose_content(spec: SiteSpec) -> str:
 
 
 def generated_secret() -> str:
+    """Generated secret."""
     return secrets.token_urlsafe(32)
 
 
 def php_ini_content(spec: SiteSpec) -> str:
+    """Php ini content."""
     memory_limit = validate_php_setting("php_memory_limit", spec.php_memory_limit)
     execution_time = validate_php_setting("php_max_execution_time", spec.php_max_execution_time)
     input_time = validate_php_setting("php_max_input_time", spec.php_max_input_time)
@@ -439,6 +455,7 @@ MANAGED_ENV_KEYS = {
 
 
 def env_content(spec: SiteSpec, existing: dict[str, str] | None = None) -> str:
+    """Env content."""
     existing = existing or {}
     values = list(spec.env_values(existing, generated_secret))
     managed = {key for key, _ in values} | MANAGED_ENV_KEYS
@@ -479,6 +496,7 @@ def _merge_tree_safely(
     excluded = set(excluded_names)
 
     def merge(source: Path, destination_fd: int, excluded_children: set[str]) -> None:
+        """Merge configurations."""
         for child in source.iterdir():
             if child.name in excluded_children:
                 continue
@@ -604,6 +622,7 @@ def _remove_entries_safely(root: Path, names: Iterable[str]) -> None:
     directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
 
     def clear(directory_fd: int) -> None:
+        """Clear."""
         for name in os.listdir(directory_fd):
             metadata = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
             if stat.S_ISDIR(metadata.st_mode):
@@ -637,6 +656,7 @@ def _remove_entries_safely(root: Path, names: Iterable[str]) -> None:
 
 
 def bootstrap_site_files(domain: str) -> RuntimeResult:
+    """Bootstrap site files."""
     validate_domain(domain)
     if os.environ.get("WPFY_SKIP_BOOTSTRAP", "0") == "1":
         return RuntimeResult(0, "bootstrap skipped by WPFY_SKIP_BOOTSTRAP=1", skipped=True)
@@ -827,6 +847,7 @@ def backup_site(
     uploader: S3Uploader | None = None,
     require_database: bool = False,
 ) -> RuntimeResult:
+    """Backup site."""
     validate_domain(domain)
     if not site_exists(domain):
         return RuntimeResult(2, f"site not found: {domain}")
@@ -984,6 +1005,7 @@ def _wordpress_config_content(env: dict[str, str]) -> str:
 
 
 def repair_wp_config_anchor(domain: str) -> RuntimeResult:
+    """Repair wp config anchor."""
     validate_domain(domain)
     config = app_dir(domain) / "wp-config.php"
     unsafe = _destination_symlink(config.parent, (config,))
@@ -1034,6 +1056,7 @@ def _ensure_wordpress_config(domain: str) -> RuntimeResult:
 
 
 def wordpress_install_state(domain: str) -> RuntimeResult:
+    """Wordpress install state."""
     validate_domain(domain)
     if runtime_skip_requested():
         return RuntimeResult(0, "wordpress install check skipped by WPFY_SKIP_RUNTIME=1", skipped=True)
@@ -1060,6 +1083,7 @@ def provision_wordpress_site(
     *,
     wp_version: str | None = None,
 ) -> RuntimeResult:
+    """Provision wordpress site."""
     validate_domain(domain)
     if runtime_skip_requested():
         return RuntimeResult(0, "wordpress provisioning skipped by WPFY_SKIP_RUNTIME=1", skipped=True)
@@ -1266,6 +1290,7 @@ def _harden_restored_permissions(domain: str) -> RuntimeResult | None:
 
 
 def restore_site(domain: str, archive_path: str) -> RuntimeResult:
+    """Restore site."""
     validate_domain(domain)
     source = Path(archive_path)
     if not source.exists():
@@ -1362,6 +1387,7 @@ def restore_site(domain: str, archive_path: str) -> RuntimeResult:
 
 
 def list_sites() -> list[dict[str, str]]:
+    """List sites."""
     with contextlib.suppress(Exception):
         sites = registry.list_sites()
         if sites:
@@ -1391,6 +1417,7 @@ def list_sites() -> list[dict[str, str]]:
 
 
 def site_info(domain: str) -> dict[str, str]:
+    """Site info."""
     validate_domain(domain)
     with contextlib.suppress(Exception):
         info = registry.get_site(domain)
@@ -1419,6 +1446,7 @@ def site_info(domain: str) -> dict[str, str]:
 
 
 def remove_site_scaffold(domain: str) -> bool:
+    """Remove site scaffold."""
     validate_domain(domain)
     path = site_dir(domain)
     removed = path.exists()
@@ -1442,6 +1470,7 @@ def remove_site_scaffold(domain: str) -> bool:
 
 
 def write_if_changed(path: Path, content: str) -> bool:
+    """Write if changed."""
     current = read_text(path)
     if current == content:
         return False
@@ -1496,6 +1525,7 @@ def _allocate_site_uid(domain: str, env: dict[str, str]) -> int:
 
 
 def chown_skip_requested() -> bool:
+    """Chown skip requested."""
     return os.environ.get("WPFY_SKIP_CHOWN", "0") == "1"
 
 
@@ -1524,6 +1554,7 @@ def _apply_site_ownership(domain: str, uid: int) -> RuntimeResult:
             directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
 
             def own_directory(directory_fd: int) -> None:
+                """Own directory."""
                 for name in os.listdir(directory_fd):
                     metadata = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
                     if stat.S_ISLNK(metadata.st_mode):
@@ -1599,6 +1630,7 @@ def apply_site_ownership(domain: str) -> RuntimeResult:
 
 
 def get_nginx_custom(domain: str) -> RuntimeResult:
+    """Get nginx custom."""
     validate_domain(domain)
     if not site_exists(domain):
         return RuntimeResult(2, f"site not found: {domain}")
@@ -1657,6 +1689,7 @@ def _validate_nginx_candidate(domain: str, content: str) -> RuntimeResult:
 
 
 def validate_nginx_custom(domain: str, content: str | None = None) -> RuntimeResult:
+    """Validate nginx custom."""
     validate_domain(domain)
     if not site_exists(domain):
         return RuntimeResult(2, f"site not found: {domain}")
@@ -1713,6 +1746,7 @@ def _validate_php_candidate(domain: str, content: str) -> RuntimeResult:
 
 
 def validate_php_custom(domain: str, content: str | None = None) -> RuntimeResult:
+    """Validate php custom."""
     validate_domain(domain)
     if not site_exists(domain):
         return RuntimeResult(2, f"site not found: {domain}")
@@ -1727,6 +1761,7 @@ def validate_php_custom(domain: str, content: str | None = None) -> RuntimeResul
 
 
 def set_nginx_custom(domain: str, content: str) -> RuntimeResult:
+    """Set nginx custom."""
     validate_domain(domain)
     if not site_exists(domain):
         return RuntimeResult(2, f"site not found: {domain}")
@@ -1768,6 +1803,7 @@ def set_nginx_custom(domain: str, content: str) -> RuntimeResult:
 
 
 def ensure_site_scaffold(spec: SiteSpec) -> list[str]:
+    """Ensure site scaffold."""
     validate_domain(spec.domain)
     # Allocate (or reuse) this site's unique uid before rendering the templates,
     # so .env and compose.yaml both carry it.
@@ -1792,6 +1828,8 @@ def ensure_site_scaffold(spec: SiteSpec) -> list[str]:
         site_root / "php",
         site_root / "php" / "zz-wpfy.ini",
         site_root / "php" / "custom.ini",
+        site_root / "php" / "zz-wpfy-pool.conf",
+        site_root / "php" / "pool-custom.conf",
         site_root / "security",
         site_root / "security" / site_event_pipeline.AUTH_LOG_FILE,
         site_root / "security" / site_event_pipeline.BRIDGE_MU_FILE,
@@ -1819,6 +1857,7 @@ def ensure_site_scaffold(spec: SiteSpec) -> list[str]:
         spec = replace(spec, site_uid=_allocate_site_uid(spec.domain, existing_env))
     except OSError as exc:
         raise ValueError(f"unsafe scaffold destination: {exc}") from exc
+    compose_rendered = compose_content(spec)
     touched: list[str] = []
     for path in (
         site_root,
@@ -1908,7 +1947,6 @@ def ensure_site_scaffold(spec: SiteSpec) -> list[str]:
     ])
     nginx_content = "\n".join(nginx_lines)
     compose_file = compose_path(spec.domain)
-    compose_rendered = compose_content(spec)
     try:
         env_rendered = env_content(spec, existing_env)
         if _read_text_safely(site_root, env_file.name) != env_rendered:
@@ -1924,6 +1962,21 @@ def ensure_site_scaffold(spec: SiteSpec) -> list[str]:
         if not _file_exists_safely(php_root, "custom.ini"):
             _write_text_safely(php_root, "custom.ini", "")
             touched.append(str(php_root / "custom.ini"))
+        # The pool override is bind-mounted individually into the app container,
+        # so it must be rewritten in place (never inode-swapped via os.replace).
+        # Sizing goes through this module's php_runtime.app_resources so the
+        # pool file and the compose limits always agree.
+        generated_pool = php_runtime.fpm_pool_content(php_runtime.app_resources()[0])
+        if _read_text_safely(php_root, "zz-wpfy-pool.conf") != generated_pool:
+            _write_text_safely(php_root, "zz-wpfy-pool.conf", generated_pool)
+            touched.append(str(php_root / "zz-wpfy-pool.conf"))
+        if not _file_exists_safely(php_root, "pool-custom.conf"):
+            _write_text_safely(
+                php_root,
+                "pool-custom.conf",
+                "; Operator overrides for the site PHP-FPM pool. wpfy never rewrites this file.\n",
+            )
+            touched.append(str(php_root / "pool-custom.conf"))
 
         nginx_root = nginx_dir(spec.domain)
         if not _file_exists_safely(nginx_root, "cache-path.conf"):

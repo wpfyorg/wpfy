@@ -1,3 +1,4 @@
+"""Database and user management for site-level MariaDB containers."""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -19,6 +20,7 @@ _RESERVED_USERS = frozenset({"root", "mysql", "mariadb_sys", "mariadb.sys"})
 
 @dataclass(frozen=True, slots=True)
 class DatabaseResult:
+    """Database operation result."""
     exit_code: int
     message: str
     items: tuple[str, ...] = ()
@@ -82,6 +84,7 @@ def _db_sql(domain: str, sql: str, *, sensitive_values: tuple[str, ...] = ()) ->
 
 
 def list_databases(domain: str) -> DatabaseResult:
+    """List databases."""
     excluded = ",".join(_sql_string(name) for name in _SYSTEM_DATABASES)
     result = _db_sql(
         domain,
@@ -94,6 +97,7 @@ def list_databases(domain: str) -> DatabaseResult:
 
 
 def list_users(domain: str) -> DatabaseResult:
+    """List users."""
     result = _db_sql(
         domain,
         "SELECT DISTINCT User FROM mysql.user "
@@ -105,6 +109,7 @@ def list_users(domain: str) -> DatabaseResult:
 
 
 def create_database(domain: str, name: str) -> DatabaseResult:
+    """Create database."""
     name = _database_name(name)
     result = _db_sql(domain, f"CREATE DATABASE IF NOT EXISTS `{name}`;\n")
     if result.exit_code == 0:
@@ -114,6 +119,7 @@ def create_database(domain: str, name: str) -> DatabaseResult:
 
 
 def drop_database(domain: str, name: str) -> DatabaseResult:
+    """Drop database."""
     name = _database_name(name)
     result = _db_sql(domain, f"DROP DATABASE IF EXISTS `{name}`;\n")
     if result.exit_code == 0:
@@ -132,6 +138,7 @@ def create_user(
     password: str | None = None,
     grants=None,
 ) -> DatabaseResult:
+    """Create user."""
     user = _user_name(user)
     grant_names: tuple[str, ...]
     if grants is None:
@@ -166,6 +173,7 @@ def create_user(
 
 
 def drop_user(domain: str, user: str) -> DatabaseResult:
+    """Drop user."""
     user = _user_name(user)
     result = _db_sql(domain, f"DROP USER IF EXISTS '{user}'@'%';\n")
     if result.exit_code == 0:
@@ -175,6 +183,7 @@ def drop_user(domain: str, user: str) -> DatabaseResult:
 
 
 def set_user_password(domain: str, user: str, password: str | None = None) -> DatabaseResult:
+    """Set user password."""
     user = _user_name(user)
     generated = password is None
     password = password if password is not None else secrets.token_urlsafe(18)
@@ -197,6 +206,7 @@ def set_user_password(domain: str, user: str, password: str | None = None) -> Da
 
 
 def grant(domain: str, user: str, database: str) -> DatabaseResult:
+    """Grant."""
     user = _user_name(user)
     database = _database_name(database)
     result = _db_sql(domain, _grant_sql(user, database) + "\n")

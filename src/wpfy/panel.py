@@ -1,3 +1,4 @@
+"""WPFY control panel HTTP server and API."""
 from __future__ import annotations
 
 import hmac
@@ -22,7 +23,7 @@ from urllib.parse import parse_qs, quote, unquote, urlparse
 
 from . import __version__, backup_schedule, certificate_lifecycle, events, fail2ban_docker, fail2ban_host, files, firewall_ports, metrics, operational_inspection, panel_auth, panel_jobs, panel_setup, s3_backup, settings, smtp, sftp, telemetry
 from . import site_cache, site_cron, site_database
-from . import site_configuration, site_lifecycle, site_security
+from . import php_runtime, site_configuration, site_lifecycle, site_security
 from .php_runtime import DEFAULT_PHP_VERSION, SUPPORTED_PHP_VERSIONS
 
 # Login Shield presentation labels (t17). Enforcement lives in
@@ -339,6 +340,7 @@ def refresh_trusted_edge_networks() -> tuple[str, ...]:
 
 @dataclass(frozen=True, slots=True)
 class PanelConfig:
+    """Panel configuration."""
     host: str = "127.0.0.1"
     port: int = DEFAULT_PANEL_PORT
     token: str = ""
@@ -359,6 +361,7 @@ class PanelConfig:
 
 @dataclass(frozen=True, slots=True)
 class RouteMeta:
+    """Route metadata."""
     action: str
     scope: str
     mutates: bool = False
@@ -369,6 +372,7 @@ class RouteMeta:
 
 @dataclass(frozen=True, slots=True)
 class RawBody:
+    """Raw request body marker."""
     stream: object
     content_length: int
 
@@ -382,6 +386,7 @@ class _FileManagerProxyResponse:
 
 @dataclass(frozen=True, slots=True)
 class Route:
+    """HTTP route definition."""
     method: str
     pattern: re.Pattern[str]
     handler: object
@@ -389,6 +394,7 @@ class Route:
 
 
 class PanelError(Exception):
+    """Panel HTTP error."""
     def __init__(self, status: int, message: str, headers: dict[str, str] | None = None) -> None:
         super().__init__(message)
         self.status = status
@@ -410,20 +416,24 @@ class _PanelHTTPServer(ThreadingHTTPServer):
         self._reaper_stop = threading.Event()
 
     def get_request(self):
+        """Get request."""
         request, client_address = super().get_request()
         request.settimeout(PANEL_SOCKET_TIMEOUT)
         return request, client_address
 
     def server_close(self):
+        """Server close."""
         self._reaper_stop.set()
         super().server_close()
 
 
 def generate_panel_token() -> str:
+    """Generate panel token."""
     return secrets.token_urlsafe(32)
 
 
 def validate_loopback_host(host: str) -> None:
+    """Validate loopback host."""
     try:
         if ipaddress.ip_address(host).is_loopback:
             return
@@ -664,6 +674,7 @@ def _internal_error_payload(exc: object) -> dict[str, str]:
 
 
 def authorize(principal, meta: RouteMeta, domain: str | None) -> None:
+    """Authorize."""
     if principal is None:
         raise PanelError(401, "missing or invalid token")
     if principal == RUN_TOKEN_ADMIN:
@@ -817,6 +828,7 @@ def _job_payload(job: panel_jobs.Job, *, one_time: dict | None = None) -> dict:
 
 def _start_job(job: panel_jobs.Job, fn, *, actor: str = RUN_TOKEN_ADMIN) -> None:
     def runner() -> None:
+        """Runner."""
         try:
             result, one_time = fn()
             panel_jobs.complete_job(job.id, result=result, one_time=one_time)
@@ -929,14 +941,7 @@ def _memory_total_bytes() -> int | None:
     instead of failing the whole overview. WPFY_TEST_PROC_DIR redirects the
     read for offline tests.
     """
-    proc_dir = os.environ.get("WPFY_TEST_PROC_DIR") or "/proc"
-    try:
-        for line in Path(proc_dir, "meminfo").read_text(encoding="utf-8").splitlines():
-            if line.startswith("MemTotal:"):
-                return int(line.split()[1]) * 1024
-    except (OSError, ValueError, IndexError):
-        return None
-    return None
+    return php_runtime.host_memory_total_bytes()
 
 
 # public_bind_address() may run three sequential external lookups with a 3s
@@ -1009,6 +1014,7 @@ def api_update_check() -> dict[str, object]:
 
 
 def api_overview() -> dict:
+    """Api overview."""
     facts = operational_inspection.aggregate_info()
     # `aggregate_info` carries the `docker compose ps` table, which is what
     # `wpfy info` should print and not what a dashboard card can show -- the card
@@ -1026,10 +1032,12 @@ def api_overview() -> dict:
 
 
 def api_sites() -> dict:
+    """Api sites."""
     return {"sites": sorted(list_sites(), key=lambda site: str(site.get("domain", "")))}
 
 
 def api_site_detail(domain: str) -> dict:
+    """Api site detail."""
     _known_domain(domain)
     try:
         return {"site": site_info(domain)}
@@ -1038,20 +1046,24 @@ def api_site_detail(domain: str) -> dict:
 
 
 def api_site_health(domain: str) -> dict:
+    """Api site health."""
     _known_domain(domain)
     return {"health": asdict(site_health(domain))}
 
 
 def api_site_diagnostics(domain: str) -> dict:
+    """Api site diagnostics."""
     _known_domain(domain)
     return {"checks": [asdict(check) for check in operational_inspection.site_diagnostics(domain)]}
 
 
 def api_system_diagnostics() -> dict:
+    """Api system diagnostics."""
     return {"checks": [asdict(check) for check in operational_inspection.system_diagnostics()]}
 
 
 def api_metrics(scope: str, range_key: str) -> dict:
+    """Api metrics."""
     if not isinstance(scope, str) or not scope:
         raise PanelError(400, "metrics scope must be a non-empty string")
     if not isinstance(range_key, str) or not range_key:
@@ -1079,11 +1091,13 @@ def api_site_services(domain: str) -> dict:
 
 
 def api_metrics_latest() -> dict:
+    """Api metrics latest."""
     samples = metrics.latest_samples()
     return {"host_scope": metrics.HOST_SCOPE, "samples": [asdict(sample) for sample in samples]}
 
 
 def api_system_services() -> dict:
+    """Get system services status."""
     # `traefik_status()` returns the whole `docker compose ps` table, header row
     # included -- right for the CLI, wrong here: the client reads this field as
     # one container's state, finds no "healthy" in the blob, and reports the
@@ -1104,6 +1118,7 @@ def api_system_services() -> dict:
 
 
 def api_site_logs(domain: str, service: str, lines: int) -> dict:
+    """Api site logs."""
     _known_domain(domain)
     if service and service not in _LOG_SERVICES:
         raise PanelError(400, f"unknown log service: {service}")
@@ -1116,6 +1131,7 @@ def api_site_logs(domain: str, service: str, lines: int) -> dict:
 
 
 def api_site_backups(domain: str) -> dict:
+    """Api site backups."""
     _known_domain(domain)
     backups = []
     for archive in list_backup_archives(domain):
@@ -1125,12 +1141,14 @@ def api_site_backups(domain: str) -> dict:
 
 
 def api_site_backup_create(domain: str) -> tuple[int, dict]:
+    """Api site backup create."""
     _known_domain(domain)
     result = backup_site(domain)
     return _operation_status(result), _runtime_payload(result)
 
 
 def api_site_restore(domain: str, archive_name: str) -> tuple[int, dict]:
+    """Api site restore."""
     _known_domain(domain)
     archive = {item.name: item for item in list_backup_archives(domain)}.get(archive_name)
     if archive is None:
@@ -1140,6 +1158,7 @@ def api_site_restore(domain: str, archive_name: str) -> tuple[int, dict]:
 
 
 def api_site_runtime(domain: str, action: str) -> tuple[int, dict]:
+    """Api site runtime."""
     _known_domain(domain)
     if action == "start":
         result = start_site_runtime(domain)
@@ -1156,6 +1175,7 @@ def api_site_runtime(domain: str, action: str) -> tuple[int, dict]:
 
 
 def api_site_sftp(domain: str) -> tuple[int, dict]:
+    """Api site sftp."""
     _known_domain(domain)
     result = sftp.sftp_status(domain)
     status, payload = _operation_status(result, not_found=True), _runtime_payload(result)
@@ -1202,6 +1222,7 @@ def _sftp_payload(result) -> dict:
 
 
 def api_site_sftp_action(domain: str, action: str) -> tuple[int, dict]:
+    """Api site sftp action."""
     _known_domain(domain)
     if action == "enable":
         # Generate here and pass explicitly, mirroring rotate: the generated
@@ -1228,6 +1249,7 @@ def api_site_sftp_action(domain: str, action: str) -> tuple[int, dict]:
 
 
 def api_site_wp(domain: str, wp_args: list) -> tuple[int, dict]:
+    """Api site wp."""
     _known_domain(domain)
     if not wp_args or not all(isinstance(arg, str) and "\x00" not in arg for arg in wp_args):
         raise PanelError(400, "wp requires a non-empty list of string arguments")
@@ -1277,6 +1299,7 @@ def _config_result_payload(result: site_configuration.ConfigurationResult) -> tu
 
 
 def api_php_settings(domain: str, body: dict | None = None) -> tuple[int, dict]:
+    """Api php settings."""
     _known_domain(domain)
     body = body or {}
     allowed = {
@@ -1318,6 +1341,7 @@ def api_php_settings(domain: str, body: dict | None = None) -> tuple[int, dict]:
 
 
 def api_databases(domain: str) -> tuple[int, dict]:
+    """Api databases."""
     _known_domain(domain)
     result = site_database.list_databases(domain)
     return _operation_status(result), {
@@ -1327,6 +1351,7 @@ def api_databases(domain: str) -> tuple[int, dict]:
 
 
 def api_db_users(domain: str) -> tuple[int, dict]:
+    """Api db users."""
     _known_domain(domain)
     result = site_database.list_users(domain)
     return _operation_status(result), {
@@ -1345,6 +1370,7 @@ def _database_result_payload(result: site_database.DatabaseResult) -> dict:
 
 
 def api_nginx_custom(domain: str) -> tuple[int, dict]:
+    """Api nginx custom."""
     _known_domain(domain)
     result = get_nginx_custom(domain)
     if result.exit_code != 0:
@@ -1405,6 +1431,7 @@ def _cache_state_payload(domain: str, definition: SiteDefinition | None = None) 
 
 
 def api_site_cache(domain: str) -> tuple[int, dict]:
+    """Api site cache."""
     return 200, {"ok": True, **_cache_state_payload(domain)}
 
 
@@ -1899,6 +1926,7 @@ def _post_db_user(principal, match, query, body):
     job = panel_jobs.create_job("site.database.user-create", domain)
 
     def operation():
+        """Operation."""
         try:
             result = site_database.create_user(domain, user, password=password, grants=database)
         except ValueError as exc:
@@ -1938,6 +1966,7 @@ def _post_db_password(principal, match, query, body):
     job = panel_jobs.create_job("site.database.user-password", domain)
 
     def operation():
+        """Operation."""
         try:
             result = site_database.set_user_password(domain, user, password=password)
         except ValueError as exc:
@@ -2643,6 +2672,7 @@ def _post_firewall_install_ufw(principal, match, query, body):
     job = panel_jobs.create_job("firewall.install-ufw", None)
 
     def operation():
+        """Operation."""
         result = firewall_ports.install_ufw()
         payload = {
             "ok": result.exit_code == 0,
@@ -2662,6 +2692,7 @@ def _post_firewall_install_fail2ban(principal, match, query, body):
     job = panel_jobs.create_job("firewall.install-fail2ban", None)
 
     def operation():
+        """Operation."""
         result = fail2ban_host.ensure_fail2ban_host()
         payload = {
             "ok": result.exit_code == 0,
@@ -2778,6 +2809,7 @@ def _post_traefik_restart(principal, match, query, body):
     job = panel_jobs.create_job("system.traefik.restart", None)
 
     def operation():
+        """Operation."""
         result = traefik.restart_traefik_existing()
         payload = _runtime_payload(result)
         if result.exit_code != 0:
@@ -2909,10 +2941,12 @@ def _post_create_site(principal, match, query, body):
     job = panel_jobs.create_job("site.create", domain)
 
     def operation():
+        """Operation."""
         admin_user = body.get("admin_user") or "admin"
         admin_email = body.get("admin_email") or f"admin@{domain}"
 
         def credentials():
+            """Get WordPress admin credentials."""
             # Shared with the CLI: blank password generates a shown-once
             # secret, a supplied one is validated and used as-is.
             return site_lifecycle.resolve_wp_admin_credentials(
@@ -2933,6 +2967,7 @@ def _post_create_site(principal, match, query, body):
                    "touched": list(result.touched), "runtime": _runtime_payload(result.runtime)}
         one_time: dict = {}
         if result.generated_password:
+            """Credentials."""
             one_time["wordpress_admin_password"] = result.generated_password
         if result.exit_code == 0:
             # Database and SFTP connection details ride the one-time payload so
@@ -3005,6 +3040,7 @@ def _delete_site(principal, match, query, body):
         return planned
     job = panel_jobs.create_job("site.delete", domain)
     def operation():
+        """Operation."""
         result = site_lifecycle.delete_site(site_lifecycle.DeleteSiteRequest(domain=domain, force=True))
         payload = {"ok": result.exit_code == 0, "exit_code": result.exit_code, "removed": result.removed,
                    "backup": _runtime_payload(result.backup), "runtime": _runtime_payload(result.runtime)}
@@ -3024,6 +3060,7 @@ def _post_backup(principal, match, query, body):
     job = panel_jobs.create_job("site.backup.create", domain)
 
     def operation():
+        """Operation."""
         _, payload = api_site_backup_create(domain)
         if not payload.get("ok"):
             raise RuntimeError(payload.get("message") or "backup failed")
@@ -3046,6 +3083,7 @@ def _post_restore(principal, match, query, body):
     job = panel_jobs.create_job("site.restore", domain)
 
     def operation():
+        """Operation."""
         _, payload = api_site_restore(domain, archive)
         if not payload.get("ok"):
             raise RuntimeError(payload.get("message") or "restore failed")
@@ -3144,6 +3182,7 @@ def _post_wp(principal, match, query, body):
     job = panel_jobs.create_job("site.wp", domain)
 
     def operation():
+        """Run wp-cli command operation."""
         # ponytail: run_wp_cli blocks on subprocess.run (no incremental hook to
         # stream into append_step); the job still frees the request immediately
         # and the full stdout/stderr land in the job result on completion.
@@ -3157,6 +3196,7 @@ def _post_wp(principal, match, query, body):
 
 
 def _post_config(principal, match, query, body):
+    """Operation."""
     domain = match.group("domain")
     _known_domain(domain)
     allowed = {"php_version", "flavor", "letsencrypt", "password", "dry_run", *_CONFIG_PHP_KEYS}
@@ -3181,6 +3221,7 @@ def _post_config(principal, match, query, body):
     job = panel_jobs.create_job("site.config", domain)
 
     def operation():
+        """Operation."""
         try:
             result = site_lifecycle.update_site(site_lifecycle.UpdateSiteRequest(
                 domain=domain, php_version=body.get("php_version"), flavor=flavor,
@@ -3589,6 +3630,7 @@ _ROUTES = (
 
 
 def make_panel_handler(config: PanelConfig, *, allow_remote_run_token: bool = False) -> type[BaseHTTPRequestHandler]:
+    """Create panel HTTP request handler class."""
     # Owned by this server, not the module: two panels in one process (as in
     # tests, which call `make_panel_server` per test) get independent budgets
     # instead of fighting over one process-lifetime dict. A fresh server
@@ -3603,17 +3645,21 @@ def make_panel_handler(config: PanelConfig, *, allow_remote_run_token: bool = Fa
     direct_public_bind = allow_remote_run_token
 
     class PanelHandler(BaseHTTPRequestHandler):
+        """Panel HTTP request handler."""
         server_version = "wpfy-panel"
         sys_version = ""
         protocol_version = "HTTP/1.1"
 
         def version_string(self) -> str:
+            """Version string."""
             return self.server_version
 
         def log_message(self, format: str, *args) -> None:
+            """Log message."""
             pass
 
         def handle_one_request(self) -> None:
+            """Handle one request command."""
             self._request_body_read = False
             super().handle_one_request()
 
@@ -3930,6 +3976,7 @@ def make_panel_handler(config: PanelConfig, *, allow_remote_run_token: bool = Fa
             return False
 
         def do_GET(self) -> None:
+            """Do get."""
             try:
                 _assert_configured_panel_host(
                     self.headers.get("Host", ""), config,
@@ -3943,6 +3990,7 @@ def make_panel_handler(config: PanelConfig, *, allow_remote_run_token: bool = Fa
             else: self._serve_static(urlparse(self.path).path)
 
         def do_POST(self) -> None:
+            """Do post."""
             try:
                 _assert_configured_panel_host(
                     self.headers.get("Host", ""), config,
@@ -3956,6 +4004,7 @@ def make_panel_handler(config: PanelConfig, *, allow_remote_run_token: bool = Fa
             else: self._send_json(404, {"error": "not found"})
 
         def do_PUT(self) -> None:
+            """Do put."""
             try:
                 _assert_configured_panel_host(
                     self.headers.get("Host", ""), config,
@@ -3969,6 +4018,7 @@ def make_panel_handler(config: PanelConfig, *, allow_remote_run_token: bool = Fa
             else: self._send_json(404, {"error": "not found"})
 
         def do_DELETE(self) -> None:
+            """Do delete."""
             try:
                 _assert_configured_panel_host(
                     self.headers.get("Host", ""), config,
@@ -3982,6 +4032,7 @@ def make_panel_handler(config: PanelConfig, *, allow_remote_run_token: bool = Fa
             else: self._send_json(404, {"error": "not found"})
 
         def do_PATCH(self) -> None:
+            """Do patch."""
             try:
                 _assert_configured_panel_host(
                     self.headers.get("Host", ""), config,
@@ -3998,6 +4049,7 @@ def make_panel_handler(config: PanelConfig, *, allow_remote_run_token: bool = Fa
 
 
 def make_panel_server(config: PanelConfig) -> ThreadingHTTPServer:
+    """Create panel HTTP server."""
     # Only the validated direct-public plain-HTTP bind may accept the printed
     # run token from a remote peer; every other mode keeps loopback-only.
     remote_token_allowed = False
@@ -4085,6 +4137,7 @@ def make_panel_server(config: PanelConfig) -> ThreadingHTTPServer:
 
 
 def panel_url(config: PanelConfig, port: int | None = None) -> str:
+    """Panel url."""
     scheme = "https" if config.self_signed_tls else "http"
     base = f"{scheme}://{panel_exposure.display_host(config.host)}:{port or config.port}/"
     if panel_auth.login_required() or config.self_signed_tls:
@@ -4097,5 +4150,6 @@ def panel_url(config: PanelConfig, port: int | None = None) -> str:
 
 
 def serve_panel(config: PanelConfig) -> None:
+    """Serve panel."""
     with make_panel_server(config) as server:
         server.serve_forever()

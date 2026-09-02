@@ -1,3 +1,4 @@
+"""S3-compatible backup storage with SigV4 authentication."""
 from __future__ import annotations
 # noqa: SIZE_OK — stdlib SigV4 client kept together to avoid a backup framework dependency.
 
@@ -37,6 +38,7 @@ REQUIRED_ENV: Final = (
 
 @dataclass(frozen=True, slots=True)
 class S3Config:
+    """S3-compatible storage configuration."""
     endpoint: str
     bucket: str
     region: str
@@ -47,13 +49,16 @@ class S3Config:
 
 
 class S3ConfigError(RuntimeError):
+    """S3 configuration error."""
     pass
 
 
 class Response(Protocol):
+    """HTTP response wrapper."""
     status: int
 
     def read(self, size: int = -1) -> bytes:
+        """Read."""
         pass
 
     def __enter__(self) -> Response:
@@ -69,12 +74,14 @@ class Response(Protocol):
 
 
 class Opener(Protocol):
+    """Custom URL opener."""
     def __call__(self, request: Request, *, timeout: int) -> Response:
         pass
 
 
 class _S3RedirectHandler(HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
+        """Redirect request."""
         source = urlparse(req.full_url)
         target = urlparse(newurl)
         if source.scheme != target.scheme or (source.hostname, source.port) != (target.hostname, target.port):
@@ -90,10 +97,12 @@ def _safe_urlopen(request: Request, *, timeout: int) -> Response:
 
 
 class S3Uploader:
+    """S3 file uploader."""
     def __init__(self, opener: Opener | None = None) -> None:
         self._opener = opener or _safe_urlopen
 
     def upload_archive(self, config: S3Config, archive_path: Path, domain: str) -> str:
+        """Upload archive."""
         key = s3_object_key(config.prefix, domain, archive_path.name)
         with archive_path.open("rb") as payload:
             payload_hash = _stream_digest(payload, "sha256")
@@ -110,6 +119,7 @@ class S3Uploader:
             return self._upload(config, key, request)
 
     def upload_bytes(self, config: S3Config, key: str, payload: bytes) -> str:
+        """Upload bytes."""
         request = signed_request(config, "PUT", key, payload)
         return self._upload(config, key, request)
 
@@ -124,6 +134,7 @@ class S3Uploader:
         return f"s3://{config.bucket}/{key}"
 
     def list_keys(self, config: S3Config, prefix: str) -> list[str]:
+        """List keys."""
         query = f"list-type=2&prefix={quote(prefix, safe='/')}"
         request = signed_request(config, "GET", "", b"", query=query)
         try:
@@ -142,6 +153,7 @@ class S3Uploader:
         ]
 
     def download_to_path(self, config: S3Config, key: str, destination: Path) -> Path:
+        """Return download to path."""
         request = signed_request(config, "GET", key)
         try:
             with self._opener(request, timeout=60) as response:
@@ -166,6 +178,7 @@ class S3Uploader:
         return destination
 
     def delete_key(self, config: S3Config, key: str) -> str:
+        """Delete key."""
         request = signed_request(config, "DELETE", key)
         try:
             with self._opener(request, timeout=60) as response:
@@ -186,6 +199,7 @@ def _profile_name(profile: str | None) -> str | None:
 
 
 def s3_config_path(profile: str | None = None) -> Path:
+    """Return s3 config path."""
     name = _profile_name(profile)
     if name is None:
         return Path(current_paths().config_dir) / CONFIG_FILENAME
@@ -193,6 +207,7 @@ def s3_config_path(profile: str | None = None) -> Path:
 
 
 def write_s3_config(config: S3Config, profile: str | None = None) -> Path:
+    """Write s3 config."""
     path = s3_config_path(profile)
     endpoint = _normalized_endpoint(config.endpoint, allow_insecure=config.allow_insecure)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -215,12 +230,14 @@ def write_s3_config(config: S3Config, profile: str | None = None) -> Path:
 
 
 def clear_s3_config(profile: str | None = None) -> None:
+    """Clear s3 config."""
     path = s3_config_path(profile)
     if path.exists():
         path.unlink()
 
 
 def load_s3_config(profile: str | None = None) -> S3Config:
+    """Load s3 config."""
     if _profile_name(profile) is None:
         env_config = _load_env_config()
         if env_config is not None:
@@ -299,19 +316,23 @@ def _normalized_endpoint(endpoint: str, *, allow_insecure: bool = False) -> str:
 
 
 def s3_object_key(prefix: str, domain: str, archive_name: str) -> str:
+    """S3 object key."""
     parts = [part for part in (prefix.strip("/"), domain, archive_name) if part]
     return "/".join(parts)
 
 
 def redact_s3_secrets(message: str, config: S3Config) -> str:
+    """Redact s3 secrets."""
     return redact_values(message, (config.access_key, config.secret_key))
 
 
 def signed_put_request(config: S3Config, key: str, payload: bytes) -> Request:
+    """Signed put request."""
     return signed_request(config, "PUT", key, payload)
 
 
 def signed_request(config: S3Config, method: str, key: str = "", payload: bytes = b"", *, query: str = "") -> Request:
+    """Signed request."""
     return _signed_request(
         config,
         method,
@@ -387,6 +408,7 @@ def _stream_digest(source: BinaryIO, algorithm: str) -> str:
 
 
 def signing_key(secret_key: str, date_stamp: str, region: str) -> bytes:
+    """Signing key."""
     date_key = hmac.new(f"AWS4{secret_key}".encode("utf-8"), date_stamp.encode("utf-8"), hashlib.sha256).digest()
     region_key = hmac.new(date_key, region.encode("utf-8"), hashlib.sha256).digest()
     service_key = hmac.new(region_key, SERVICE.encode("utf-8"), hashlib.sha256).digest()

@@ -1,3 +1,4 @@
+"""Event logging and audit trail."""
 from __future__ import annotations
 
 import json
@@ -28,6 +29,7 @@ _QUOTED_KEY_ASSIGNMENT = re.compile(
 
 
 def event_log_path() -> Path:
+    """Return event log path."""
     return Path(current_paths().state_dir) / "events" / "events.jsonl"
 
 
@@ -77,6 +79,7 @@ def record_event(
     actor="cli",
     job_id=None,
 ) -> dict:
+    """Record event."""
     event = _json_safe(_redact({
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "action": str(action),
@@ -102,6 +105,7 @@ def record_event(
 
 
 def list_events(limit=200, domain=None, action=None) -> list[dict]:
+    """List events."""
     try:
         requested = max(0, int(limit))
     except (TypeError, ValueError):

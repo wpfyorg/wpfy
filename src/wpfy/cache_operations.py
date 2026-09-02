@@ -1,3 +1,4 @@
+"""Cache clearing operations across sites."""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -10,6 +11,7 @@ from .site_runtime import compose_command, docker_available, runtime_skip_reques
 
 @dataclass(frozen=True, slots=True)
 class CacheRequest:
+    """Cache clearing request specification."""
     domain: str | None = None
     redis: bool = False
     opcache: bool = False
@@ -18,6 +20,7 @@ class CacheRequest:
 
 @dataclass(frozen=True, slots=True)
 class CacheOutcome:
+    """Single cache operation outcome."""
     domain: str
     cache: str
     status: str
@@ -26,11 +29,13 @@ class CacheOutcome:
 
 @dataclass(frozen=True, slots=True)
 class CacheResult:
+    """Aggregate cache operation result."""
     outcomes: tuple[CacheOutcome, ...]
     no_sites_found: bool = False
 
     @property
     def exit_code(self) -> int:
+        """Return exit code based on outcomes."""
         return 1 if any(outcome.status == "error" for outcome in self.outcomes) else 0
 
 
@@ -81,6 +86,7 @@ def _opcache(domain: str) -> CacheOutcome:
 
 
 def clear(request: CacheRequest) -> CacheResult:
+    """Clear caches for one or all sites."""
     selected = ("nginx", "redis", "opcache") if request.clear_all else tuple(
         cache for cache, enabled in (
             ("redis", request.redis),

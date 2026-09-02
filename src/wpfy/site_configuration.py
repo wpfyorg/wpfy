@@ -1,3 +1,4 @@
+"""Site configuration management (PHP settings, Adminer)."""
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
@@ -16,6 +17,7 @@ _DEFAULT_ADMINER_PORT = 8081
 
 @dataclass(frozen=True, slots=True)
 class ConfigurationResult:
+    """Site configuration result."""
     exit_code: int
     message: str
     changes: tuple[str, ...] = ()
@@ -31,6 +33,7 @@ def _definition(domain: str) -> SiteDefinition:
 
 
 def php_settings(domain: str) -> dict[str, str]:
+    """Php settings."""
     definition = _definition(domain)
     return {name: getattr(definition, name) for name in PHP_SETTING_FIELDS}
 
@@ -60,6 +63,7 @@ def update_php_settings(
     reset: bool = False,
     dry_run: bool = False,
 ) -> ConfigurationResult:
+    """Update php settings."""
     definition = _definition(domain)
     requested = {
         "php_memory_limit": php_memory_limit,
@@ -170,6 +174,7 @@ def configure_adminer(
     port: int | str | None = None,
     dry_run: bool = False,
 ) -> ConfigurationResult:
+    """Configure adminer."""
     definition = _definition(domain)
     if not definition.use_mysql:
         return ConfigurationResult(2, f"site has no database service: {domain}")

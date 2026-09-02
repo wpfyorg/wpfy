@@ -1,3 +1,4 @@
+"""Site-level security (basic auth, IP restrictions, rate limiting, fail2ban)."""
 from __future__ import annotations
 
 from contextlib import contextmanager
@@ -101,6 +102,7 @@ _DEFAULT_PLUGIN_STATE = dict(_DEFAULT_SECURITY["fail2ban_plugin"])
 
 @dataclass(frozen=True, slots=True)
 class SecurityResult:
+    """Security configuration result."""
     exit_code: int
     message: str
     changed: bool = False
@@ -109,6 +111,7 @@ class SecurityResult:
 
 @dataclass(frozen=True, slots=True)
 class SecurityPreflightResult:
+    """Security preflight check result."""
     warnings: tuple[str, ...] = ()
 
 
@@ -120,6 +123,7 @@ def _require_site(domain: str) -> Path:
 
 
 def access_log_path(domain: str) -> Path:
+    """Return access log path."""
     validate_domain(domain)
     root = Path(current_paths().sites_dir) / domain
     if not root.is_dir():
@@ -139,10 +143,12 @@ def _fail2ban_root() -> Path:
 
 
 def fail2ban_filter_path() -> Path:
+    """Return fail2ban filter path."""
     return _fail2ban_root() / "filter.d" / FAIL2BAN_FILTER_FILE
 
 
 def fail2ban_jail_path() -> Path:
+    """Return fail2ban jail path."""
     return _fail2ban_root() / "jail.d" / FAIL2BAN_JAIL_FILE
 
 
@@ -182,6 +188,7 @@ def _logrotate_path(domain: str) -> Path:
 
 
 def fail2ban_available() -> bool:
+    """Check if fail2ban is available."""
     return shutil.which("fail2ban-client") is not None
 
 
@@ -385,6 +392,7 @@ def _decode_config(content: str) -> dict:
 
 
 def load_security(domain: str) -> dict:
+    """Load security."""
     root = _require_site(domain)
     content = _safe_read(root, SECURITY_STATE)
     if content is None:
@@ -393,6 +401,7 @@ def load_security(domain: str) -> dict:
 
 
 def save_security(domain: str, config: dict) -> None:
+    """Save security."""
     root = _require_site(domain)
     candidate = dict(config)
     if not isinstance(candidate.get("login_rate_limit", False), bool):
@@ -405,6 +414,7 @@ def save_security(domain: str, config: dict) -> None:
 
 
 def cloudflare_cidrs() -> tuple[str, ...]:
+    """Cloudflare cidrs."""
     cidrs: list[str] = []
     for raw in cloudflare_ranges._effective_cidrs():
         try:
@@ -426,6 +436,7 @@ def _cloudflare_trust_required(domain: str, config: dict) -> bool:
 
 
 def login_zone_name(domain: str) -> str:
+    """Login zone name."""
     validate_domain(domain)
     digest = hashlib.sha256(domain.encode("utf-8")).hexdigest()[:16]
     return f"wpfy_login_{digest}"
@@ -838,6 +849,7 @@ def _reload_web_service(domain: str) -> str | None:
 
 
 def apply_security_runtime(domain: str) -> SecurityResult:
+    """Apply security runtime."""
     forwarded = render_forwarded_scheme(domain)
     if forwarded.exit_code != 0:
         return forwarded
@@ -883,6 +895,7 @@ def _forwarded_scheme_content(trusted_sources: tuple[str, ...]) -> str:
 
 
 def render_forwarded_scheme(domain: str) -> SecurityResult:
+    """Render forwarded scheme."""
     root = _require_site(domain) / "nginx"
     try:
         config = load_security(domain)
@@ -972,6 +985,7 @@ def _security_snippet(domain: str, config: dict) -> tuple[str, str | None]:
 
 
 def render_security(domain: str) -> SecurityResult:
+    """Render security."""
     root = _require_site(domain)
     try:
         state_content = _safe_read(root, SECURITY_STATE)
@@ -1047,18 +1061,22 @@ def _update_list(domain: str, key: str, value: str, *, remove: bool) -> Security
 
 
 def add_deny_ip(domain: str, cidr: str) -> SecurityResult:
+    """Add deny ip."""
     return _update_list(domain, "deny_ips", cidr, remove=False)
 
 
 def remove_deny_ip(domain: str, cidr: str) -> SecurityResult:
+    """Remove deny ip."""
     return _update_list(domain, "deny_ips", cidr, remove=True)
 
 
 def add_ua_block(domain: str, pattern: str) -> SecurityResult:
+    """Add ua block."""
     return _update_list(domain, "ua_blocks", pattern, remove=False)
 
 
 def remove_ua_block(domain: str, pattern: str) -> SecurityResult:
+    """Remove ua block."""
     return _update_list(domain, "ua_blocks", pattern, remove=True)
 
 
@@ -1089,6 +1107,7 @@ def _htpasswd_apr1(password: str) -> str:
         digest = hashlib.md5(context).digest()
 
     def encode(value: int, count: int) -> str:
+        """Encode value."""
         chars = []
         for _ in range(count):
             chars.append(_APR1_ALPHABET[value & 0x3F])
@@ -1148,6 +1167,7 @@ def set_basic_auth(
     username: str | None = None,
     password: str | None = None,
 ) -> SecurityResult:
+    """Set basic auth."""
     root = _require_site(domain)
     if not isinstance(enabled, bool):
         raise TypeError("basic-auth enabled must be a boolean")
@@ -1219,6 +1239,7 @@ def set_basic_auth(
 
 
 def set_cloudflare_only(domain: str, enabled: bool) -> SecurityResult:
+    """Set cloudflare only."""
     if not isinstance(enabled, bool):
         raise TypeError("cloudflare-only enabled must be a boolean")
     config = load_security(domain)
@@ -1267,6 +1288,7 @@ def set_cloudflare_only(domain: str, enabled: bool) -> SecurityResult:
 
 
 def set_login_rate_limit(domain: str, enabled: bool) -> SecurityResult:
+    """Set login rate limit."""
     if not isinstance(enabled, bool):
         raise TypeError("login rate-limit enabled must be a boolean")
     config = load_security(domain)
@@ -2128,6 +2150,7 @@ def host_fail2ban_status() -> dict:
 
 
 def security_preflight(domain: str, change: dict) -> SecurityPreflightResult:
+    """Security preflight."""
     _require_site(domain)
     if not isinstance(change, dict):
         raise TypeError("security change must be an object")

@@ -1,3 +1,4 @@
+"""Cloudflare IP range detection and validation."""
 from __future__ import annotations
 
 import ipaddress
@@ -56,6 +57,7 @@ def _networks(cidrs: tuple[str, ...]) -> tuple[ipaddress.IPv4Network | ipaddress
 
 
 def is_cloudflare_ip(ip: str) -> bool:
+    """Check if cloudflare ip."""
     try:
         addr = ipaddress.ip_address(ip)
     except ValueError:

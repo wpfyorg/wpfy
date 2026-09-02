@@ -1,3 +1,4 @@
+"""Quantum file manager provider implementation."""
 from __future__ import annotations
 
 import json
@@ -55,6 +56,7 @@ def _read_port(domain: str) -> int:
 
 
 def provider_port(domain: str) -> int:
+    """Provider port."""
     return _read_port(domain)
 
 

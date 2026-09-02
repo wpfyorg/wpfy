@@ -1,3 +1,4 @@
+"""SSL certificate lifecycle management and ACME preflight checks."""
 from __future__ import annotations
 
 import base64
@@ -19,6 +20,7 @@ from .traefik import TRAEFIK_CONTAINER
 
 @dataclass(frozen=True)
 class SSLPreflightResult:
+    """SSL preflight validation result."""
     domain: str
     a_records: tuple[str, ...]
     aaaa_records: tuple[str, ...]
@@ -30,6 +32,7 @@ class SSLPreflightResult:
 
 
 def resolve_domain_ips(domain: str) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Resolve domain ips."""
     override = os.environ.get("WPFY_TEST_DNS_IPS")
     if override:
         ipv4: set[str] = set()
@@ -66,6 +69,7 @@ def resolve_domain_ips(domain: str) -> tuple[tuple[str, ...], tuple[str, ...]]:
 
 
 def public_ip_via_url(url: str) -> str | None:
+    """Public ip via url."""
     try:
         with urlopen(url, timeout=3) as response:
             text = response.read().decode("utf-8").strip()
@@ -78,6 +82,7 @@ def public_ip_via_url(url: str) -> str | None:
 
 
 def detect_public_ips() -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Detect public ips."""
     override = os.environ.get("WPFY_TEST_PUBLIC_IPS")
     if override:
         ipv4: set[str] = set()
@@ -115,6 +120,7 @@ def detect_public_ips() -> tuple[tuple[str, ...], tuple[str, ...]]:
 
 
 def preflight_ssl(domain: str) -> SSLPreflightResult:
+    """Preflight ssl."""
     a_records, aaaa_records = resolve_domain_ips(domain)
     public_ipv4, public_ipv6 = detect_public_ips()
 
@@ -283,6 +289,7 @@ def _parse_not_after(value: str) -> datetime.datetime | None:
 
 
 def get_cert_info(domain: str) -> dict:
+    """Get cert info."""
     certs = _read_acme_file()
     expected_domain = domain.rstrip(".").lower()
     if certs is None:
@@ -319,6 +326,7 @@ def get_cert_info(domain: str) -> dict:
 
 
 def list_certificates() -> list[dict]:
+    """List certificates."""
     certs = _read_acme_file()
     if certs is None or not certs:
         return []
@@ -344,6 +352,7 @@ def list_certificates() -> list[dict]:
 
 
 def cert_expiry_days(domain: str) -> int | None:
+    """Cert expiry days."""
     cert_info = get_cert_info(domain)
     if cert_info.get("status") != "issued":
         return None
@@ -356,6 +365,7 @@ def cert_expiry_days(domain: str) -> int | None:
 
 
 def force_renew_cert(domain: str) -> RuntimeResult:
+    """Force renew cert."""
     if runtime_skip_requested():
         return RuntimeResult(0, f"certificate renewal for {domain} skipped by WPFY_SKIP_RUNTIME=1", skipped=True)
     if not docker_available():

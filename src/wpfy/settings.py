@@ -1,3 +1,4 @@
+"""WPFY installation paths and configuration."""
 from __future__ import annotations
 
 import os
@@ -6,6 +7,7 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True)
 class WpfyPaths:
+    """WPFY installation paths."""
     install_root: str = os.environ.get("WPFY_INSTALL_ROOT", "/opt/wpfy")
     config_dir: str = os.environ.get("WPFY_CONFIG_DIR", "/etc/wpfy")
     state_dir: str = os.environ.get("WPFY_STATE_DIR", "/var/lib/wpfy")
@@ -13,14 +15,17 @@ class WpfyPaths:
 
     @property
     def app_dir(self) -> str:
+        """Return app directory."""
         return os.path.join(self.install_root, "app")
 
     @property
     def sites_dir(self) -> str:
+        """Return sites directory."""
         return os.path.join(self.install_root, "sites")
 
     @property
     def tmp_dir(self) -> str:
+        """Return tmp directory."""
         return os.path.join(self.state_dir, "tmp")
 
     @property
@@ -30,37 +35,46 @@ class WpfyPaths:
 
     @property
     def update_dir(self) -> str:
+        """Update dir."""
         return self.updater_dir
 
     @property
     def releases_dir(self) -> str:
+        """Return releases directory."""
         return os.path.join(self.install_root, "releases")
 
     @property
     def release_dir(self) -> str:
+        """Return release directory."""
         return self.releases_dir
 
     @property
     def current_link(self) -> str:
+        """Current link."""
         return os.path.join(self.install_root, "current")
 
     @property
     def update_lock_path(self) -> str:
+        """Update lock path."""
         return os.path.join(self.updater_dir, "update.lock")
 
     @property
     def update_state_path(self) -> str:
+        """Update state path."""
         return os.path.join(self.updater_dir, "state.json")
 
     @property
     def update_keyring_path(self) -> str:
+        """Update keyring path."""
         return os.environ.get("WPFY_UPDATE_KEYRING", os.path.join(self.config_dir, "update_trust.gpg"))
 
     @property
     def traefik_dir(self) -> str:
+        """Return traefik directory."""
         return os.environ.get("WPFY_TRAEFIK_DIR", os.path.join(self.install_root, "traefik"))
 
     def site_dir(self, domain: str) -> str:
+        """Return site directory."""
         return os.path.join(self.sites_dir, domain)
 
 

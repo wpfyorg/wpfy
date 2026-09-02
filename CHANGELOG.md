@@ -8,6 +8,38 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- Host-derived PHP-FPM pool sizing for managed sites: `site create` and
+  `site refresh` now generate a per-site `php/zz-wpfy-pool.conf`,
+  bind-mounted read-only into the site's app container as a second `[www]`
+  pool section loaded after the upstream image's stock pool files. PHP-FPM
+  applies later declarations of the same pool over earlier ones, so the
+  generated file extends rather than replaces the image's pool: only the
+  pool-management directives wpfy sets are overridden and the stock listen
+  socket (and therefore the nginx upstream) is untouched. Previously every
+  site inherited the stock `php:*-fpm` image pool, whose
+  `pm.max_children=5` development default wpfy had never overridden. The
+  generated pool uses `pm=ondemand` — with one pool per site, resident
+  spare workers on idle sites would multiply idle memory by site count, so
+  workers are spawned on request instead — under a host-derived ceiling.
+  The app memory limit is `min(96 MB × 4 × host CPU count, 40% of host RAM)`
+  with a 512m floor and no artificial maximum; `pm.max_children` derives from
+  it at 96 MB of working set per worker, and `cpus` is the host CPU count.
+  Sizing is per host, not per site: as with the `db`, `redis`, and `web`
+  limits wpfy already emits, `mem_limit` is a cap rather than a reservation
+  and is deliberately overcommitted across sites — under `pm=ondemand` an
+  idle site holds no workers at all — while `cpus` is a CFS quota, so
+  granting the full host costs nothing and the scheduler still shares fairly
+  under contention. Adding a site therefore never shrinks an existing site's
+  pool. The benchmark box shape (2 vCPU / 2468 MB) yields 768m, 2.00 CPUs,
+  8 workers; an 8 vCPU / 16 GB host yields 3072m, 8.00, 32; 1 vCPU / 1 GB
+  hits the floor at 512m, 1.00, 5 — identical to the pre-change default, so
+  small and dense hosts are never regressed. The generated file's header points
+  operators at `php/pool-custom.conf`, the operator override file mounted
+  after the generated override; regeneration rewrites the generated file
+  in place and never touches operator content. The WP-CLI service does not
+  mount either FPM pool file — only the app service runs the pool. See
+  ADR 0038.
+
 - IPv6 enforcement for Docker-backed edge traffic: `wpfy stack install --ipv6`
   safely merges the required Docker daemon settings, creates IPv6-enabled WPFY
   shared bridges, and exposes an explicit `wpfy stack ipv6-migrate --force`
@@ -15,6 +47,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   after the live Docker daemon confirms IPv6 is enabled.
 
 ### Changed
+
+- The generated PHP-FPM pool file (`php/zz-wpfy-pool.conf`) and the operator
+  override (`php/pool-custom.conf`) are bind-mounted individually and are
+  rewritten/created in place like `php/zz-wpfy.ini`; they are never replaced
+  by inode-swapping, which would break the existing mounts. The WP-CLI
+  service does not mount either file.
+- Existing sites adopt the pool override through the normal refresh path:
+  `wpfy refresh all --restart` regenerates each scaffold (adding
+  `php/zz-wpfy-pool.conf` and its bind mount) and recreates the site's app
+  and web containers so the new pool configuration takes effect. Refresh
+  processes sites one at a time, and each site's recreation is a brief
+  per-site 502 window; there is no fleet-wide simultaneous restart and no
+  shared-edge downtime. Sites can also be migrated individually with
+  `wpfy refresh <domain> --restart`.
 
 - WPFY-managed Docker addressing now reserves distinct ULA subnets for the
   shared edge and panel edge. Per-site networks remain IPv4-only. Panel-edge

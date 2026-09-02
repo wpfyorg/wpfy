@@ -47,6 +47,7 @@ _PEM_BODY = re.compile(
 
 @dataclass(frozen=True, slots=True)
 class SelfSignedCertificate:
+    """Self-signed TLS certificate."""
     certificate_path: Path
     key_path: Path
     fingerprint: str
@@ -54,18 +55,22 @@ class SelfSignedCertificate:
 
 
 def tls_dir() -> Path:
+    """Return tls directory."""
     return Path(settings.PATHS.config_dir) / "panel-tls"
 
 
 def certificate_path() -> Path:
+    """Return certificate path."""
     return tls_dir() / "panel-self-signed.crt"
 
 
 def key_path() -> Path:
+    """Return key path."""
     return tls_dir() / "panel-self-signed.key"
 
 
 def openssl_available() -> bool:
+    """Check if openssl is available."""
     return shutil.which("openssl") is not None
 
 

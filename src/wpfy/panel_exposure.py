@@ -1,3 +1,4 @@
+"""Panel exposure configuration (domains, bind addresses, basic auth, systemd)."""
 from __future__ import annotations
 
 import ipaddress
@@ -28,14 +29,17 @@ _DOMAIN_RULE_RE = re.compile(r"Host\(`([^`]+)`\)")
 
 
 def dynamic_dir() -> Path:
+    """Return dynamic directory."""
     return traefik.traefik_dir() / "dynamic"
 
 
 def panel_router_path() -> Path:
+    """Return panel router path."""
     return dynamic_dir() / "wpfy-panel.yml"
 
 
 def panel_service_path() -> Path:
+    """Return panel service path."""
     return systemd.systemd_dir() / _SERVICE_NAME
 
 
@@ -58,6 +62,7 @@ def _validated_target_url(target_url: str) -> str:
 
 
 def render_router_config(domain, target_url, credential: str | None = _UNSET) -> str:
+    """Render router config."""
     if not isinstance(domain, str):
         raise TypeError("panel domain must be a string")
     validate_domain(domain)
@@ -114,6 +119,7 @@ def render_router_config(domain, target_url, credential: str | None = _UNSET) ->
 
 
 def validate_edge_bind(host) -> str:
+    """Validate edge bind."""
     if not isinstance(host, str) or not host:
         raise ValueError("panel edge bind must be an IP address")
     try:
@@ -160,6 +166,7 @@ def validate_panel_edge_bind(host) -> str:
 
 
 def edge_bind_address() -> str:
+    """Edge bind address."""
     gateway = traefik._network_gateway(PANEL_EDGE_NETWORK)
     if gateway is not None:
         return validate_panel_edge_bind(gateway)
@@ -281,6 +288,7 @@ def _install_prerequisites(domain) -> list[str]:
 
 
 def expose(domain, *, confirm, port=DEFAULT_PANEL_PORT, no_install=False) -> RuntimeResult:
+    """Expose."""
     try:
         if not isinstance(domain, str):
             raise TypeError("panel domain must be a string")
@@ -388,6 +396,7 @@ def _router_details() -> dict | None:
 
 
 def exposure_status() -> dict:
+    """Get exposure status."""
     path = panel_router_path()
     router_present = path.exists()
     details = _router_details()
@@ -404,6 +413,7 @@ def exposure_status() -> dict:
 
 
 def panel_service_content(host, port) -> str:
+    """Panel service content."""
     host = validate_panel_edge_bind(host)
     _target_url(host, port)
     command = systemd.command_line([
@@ -429,6 +439,7 @@ def panel_service_content(host, port) -> str:
 
 
 def install_service(host, port) -> RuntimeResult:
+    """Install service."""
     try:
         content = panel_service_content(host, port)
         status = exposure_status()
@@ -448,6 +459,7 @@ def install_service(host, port) -> RuntimeResult:
 
 
 def remove_service() -> RuntimeResult:
+    """Remove service."""
     path = panel_service_path()
     if not path.exists():
         return RuntimeResult(0, "panel service is not installed")
@@ -455,6 +467,7 @@ def remove_service() -> RuntimeResult:
 
 
 def disable() -> RuntimeResult:
+    """Disable."""
     errors: list[str] = []
     status = exposure_status()
     try:
@@ -518,6 +531,7 @@ def public_bind_address() -> str:
 
 
 def domainless_status() -> dict:
+    """Get domainless status."""
     from . import panel_tls
 
     certificate = panel_tls.certificate_path()
@@ -615,6 +629,7 @@ _SAFE_BASIC_AUTH_USERNAME = re.compile(r"^[A-Za-z0-9._@-]{1,64}$")
 
 
 def panel_basic_auth_path() -> Path:
+    """Return panel basic auth path."""
     from . import settings
 
     return Path(settings.PATHS.config_dir) / _BASIC_AUTH_FILE
@@ -630,6 +645,7 @@ def read_panel_basic_auth() -> str | None:
 
 
 def panel_basic_auth_status() -> dict:
+    """Get panel basic auth status."""
     line = read_panel_basic_auth()
     return {
         "enabled": line is not None,
@@ -711,6 +727,7 @@ def set_panel_basic_auth(username: str, password: str) -> RuntimeResult:
 
 
 def clear_panel_basic_auth() -> RuntimeResult:
+    """Clear panel basic authentication."""
     # Convergent disable: the credential file is removed only after its bytes
     # and mode are captured, and a failed router rewrite restores both so disk
     # state matches the still-enforced router. A retry where the file is

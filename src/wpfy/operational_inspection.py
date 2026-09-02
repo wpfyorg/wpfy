@@ -1,3 +1,4 @@
+"""Operational diagnostics and health checks."""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -19,6 +20,7 @@ _current_paths = current_paths
 
 @dataclass(frozen=True, slots=True)
 class InspectionCheck:
+    """Single diagnostic check result."""
     name: str
     ok: bool | None
     message: str
@@ -26,6 +28,7 @@ class InspectionCheck:
 
 @dataclass(frozen=True, slots=True)
 class AggregateInfo:
+    """Aggregate system information."""
     sites: tuple[dict, ...]
     traefik_message: str
     docker_version: str
@@ -33,11 +36,13 @@ class AggregateInfo:
 
 @dataclass(frozen=True, slots=True)
 class ServiceInfo:
+    """Single service information."""
     heading: str
     checks: tuple[InspectionCheck, ...]
 
 
 def nginx_service_info(domain: str) -> ServiceInfo:
+    """Nginx service info."""
     project = domain_to_project(domain)
     try:
         definition = SiteDefinition.from_env(domain, read_env(env_path(domain)))
@@ -74,6 +79,7 @@ def _service_state(domain: str, service: str) -> InspectionCheck:
 
 
 def php_service_info(domain: str) -> ServiceInfo:
+    """Php service info."""
     project = domain_to_project(domain)
     state = _service_state(domain, "app")
     if state.ok is not True:
@@ -92,6 +98,7 @@ def php_service_info(domain: str) -> ServiceInfo:
 
 
 def mysql_service_info(domain: str) -> ServiceInfo:
+    """Mysql service info."""
     project = domain_to_project(domain)
     try:
         definition = SiteDefinition.from_env(domain, read_env(env_path(domain)))
@@ -127,6 +134,7 @@ def mysql_service_info(domain: str) -> ServiceInfo:
 
 
 def aggregate_info() -> AggregateInfo:
+    """Aggregate info."""
     sites = tuple(list_sites())
     try:
         traefik_message = traefik.traefik_status().message
@@ -211,6 +219,7 @@ def _registry_consistency() -> InspectionCheck:
 
 
 def site_diagnostics(domain: str) -> tuple[InspectionCheck, ...]:
+    """Site diagnostics."""
     checks = []
     root = Path(_current_paths().sites_dir) / domain
     scaffold_ok = (root / "compose.yaml").exists()
@@ -295,6 +304,7 @@ def site_diagnostics(domain: str) -> tuple[InspectionCheck, ...]:
 
 
 def security_checks(domain: str) -> tuple[InspectionCheck, ...]:
+    """Security checks."""
     checks = []
     project = domain_to_project(domain)
     containers = tuple(f"{project}-{service}" for service in ("web", "app", "db", "redis", "sftp"))

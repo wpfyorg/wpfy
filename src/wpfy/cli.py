@@ -1,3 +1,4 @@
+"""WPFY command-line interface."""
 from __future__ import annotations
 
 import argparse
@@ -100,11 +101,13 @@ from .site_runtime import (
 
 
 class WpfyHelpFormatter(argparse.ArgumentDefaultsHelpFormatter, argparse.RawDescriptionHelpFormatter):
+    """Custom help formatter for WPFY CLI."""
     pass
 
 
 @dataclass(frozen=True, slots=True)
 class CommandResult:
+    """CLI command execution result."""
     message: str
     exit_code: int = 0
     raw_output: bool = False
@@ -265,6 +268,7 @@ def _add_parser(
 
 
 def build_parser() -> argparse.ArgumentParser:
+    """Build parser."""
     parser = argparse.ArgumentParser(
         prog="wpfy",
         description="Docker-first CLI for WordPress and server administration.",
@@ -329,6 +333,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def add_info_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+    """Add info parser."""
     parser = _add_parser(
         subparsers,
         "info",
@@ -426,6 +431,7 @@ def _render_service_info(info: operational_inspection.ServiceInfo) -> CommandRes
 
 
 def handle_info(args: argparse.Namespace) -> CommandResult:
+    """Handle info command."""
     domain = getattr(args, "domain", None)
     want_nginx = getattr(args, "nginx", False)
     want_php = getattr(args, "php", False)
@@ -519,6 +525,7 @@ def _cache_configuration_result(result: site_cache.CacheConfigurationResult, tit
 
 
 def handle_cache(args: argparse.Namespace) -> CommandResult:
+    """Handle cache command."""
     domain = args.domain
     try:
         if args.cache_command == "show":
@@ -557,6 +564,7 @@ def handle_cache(args: argparse.Namespace) -> CommandResult:
 
 
 def add_cache_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+    """Add cache parser."""
     parser = _add_parser(
         subparsers,
         "cache",
@@ -581,6 +589,7 @@ def add_cache_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentPar
 
 
 def add_clean_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+    """Add clean parser."""
     parser = _add_parser(
         subparsers,
         "clean",
@@ -594,6 +603,7 @@ def add_clean_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentPar
 
 
 def handle_clean(args: argparse.Namespace) -> CommandResult:
+    """Handle clean command."""
     result = cache_operations.clear(cache_operations.CacheRequest(
         domain=getattr(args, "domain", None),
         redis=getattr(args, "redis", False),
@@ -640,6 +650,7 @@ def handle_clean(args: argparse.Namespace) -> CommandResult:
 
 
 def add_secure_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+    """Add secure parser."""
     parser = _add_parser(
         subparsers,
         "secure",
@@ -651,6 +662,7 @@ def add_secure_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentPa
 
 
 def handle_secure(args: argparse.Namespace) -> CommandResult:
+    """Handle secure command."""
     domain: str | None = getattr(args, "domain", None)
     all_sites: bool = getattr(args, "all", False)
 
@@ -687,6 +699,7 @@ def handle_secure(args: argparse.Namespace) -> CommandResult:
 
 
 def add_maintenance_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+    """Add maintenance parser."""
     parser = _add_parser(
         subparsers,
         "maintenance",
@@ -701,6 +714,7 @@ def add_maintenance_parser(subparsers: argparse._SubParsersAction[argparse.Argum
 
 
 def handle_maintenance(args: argparse.Namespace) -> CommandResult:
+    """Handle maintenance command."""
     domain: str | None = getattr(args, "domain", None)
     enable: bool = getattr(args, "enable", False)
     disable: bool = getattr(args, "disable", False)
@@ -766,6 +780,7 @@ def handle_maintenance(args: argparse.Namespace) -> CommandResult:
 
 
 def add_update_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+    """Add update parser."""
     parser = _add_parser(
         subparsers,
         "update",
@@ -837,6 +852,7 @@ def _update_error_result(args: argparse.Namespace, action: str, error: update_li
 
 
 def handle_update(args: argparse.Namespace) -> CommandResult:
+    """Handle update command."""
     check = bool(getattr(args, "check", False))
     apply = bool(getattr(args, "apply", False))
     rollback = bool(getattr(args, "rollback", False))
@@ -956,6 +972,7 @@ def _add_site_create_arguments(parser: argparse.ArgumentParser) -> None:
 
 
 def add_run_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+    """Add run parser."""
     parser = _add_parser(
         subparsers,
         "run",
@@ -973,6 +990,7 @@ def add_run_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParse
 
 
 def add_backup_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+    """Add backup parser."""
     parser = _add_parser(
         subparsers,
         "backup",
@@ -993,6 +1011,7 @@ def add_backup_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentPa
 
 
 def add_backup_prune_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+    """Add backup prune parser."""
     parser = subparsers.add_parser(
         "backup-prune",
         prog="wpfy backup prune",
@@ -1007,6 +1026,7 @@ def add_backup_prune_parser(subparsers: argparse._SubParsersAction[argparse.Argu
 
 
 def add_backup_remote_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+    """Add backup remote parser."""
     parser = subparsers.add_parser(
         "backup-remote",
         prog="wpfy backup remote",
@@ -1046,6 +1066,7 @@ def add_backup_remote_parser(subparsers: argparse._SubParsersAction[argparse.Arg
 
 
 def add_backup_edge_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+    """Add backup edge parser."""
     parser = subparsers.add_parser(
         "backup-edge",
         prog="wpfy backup edge",
@@ -1060,6 +1081,7 @@ def add_backup_edge_parser(subparsers: argparse._SubParsersAction[argparse.Argum
 
 
 def add_backup_storage_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+    """Add backup storage parser."""
     parser = subparsers.add_parser(
         "backup-storage",
         prog="wpfy backup storage",
@@ -1103,6 +1125,7 @@ def add_backup_storage_parser(subparsers: argparse._SubParsersAction[argparse.Ar
 
 
 def add_backup_schedule_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+    """Add backup schedule parser."""
     parser = subparsers.add_parser(
         "backup-schedule",
         prog="wpfy backup schedule",
@@ -1133,6 +1156,7 @@ def add_backup_schedule_parser(subparsers: argparse._SubParsersAction[argparse.A
 
 
 def add_cron_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+    """Add cron parser."""
     parser = _add_parser(
         subparsers,
         "cron",
@@ -1156,6 +1180,7 @@ def add_cron_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentPars
 
 
 def add_metrics_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+    """Add metrics parser."""
     parser = _add_parser(
         subparsers,
         "metrics",
@@ -1176,6 +1201,7 @@ def add_metrics_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentP
 
 
 def add_smtp_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+    """Add smtp parser."""
     parser = _add_parser(
         subparsers,
         "smtp",
@@ -1206,6 +1232,7 @@ def add_smtp_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentPars
 
 
 def add_dns_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+    """Add dns parser."""
     parser = _add_parser(
         subparsers,
         "dns",
@@ -1231,6 +1258,7 @@ def add_dns_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParse
 
 
 def add_restore_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+    """Add restore parser."""
     parser = _add_parser(
         subparsers,
         "restore",
@@ -1245,6 +1273,7 @@ def add_restore_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentP
 
 
 def add_restore_edge_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+    """Add restore edge parser."""
     parser = subparsers.add_parser(
         "restore-edge",
         prog="wpfy restore edge",
@@ -1258,6 +1287,7 @@ def add_restore_edge_parser(subparsers: argparse._SubParsersAction[argparse.Argu
 
 
 def add_rm_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+    """Add rm parser."""
     parser = _add_parser(
         subparsers,
         "rm",
@@ -1270,6 +1300,7 @@ def add_rm_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser
 
 
 def add_wp_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+    """Add wp parser."""
     parser = _add_parser(
         subparsers,
         "wp",
@@ -1282,6 +1313,7 @@ def add_wp_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser
 
 
 def add_version_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+    """Add version parser."""
     parser = _add_parser(
         subparsers,
         "version",
@@ -1291,6 +1323,7 @@ def add_version_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentP
 
 
 def handle_version(args: argparse.Namespace) -> CommandResult:
+    """Handle version command."""
     return CommandResult(f"wpfy {__version__}")
 
 
@@ -1320,6 +1353,7 @@ def _compose_result(proc: subprocess.CompletedProcess[str]) -> CommandResult:
 
 
 def add_compose_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+    """Add compose parser."""
     parser = _add_parser(
         subparsers,
         "compose",
@@ -1338,6 +1372,7 @@ def add_compose_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentP
 
 
 def handle_compose(args: argparse.Namespace) -> CommandResult:
+    """Handle compose command."""
     site_error = _require_existing_site(args.domain)
     if site_error:
         return site_error
@@ -1348,6 +1383,7 @@ def handle_compose(args: argparse.Namespace) -> CommandResult:
 
 
 def add_up_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+    """Add up parser."""
     parser = _add_parser(
         subparsers,
         "up",
@@ -1358,6 +1394,7 @@ def add_up_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser
 
 
 def handle_up(args: argparse.Namespace) -> CommandResult:
+    """Handle up command."""
     site_error = _require_existing_site(args.domain)
     if site_error:
         return site_error
@@ -1369,6 +1406,7 @@ def handle_up(args: argparse.Namespace) -> CommandResult:
 
 
 def add_down_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+    """Add down parser."""
     parser = _add_parser(
         subparsers,
         "down",
@@ -1380,6 +1418,7 @@ def add_down_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentPars
 
 
 def handle_down(args: argparse.Namespace) -> CommandResult:
+    """Handle down command."""
     site_error = _require_existing_site(args.domain)
     if site_error:
         return site_error
@@ -1399,6 +1438,7 @@ def handle_down(args: argparse.Namespace) -> CommandResult:
 
 
 def add_exec_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+    """Add exec parser."""
     parser = _add_parser(
         subparsers,
         "exec",
@@ -1416,6 +1456,7 @@ def add_exec_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentPars
 
 
 def handle_exec(args: argparse.Namespace) -> CommandResult:
+    """Handle exec command."""
     site_error = _require_existing_site(args.domain)
     if site_error:
         return site_error
@@ -1429,6 +1470,7 @@ def handle_exec(args: argparse.Namespace) -> CommandResult:
 
 
 def add_cp_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+    """Add cp parser."""
     parser = _add_parser(
         subparsers,
         "cp",
@@ -1445,6 +1487,7 @@ def _dangerous_copy_path(path: str) -> bool:
 
 
 def handle_cp(args: argparse.Namespace) -> CommandResult:
+    """Handle cp command."""
     site_error = _require_existing_site(args.domain)
     if site_error:
         return site_error
@@ -1454,6 +1497,7 @@ def handle_cp(args: argparse.Namespace) -> CommandResult:
 
 
 def add_pull_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+    """Add pull parser."""
     parser = _add_parser(
         subparsers,
         "pull",
@@ -1467,6 +1511,7 @@ def add_pull_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentPars
 
 
 def handle_pull(args: argparse.Namespace) -> CommandResult:
+    """Handle pull command."""
     site_error = _require_existing_site(args.domain)
     if site_error:
         return site_error
@@ -1558,6 +1603,7 @@ def _site_update_command_result(
 
 
 def add_config_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+    """Add config parser."""
     parser = _add_parser(
         subparsers,
         "config",
@@ -1666,6 +1712,7 @@ def _php_config_command_result(result: site_configuration.ConfigurationResult) -
 
 
 def handle_config(args: argparse.Namespace) -> CommandResult:
+    """Handle config command."""
     site_error = _require_existing_site(args.domain)
     if site_error:
         return site_error
@@ -1744,6 +1791,7 @@ def handle_config(args: argparse.Namespace) -> CommandResult:
 
 
 def add_edit_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+    """Add edit parser."""
     parser = _add_parser(
         subparsers,
         "edit",
@@ -1755,6 +1803,7 @@ def add_edit_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentPars
 
 
 def handle_edit(args: argparse.Namespace) -> CommandResult:
+    """Handle edit command."""
     site_error = _require_existing_site(args.domain)
     if site_error:
         return site_error
@@ -1805,6 +1854,7 @@ def handle_edit(args: argparse.Namespace) -> CommandResult:
 
 
 def add_refresh_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+    """Add refresh parser."""
     parser = _add_parser(
         subparsers,
         "refresh",
@@ -1837,6 +1887,7 @@ def _refresh_one(domain: str, *, restart: bool) -> CommandResult:
 
 
 def handle_refresh(args: argparse.Namespace) -> CommandResult:
+    """Handle refresh command."""
     if args.target != "all":
         return _refresh_one(args.target, restart=args.restart)
 
@@ -1864,6 +1915,7 @@ def handle_refresh(args: argparse.Namespace) -> CommandResult:
 
 
 def add_healthcheck_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+    """Add healthcheck parser."""
     parser = _add_parser(
         subparsers,
         "healthcheck",
@@ -2019,6 +2071,7 @@ def _healthcheck_all_sites() -> CommandResult:
 
 
 def handle_healthcheck(args: argparse.Namespace) -> CommandResult:
+    """Handle healthcheck command."""
     target = getattr(args, "health_target", None) or "all"
     if target == "disk":
         return _healthcheck_disk(args.path, args.warn, args.fail)
@@ -2058,6 +2111,7 @@ def handle_healthcheck(args: argparse.Namespace) -> CommandResult:
 
 
 def add_motd_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+    """Add motd parser."""
     parser = _add_parser(
         subparsers,
         "motd",
@@ -2092,6 +2146,7 @@ def _motd_warning_count(facts: operational_inspection.AggregateInfo) -> int:
 
 
 def handle_motd(args: argparse.Namespace) -> CommandResult:
+    """Handle motd command."""
     facts = operational_inspection.aggregate_info()
     sites = sorted(facts.sites, key=lambda site: str(site.get("domain", "")))
     warnings = _motd_warning_count(facts)
@@ -2121,6 +2176,7 @@ def handle_motd(args: argparse.Namespace) -> CommandResult:
 
 
 def add_telemetry_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+    """Add telemetry parser."""
     parser = _add_parser(subparsers, "telemetry", help="Inspect or control anonymous usage telemetry.")
     commands = parser.add_subparsers(dest="telemetry_command")
     for command in ("status", "enable", "disable"):
@@ -2130,6 +2186,7 @@ def add_telemetry_parser(subparsers: argparse._SubParsersAction[argparse.Argumen
 
 
 def handle_telemetry(args: argparse.Namespace) -> CommandResult:
+    """Handle telemetry command."""
     command = args.telemetry_command
     if command == "enable":
         telemetry.set_enabled(True)
@@ -2154,6 +2211,7 @@ def handle_telemetry(args: argparse.Namespace) -> CommandResult:
 
 
 def add_panel_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+    """Add panel parser."""
     parser = _add_parser(
         subparsers,
         "panel",
@@ -2282,6 +2340,7 @@ def _panel_user_password(args: argparse.Namespace) -> tuple[str | None, CommandR
 
 
 def handle_panel_auth(args: argparse.Namespace) -> CommandResult:
+    """Handle panel auth command."""
     try:
         if args.panel_command == "user":
             command = args.panel_user_command
@@ -2342,6 +2401,7 @@ def handle_panel_auth(args: argparse.Namespace) -> CommandResult:
 
 
 def handle_panel_exposure(args: argparse.Namespace) -> CommandResult:
+    """Handle panel exposure command."""
     try:
         if args.panel_command == "expose":
             if args.status:
@@ -2463,6 +2523,7 @@ def _is_loopback_host(host: str) -> bool:
 
 
 def handle_panel(args: argparse.Namespace) -> CommandResult:
+    """Handle panel command."""
     try:
         token, token_warning = resolve_panel_token(args)
     except (OSError, ValueError) as exc:
@@ -2558,6 +2619,7 @@ PASSWORD_SYMBOLS: Final = "!#$%&()*+,-./:;<=>?@[]^_{|}~"
 
 
 def add_utility_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+    """Add utility parser."""
     parser = _add_parser(
         subparsers,
         "utility",
@@ -2601,22 +2663,26 @@ def _generate_password(length: int, include_symbols: bool) -> str:
 
 
 def handle_utility_password(args: argparse.Namespace) -> CommandResult:
+    """Handle utility password command."""
     if not 12 <= args.length <= 128:
         return CommandResult("password length must be between 12 and 128", exit_code=2)
     return CommandResult(_generate_password(args.length, not args.no_symbols))
 
 
 def handle_utility_token(args: argparse.Namespace) -> CommandResult:
+    """Handle utility token command."""
     if not 16 <= args.bytes <= 128:
         return CommandResult("token bytes must be between 16 and 128", exit_code=2)
     return CommandResult(secrets.token_urlsafe(args.bytes))
 
 
 def handle_utility_username(args: argparse.Namespace) -> CommandResult:
+    """Handle utility username command."""
     return CommandResult(_normalize_wp_user(args.value))
 
 
 def handle_utility_uid(args: argparse.Namespace) -> CommandResult:
+    """Handle utility uid command."""
     try:
         validate_domain(args.domain)
     except ValueError as exc:
@@ -2634,6 +2700,7 @@ def handle_utility_uid(args: argparse.Namespace) -> CommandResult:
 
 
 def handle_utility_htpasswd(args: argparse.Namespace) -> CommandResult:
+    """Handle utility htpasswd command."""
     username = args.username.strip()
     if not username or not site_security._safe_htpasswd_username(username):
         return CommandResult("invalid username: use letters, digits, '_', '.', '@', or '-'", exit_code=2)
@@ -2685,6 +2752,7 @@ def _password_argument(
 
 
 def handle_db(args: argparse.Namespace) -> CommandResult:
+    """Handle db command."""
     domain = args.domain
     command = args.db_command
     try:
@@ -2725,6 +2793,7 @@ def handle_db(args: argparse.Namespace) -> CommandResult:
 
 
 def add_db_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+    """Add db parser."""
     parser = _add_parser(subparsers, "db", help="Manage per-site databases and database users.")
     parser.add_argument("domain")
     commands = parser.add_subparsers(dest="db_command")
@@ -2763,6 +2832,7 @@ def add_db_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser
 
 
 def handle_site_security(args: argparse.Namespace) -> CommandResult:
+    """Handle site security command."""
     try:
         if args.security_command == "show":
             return CommandResult(json.dumps(site_security.load_security(args.domain), indent=2, sort_keys=True))
@@ -2899,6 +2969,7 @@ def _render_login_shield_status(status: dict) -> str:
 
 
 def handle_security(args: argparse.Namespace) -> CommandResult:
+    """Handle security command."""
     try:
         if args.fail2ban_command == "status":
             return CommandResult(_render_login_shield_status(site_security.host_fail2ban_status()))
@@ -2922,6 +2993,7 @@ def handle_security(args: argparse.Namespace) -> CommandResult:
 
 
 def add_security_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+    """Add security parser."""
     parser = _add_parser(
         subparsers,
         "security",
@@ -2957,6 +3029,7 @@ def add_security_parser(subparsers: argparse._SubParsersAction[argparse.Argument
 
 
 def add_site_security_parser(site_subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+    """Add site security parser."""
     parser = _add_parser(site_subparsers, "security", help="Manage per-site nginx access controls.")
     parser.add_argument("domain")
     commands = parser.add_subparsers(dest="security_command")
@@ -3019,6 +3092,7 @@ def add_site_security_parser(site_subparsers: argparse._SubParsersAction[argpars
 
 
 def handle_site_nginx(args: argparse.Namespace) -> CommandResult:
+    """Handle site nginx command."""
     try:
         if args.nginx_command == "show":
             result = get_nginx_custom(args.domain)
@@ -3038,6 +3112,7 @@ def handle_site_nginx(args: argparse.Namespace) -> CommandResult:
 
 
 def add_site_nginx_parser(site_subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+    """Add site nginx parser."""
     parser = _add_parser(site_subparsers, "nginx", help="Inspect or safely update the generated vhost include.")
     parser.add_argument("domain")
     commands = parser.add_subparsers(dest="nginx_command")
@@ -3055,6 +3130,7 @@ def add_site_nginx_parser(site_subparsers: argparse._SubParsersAction[argparse.A
 
 
 def handle_site_php(args: argparse.Namespace) -> CommandResult:
+    """Handle site php command."""
     try:
         result = validate_php_custom(args.domain)
     except ValueError as exc:
@@ -3063,6 +3139,7 @@ def handle_site_php(args: argparse.Namespace) -> CommandResult:
 
 
 def add_site_php_parser(site_subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+    """Add site php parser."""
     parser = _add_parser(site_subparsers, "php", help="Inspect PHP operator overrides.")
     parser.add_argument("domain")
     commands = parser.add_subparsers(dest="php_command")
@@ -3071,6 +3148,7 @@ def add_site_php_parser(site_subparsers: argparse._SubParsersAction[argparse.Arg
 
 
 def handle_site_files(args: argparse.Namespace) -> CommandResult:
+    """Handle site files command."""
     try:
         if args.site_files_command == "ls":
             result = files.list_files(args.domain, args.path)
@@ -3095,6 +3173,7 @@ def handle_site_files(args: argparse.Namespace) -> CommandResult:
 
 
 def add_site_files_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+    """Add site files parser."""
     parser = _add_parser(subparsers, "files", help="Manage files inside the site's app directory.")
     parser.add_argument("domain")
     commands = parser.add_subparsers(dest="site_files_command")
@@ -3119,6 +3198,7 @@ def add_site_files_parser(subparsers: argparse._SubParsersAction[argparse.Argume
 
 
 def handle_site_cron(args: argparse.Namespace) -> CommandResult:
+    """Handle site cron command."""
     try:
         if args.site_cron_command == "list":
             jobs = site_cron.load_cron(args.domain)
@@ -3158,6 +3238,7 @@ def handle_site_cron(args: argparse.Namespace) -> CommandResult:
 
 
 def add_site_cron_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+    """Add site cron parser."""
     parser = _add_parser(
         subparsers,
         "cron",
@@ -3183,6 +3264,7 @@ def add_site_cron_parser(subparsers: argparse._SubParsersAction[argparse.Argumen
 
 
 def add_site_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+    """Add site parser."""
     parser = _add_parser(
         subparsers,
         "site",
@@ -3330,6 +3412,7 @@ def add_site_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentPars
 
 
 def add_stack_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+    """Add stack parser."""
     parser = _add_parser(
         subparsers,
         "stack",
@@ -3431,6 +3514,7 @@ def add_stack_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentPar
 
 
 def add_sftp_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+    """Add sftp parser."""
     parser = _add_parser(
         subparsers,
         "sftp",
@@ -3450,6 +3534,7 @@ def add_sftp_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentPars
 
 
 def handle_sftp(args: argparse.Namespace) -> CommandResult:
+    """Handle sftp command."""
     domain = args.domain
     password, password_error = _password_argument(
         args.password,
@@ -3470,6 +3555,7 @@ def handle_sftp(args: argparse.Namespace) -> CommandResult:
 
 
 def add_log_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+    """Add log parser."""
     parser = _add_parser(
         subparsers,
         "log",
@@ -3517,6 +3603,7 @@ def add_log_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParse
 
 
 def handle_log_show(args: argparse.Namespace) -> CommandResult:
+    """Handle log show command."""
     domain = args.domain
     try:
         site_info(domain)
@@ -3541,16 +3628,19 @@ def handle_log_show(args: argparse.Namespace) -> CommandResult:
 
 
 def handle_log_cron(args: argparse.Namespace) -> CommandResult:
+    """Handle log cron command."""
     result = cron.read_cron_log(args.lines)
     return CommandResult(result.message, exit_code=result.exit_code)
 
 
 def handle_log_events(args: argparse.Namespace) -> CommandResult:
+    """Handle log events command."""
     rows = events.list_events(limit=args.limit, domain=args.domain)
     return CommandResult("\n".join(json.dumps(row, sort_keys=True) for row in rows))
 
 
 def handle_log_reset(args: argparse.Namespace) -> CommandResult:
+    """Handle log reset command."""
     domain = args.domain
     try:
         site_info(domain)
@@ -3582,10 +3672,12 @@ def handle_log_reset(args: argparse.Namespace) -> CommandResult:
 
 
 def make_site_handler(name: str):
+    """Make site handler."""
     if name not in {"delete", "list", "info", "show", "status"}:
         raise ValueError(f"unsupported site handler: {name}")
 
     def handler(args: argparse.Namespace) -> CommandResult:
+        """Handler."""
         domain = getattr(args, "domain", None)
         if name == "list":
             try:
@@ -3735,6 +3827,7 @@ def make_site_handler(name: str):
 
 
 def handle_stack_install(args: argparse.Namespace) -> CommandResult:
+    """Handle stack install command."""
     host_tools = tuple(flag for flag in stack.HOST_TOOLS if getattr(args, flag, False))
     helpers = tuple(flag for flag in stack.HELPER_IMAGES if getattr(args, flag, False))
     result = stack.install(stack.StackInstallRequest(
@@ -3761,6 +3854,7 @@ def handle_stack_install(args: argparse.Namespace) -> CommandResult:
 
 
 def handle_stack_acme_email(args: argparse.Namespace) -> CommandResult:
+    """Handle stack acme email command."""
     if args.address is not None:
         try:
             stack.traefik.set_acme_email(args.address)
@@ -3782,6 +3876,7 @@ def handle_stack_acme_email(args: argparse.Namespace) -> CommandResult:
 
 
 def handle_stack_status(args: argparse.Namespace) -> CommandResult:
+    """Handle stack status command."""
     results: list[str] = [_section("stack status")]
 
     status = stack.status()
@@ -3805,6 +3900,7 @@ def handle_stack_status(args: argparse.Namespace) -> CommandResult:
 
 
 def handle_stack_remove(args: argparse.Namespace) -> CommandResult:
+    """Handle stack remove command."""
     result = stack.remove()
     if result.skipped:
         return CommandResult(_render_summary("stack remove", [f"Traefik: SKIP {result.message}"]))
@@ -3817,6 +3913,7 @@ def handle_stack_remove(args: argparse.Namespace) -> CommandResult:
 
 
 def handle_stack_upgrade(args: argparse.Namespace) -> CommandResult:
+    """Handle stack upgrade command."""
     result = stack.upgrade()
     lines = [_section("stack upgrade")]
     for fact in result.facts:
@@ -3829,6 +3926,7 @@ def handle_stack_upgrade(args: argparse.Namespace) -> CommandResult:
 
 
 def handle_stack_purge(args: argparse.Namespace) -> CommandResult:
+    """Handle stack purge command."""
     result = stack.purge(force=getattr(args, "force", False))
     lines = [_section("stack purge")]
     for fact in result.facts:
@@ -3842,10 +3940,12 @@ def handle_stack_purge(args: argparse.Namespace) -> CommandResult:
 
 
 def handle_stack_migrate(args: argparse.Namespace) -> CommandResult:
+    """Handle stack migrate command."""
     return CommandResult(_render_summary("stack migrate", ["not implemented for Docker-first wpfy in v1"]))
 
 
 def handle_stack_ipv6_migrate(args: argparse.Namespace) -> CommandResult:
+    """Handle stack ipv6 migrate command."""
     result = stack.ipv6_migrate(force=getattr(args, "force", False))
     lines = [_section("stack ipv6-migrate")]
     for fact in result.facts:
@@ -3883,6 +3983,7 @@ def _site_cache_selection(args: argparse.Namespace) -> tuple[str, str, str] | Co
 
 
 def handle_site_create(args: argparse.Namespace) -> CommandResult:
+    """Handle site create command."""
     password, password_error = _password_argument(
         args.wp_password,
         password_name="WordPress admin password",
@@ -3958,6 +4059,7 @@ def handle_site_create(args: argparse.Namespace) -> CommandResult:
 
 
 def handle_site_update(args: argparse.Namespace) -> CommandResult:
+    """Handle site update command."""
     domain = args.domain
     password, password_error = _password_argument(
         args.password,
@@ -3996,6 +4098,7 @@ def handle_site_update(args: argparse.Namespace) -> CommandResult:
 
 
 def handle_site_ssl(args: argparse.Namespace) -> CommandResult:
+    """Handle site ssl command."""
     domain = args.domain
     preflight_only = getattr(args, "preflight_only", False)
     renew = getattr(args, "renew", False)
@@ -4090,6 +4193,7 @@ def handle_site_ssl(args: argparse.Namespace) -> CommandResult:
 
 
 def handle_site_backup(args: argparse.Namespace) -> CommandResult:
+    """Handle site backup command."""
     keep_local = getattr(args, "keep_local", None)
     if keep_local is not None and keep_local < 0:
         return CommandResult("keep-local must be 0 or greater", exit_code=2)
@@ -4165,6 +4269,7 @@ def _secret_from_args(args: argparse.Namespace) -> tuple[str | None, CommandResu
 
 
 def handle_backup_storage(args: argparse.Namespace) -> CommandResult:
+    """Handle backup storage command."""
     profile = getattr(args, "profile", None)
     if args.storage_command == "set":
         secret_key, secret_error = _secret_from_args(args)
@@ -4221,6 +4326,7 @@ def handle_backup_storage(args: argparse.Namespace) -> CommandResult:
 
 
 def handle_backup_prune(args: argparse.Namespace) -> CommandResult:
+    """Handle backup prune command."""
     if args.domain == "all":
         sites = sorted(list_sites(), key=lambda site: site.get("domain", ""))
         if not sites:
@@ -4238,6 +4344,7 @@ def handle_backup_prune(args: argparse.Namespace) -> CommandResult:
 
 
 def handle_backup_edge(args: argparse.Namespace) -> CommandResult:
+    """Handle backup edge command."""
     result = edge_backup.backup_edge(
         destination_dir=getattr(args, "destination_dir", None),
         upload_s3=getattr(args, "s3", False),
@@ -4271,6 +4378,7 @@ def _load_remote(profile: str | None) -> tuple[S3Config | None, S3Uploader | Non
 
 
 def handle_backup_remote(args: argparse.Namespace) -> CommandResult:
+    """Handle backup remote command."""
     config, uploader, error = _load_remote(getattr(args, "profile", None))
     if error:
         return error
@@ -4352,6 +4460,7 @@ def handle_backup_remote(args: argparse.Namespace) -> CommandResult:
 
 
 def handle_backup_schedule(args: argparse.Namespace) -> CommandResult:
+    """Handle backup schedule command."""
     if args.schedule_command == "status":
         result = backup_schedule.schedule_status()
         return CommandResult(_render_summary("backup schedule", [_step_line("schedule", result)]), result.exit_code)
@@ -4386,6 +4495,7 @@ def handle_backup_schedule(args: argparse.Namespace) -> CommandResult:
 
 
 def handle_cron(args: argparse.Namespace) -> CommandResult:
+    """Handle cron command."""
     if args.cron_command == "install":
         result = cron.install_timers()
         return CommandResult(_render_summary("cron", [_step_line("timers", result)]), result.exit_code)
@@ -4410,6 +4520,7 @@ def _metrics_sample_line(sample: metrics.Sample) -> str:
 
 
 def handle_metrics(args: argparse.Namespace) -> CommandResult:
+    """Handle metrics command."""
     try:
         if args.metrics_command == "sample":
             result = metrics.sample_once()
@@ -4449,6 +4560,7 @@ def _load_smtp() -> tuple[SMTPConfig | None, CommandResult | None]:
 
 
 def handle_smtp(args: argparse.Namespace) -> CommandResult:
+    """Handle smtp command."""
     if args.smtp_command == "set":
         password, password_error = _smtp_password_from_args(args)
         if password_error:
@@ -4500,6 +4612,7 @@ def handle_smtp(args: argparse.Namespace) -> CommandResult:
 
 
 def handle_dns(args: argparse.Namespace) -> CommandResult:
+    """Handle dns command."""
     if args.dns_provider != "cloudflare":
         return CommandResult("dns provider required", exit_code=2)
     if args.dns_command == "set":
@@ -4535,6 +4648,7 @@ def handle_dns(args: argparse.Namespace) -> CommandResult:
 
 
 def handle_site_restore(args: argparse.Namespace) -> CommandResult:
+    """Handle site restore command."""
     if getattr(args, "list", False):
         try:
             archives = list_backup_archives(args.domain)
@@ -4555,11 +4669,13 @@ def handle_site_restore(args: argparse.Namespace) -> CommandResult:
 
 
 def handle_restore_edge(args: argparse.Namespace) -> CommandResult:
+    """Handle restore edge command."""
     result = edge_backup.restore_edge(args.archive, force=getattr(args, "force", False))
     return CommandResult(_render_summary("restore edge", [_step_line("edge", result)]), exit_code=result.exit_code)
 
 
 def handle_site_wp(args: argparse.Namespace) -> CommandResult:
+    """Handle site wp command."""
     domain = args.domain
     if not site_exists(domain):
         return CommandResult(f"site not found: {domain}", exit_code=2)
@@ -4575,6 +4691,7 @@ def _label(ok: bool | None) -> str:
 
 
 def handle_debug(args: argparse.Namespace) -> CommandResult:
+    """Handle debug command."""
     domain: str | None = getattr(args, "domain", None)
     lines: list[str] = []
     has_fail = False
@@ -4626,6 +4743,7 @@ def handle_debug(args: argparse.Namespace) -> CommandResult:
 
 
 def add_debug_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+    """Add debug parser."""
     parser = _add_parser(
         subparsers,
         "debug",
@@ -4657,6 +4775,7 @@ def _normalize_backup_argv(argv: list[str]) -> list[str]:
 
 
 def run(argv: Iterable[str] | None = None) -> int:
+    """Run the CLI application."""
     parser = build_parser()
     raw_argv = list(argv) if argv is not None else sys.argv[1:]
     args = parser.parse_args(_normalize_exec_argv(_normalize_backup_argv(raw_argv)))
@@ -4676,4 +4795,5 @@ def run(argv: Iterable[str] | None = None) -> int:
 
 
 def main(argv: Iterable[str] | None = None) -> int:
+    """Main entry point."""
     return run(argv)

@@ -107,6 +107,7 @@ def read_daemon_config() -> tuple[dict[str, object], bool]:
 
 
 def desired_daemon_ipv6(subnet: str | None = None) -> dict[str, object]:
+    """Desired daemon ipv6."""
     return {
         "ipv6": True,
         "ip6tables": True,
